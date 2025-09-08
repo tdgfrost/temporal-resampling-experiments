@@ -28,14 +28,14 @@ for p in paths:
     dfs.append(df_pl)
 
 df_pl = pl.concat(dfs, how="vertical")
-cols = ["expectile", "decoy", "dataset_reward", "natural_alt_step_eval", "forced_one_step_eval"]
+cols = ["expectile", "decoy", "dataset_reward", "lavagap_1_3_eval", "lavagap_1_1_eval"]
 df_pl = df_pl.select(cols)
 decoy_map = {"0": "Real 1-3", "1": "Artificial 1-1", "2": "Artificial 2-2"}
 df_pl = df_pl.with_columns(pl.col("decoy").cast(pl.Utf8).replace(decoy_map).alias("dataset"))
 
 df_long_pl = df_pl.unpivot(
     index=["expectile", "decoy", "dataset", "dataset_reward"],
-    on=["natural_alt_step_eval", "forced_one_step_eval"],
+    on=["lavagap_1_3_eval", "lavagap_1_1_eval"],
     variable_name="task",
     value_name="score",
 )
@@ -43,8 +43,8 @@ df_long_pl = df_long_pl.with_columns([pl.col('expectile').cast(pl.Utf8).replace(
 df = df_long_pl.to_pandas()
 
 task_name_map = {
-    "natural_alt_step_eval": "LavaGap 1-3",
-    "forced_one_step_eval":  "LavaGap 1-1",
+    "lavagap_1_3_eval": "LavaGap 1-3",
+    "lavagap_1_1_eval":  "LavaGap 1-1",
 }
 df["task"] = df["task"].map(task_name_map)
 # df["expectile"] = df["expectile"].astype(float)

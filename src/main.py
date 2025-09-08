@@ -102,7 +102,7 @@ if __name__ == "__main__":
     render_performance = args.render_performance
     record_video = args.record_video
 
-    if train_iql or render_performance:
+    if (train_iql and not os.path.exists('./dataset.pkl')) or render_performance:
         ppo_agent = f'../logs/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
