@@ -20,6 +20,7 @@ parser.add_argument('--render_performance', default=False, type=parse_bool, help
 parser.add_argument('--record_video', default=False, type=parse_bool, help='Whether to record video of performance rendering')
 
 parser.add_argument('--expectile', default=0.5, type=float, help='Expectile value for IQL training (0.5 is BC)')
+parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
@@ -193,6 +194,7 @@ if __name__ == "__main__":
                              batch_size=32,
                              expectile=EXPECTILE,
                              gamma=GAMMA,
+                             dropout_p=args.dropout_p,
                              device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()

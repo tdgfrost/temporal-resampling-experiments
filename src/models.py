@@ -25,7 +25,7 @@ class CallablePPO(PPO):
 
 
 class MiniGridCNN(nn.Module):
-    def __init__(self, C: int, H: int, W: int, feature_size: int = 128):
+    def __init__(self, C: int, H: int, W: int, feature_size: int = 128, dropout_p: float = 0.0):
         super().__init__()
 
         self.cnn = nn.Sequential(
@@ -51,6 +51,7 @@ class MiniGridCNN(nn.Module):
             nn.Linear(n_flat, feature_size),
             nn.LayerNorm(feature_size),
             nn.ReLU(),
+            nn.Dropout(p=dropout_p)
         )
 
         self.scale_inputs_maybe = lambda x: x
@@ -91,6 +92,7 @@ class MiniGridCNN(nn.Module):
         scaled_x = self.scale_inputs_maybe(permuted_x)
         shrink_x = self.shrink_obs(scaled_x)
         return self.fc(self.cnn(shrink_x))
+
 
 
 class PPOMiniGridCNN(MiniGridCNN):
@@ -138,12 +140,13 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
 
 class CustomNet(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], output_size: int = 1, feature_size: int = 128,
-                 device: str = 'cpu', feature_extractor=None, *args, **kwargs) -> None:
+                 device: str = 'cpu', feature_extractor=None, dropout_p: float = 0.0, *args, **kwargs) -> None:
         super().__init__()
         self._device = device
         if feature_extractor is None:
             self.encoder = OfflineMiniGridCNN(observation_shape=observation_shape,
-                                              feature_size=feature_size).to(device)
+                                              feature_size=feature_size,
+                                              dropout_p=dropout_p).to(device)
         else:
             self.encoder = feature_extractor
 
@@ -151,10 +154,12 @@ class CustomNet(nn.Module):
             nn.Linear(feature_size, feature_size // 2),
             nn.LayerNorm(feature_size // 2),
             nn.ReLU(),
+            nn.Dropout(p=dropout_p),
 
             nn.Linear(feature_size // 2, feature_size // 2),
             nn.LayerNorm(feature_size // 2),
             nn.ReLU(),
+            nn.Dropout(p=dropout_p),
 
             nn.Linear(feature_size // 2, output_size)
         ).to(device)
@@ -218,6 +223,13 @@ class CustomNet(nn.Module):
 
         return new_tensors
 
+    def enable_mc_dropout(self):
+        """Enable MC Dropout during inference."""
+        def apply_mc_dropout(m):
+            if isinstance(m, nn.Dropout):
+                m.train()
+        self.apply(apply_mc_dropout)
+
 
 class CustomIQL(nn.Module):
     def __init__(
@@ -233,6 +245,7 @@ class CustomIQL(nn.Module):
             value_lr: float = 3e-4,
             actor_lr: float = 3e-4,
             tau_target: float = 0.005,
+            dropout_p: float = 0.0,
             device: str = 'cpu'
     ):
         super().__init__()
@@ -245,8 +258,9 @@ class CustomIQL(nn.Module):
         self._device = device
         self._cloning_only = expectile == 0.5
         self._tau_target = tau_target
+        self._has_dropout = dropout_p > 0.0
 
-        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, device=device)
+        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=device)
 
         self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
 
@@ -375,7 +389,10 @@ class CustomIQL(nn.Module):
         weights = 1.0
         if not self._cloning_only:
             weights = self._batch_diff
-            weights = torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)
+            if self._has_dropout:
+                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+            else:
+                weights = torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)
 
         policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
         policy_loss = (policy_loss * weights).mean()
