@@ -246,6 +246,7 @@ class CustomIQL(nn.Module):
             actor_lr: float = 3e-4,
             tau_target: float = 0.005,
             dropout_p: float = 0.0,
+            beta: float = 2.0,
             device: str = 'cpu'
     ):
         super().__init__()
@@ -259,6 +260,7 @@ class CustomIQL(nn.Module):
         self._cloning_only = expectile == 0.5
         self._tau_target = tau_target
         self._has_dropout = dropout_p > 0.0
+        self._beta = beta
 
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=device)
 
@@ -392,7 +394,7 @@ class CustomIQL(nn.Module):
             if self._has_dropout:
                 weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
             else:
-                weights = torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)
+                weights = torch.clip(torch.exp(self._beta * weights), -torch.inf, 100)
 
         policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
         policy_loss = (policy_loss * weights).mean()

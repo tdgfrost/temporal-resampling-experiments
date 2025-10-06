@@ -4,6 +4,7 @@ from gymnasium.envs.registration import register, WrapperSpec
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 import pickle
 import argparse
+from math import ceil
 from collections import defaultdict
 import polars as pl
 
@@ -14,13 +15,14 @@ from models import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
-parser.add_argument('--train_iql', default=False, type=parse_bool, help='Train IQL agent')
+parser.add_argument('--train_iql', default=True, type=parse_bool, help='Train IQL agent')
 parser.add_argument('--ppo_agent', default=None, type=str, help='Path to pre-trained PPO agent')
 parser.add_argument('--render_performance', default=False, type=parse_bool, help='Whether to render performance in final eval')
 parser.add_argument('--record_video', default=False, type=parse_bool, help='Whether to record video of performance rendering')
 
-parser.add_argument('--expectile', default=0.5, type=float, help='Expectile value for IQL training (0.5 is BC)')
-parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
+parser.add_argument('--expectile', default=0.6, type=float, help='Expectile value for IQL training (0.5 is BC)')
+parser.add_argument('--dropout_p', default=0.2, type=float, help='MC dropout probability for PPO agent')
+parser.add_argument('--beta', default=2.0, type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
@@ -142,7 +144,7 @@ if __name__ == "__main__":
         model_loaded = True
 
     if train_iql:
-        print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}")
+        print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
 
         logs = defaultdict(list)
 
@@ -190,11 +192,12 @@ if __name__ == "__main__":
             # Alternately collect and training
             algo = CustomIQL(observation_shape=base_env.observation_space.shape,
                              action_size=base_env.action_space.n,
-                             feature_size=32,
-                             batch_size=32,
+                             feature_size=ceil(64 / (1-args.dropout_p)),
+                             batch_size=ceil(64 / (1-args.dropout_p)),
                              expectile=EXPECTILE,
                              gamma=GAMMA,
                              dropout_p=args.dropout_p,
+                             beta=args.beta,
                              device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
@@ -211,7 +214,8 @@ if __name__ == "__main__":
 
         # Save logs
         os.makedirs('../logs/iql_minigrid_logs', exist_ok=True)
-        pl.DataFrame(logs).write_csv(f'../logs/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}.csv')
+        pl.DataFrame(logs).write_csv(f'../logs/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}'
+                                     f'_dropout={args.dropout_p}_beta={args.beta}.csv')
 
     if render_performance:
         eval_env = gym.make(video_env_name if record_video else env_name,
