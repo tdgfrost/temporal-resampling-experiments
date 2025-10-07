@@ -183,26 +183,25 @@ class ReplayBufferEnv:
 
             self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'{decoy_maybe}done']))]
 
-        # Update the decoy actions (every second step)
-        # - For basal insulin, this involves taking the average of the two actions
+        # Update the decoy actions (every third step)
+        # - For basal insulin, this involves taking the average of the three actions
         actions = [
-            np.mean(ep_buffer['decoy_action'][idx: idx + 2])
-            for idx in range(0, len(ep_buffer['decoy_action']), 2)
+            np.mean(ep_buffer['decoy_action'][idx: idx + 3])
+            for idx in range(0, len(ep_buffer['decoy_action']), 3)
         ]
 
-        rewards = [
-            np.sum(ep_buffer['decoy_reward'][idx: idx + 2])
-            for idx in range(0, len(ep_buffer['decoy_reward']), 2)
+        rewards, dones = [
+            [np.sum(ep_buffer[f'decoy_{key}'][idx: idx + 3]) for idx in range(0, len(ep_buffer['decoy_reward']), 3)]
+            for key in ['reward', 'done']
         ]
 
-        obs, dones = [
-            [ep_buffer[f'decoy_{key}'][idx] for idx in range(0, len(ep_buffer[f'decoy_{key}']), 2)]
-            for key in ['obs', 'done']
+        obs = [
+            ep_buffer[f'decoy_obs'][idx] for idx in range(0, len(ep_buffer[f'decoy_{key}']), 3)
         ]
 
-        if not dones[-1]:
-            rewards[-1] = ep_buffer['reward'][-1]
-            dones[-1] = ep_buffer['done'][-1]
+        # if not dones[-1]:
+            # rewards[-1] = ep_buffer['reward'][-1]
+            # dones[-1] = ep_buffer['done'][-1]
         assert dones[-1], "Last done flag should be True"
         self.observations[2] += obs
         self.actions[2] += actions

@@ -352,9 +352,11 @@ class CustomIQL(nn.Module):
         q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
         with torch.no_grad():
             v_next = self.target_value_net(next_obs, flags=next_flags)
-            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
-            current_multistep_discount = torch.where(flags == 1, 2, 0)
-            r = self._gamma ** current_multistep_discount * rews.float()
+            # next_multistep_discount = torch.where(next_flags == 1, 3, 1)
+            # current_multistep_discount = torch.where(flags == 1, 2, 0)
+            # r = self._gamma ** current_multistep_discount * rews.float()
+            r = rews.float()
+            next_multistep_discount = torch.where(flags == 1, 6, 1)
             q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
 
         loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
