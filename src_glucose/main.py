@@ -15,8 +15,8 @@ from models import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
-parser.add_argument('--train_iql', default=True, type=parse_bool, help='Train IQL agent')
-parser.add_argument('--ppo_agent', default="historic_bests/best_009_steps=36000_mean=104.20.zip", type=str, help='Path to pre-trained PPO agent')
+parser.add_argument('--train_iql', default=False, type=parse_bool, help='Train IQL agent')
+parser.add_argument('--ppo_agent', default=None, type=str, help='Path to pre-trained PPO agent')
 
 parser.add_argument('--expectile', default=0.5, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--dropout_p', default=0.2, type=float, help='MC dropout probability for PPO agent')

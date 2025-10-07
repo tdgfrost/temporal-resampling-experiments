@@ -34,9 +34,10 @@ class CombinedObservationWrapper(RecordConstructorArgs, Wrapper):
 
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
-        # Add something about the sample_time - don't forget to update info
-        # self.env.env.env.sample_time = 5  # set to 5 minutes
-        # info['sample_time'] = self.env.env.env.sample_time (assuming sample_time appears here)
+        # Update sample time
+        new_sample_time = 6
+        self.env.unwrapped.env.env.sample_time = new_sample_time
+        info['sample_time'] = new_sample_time
         state = self._extract_state(info)
         return state, info
 
