@@ -82,7 +82,7 @@ if __name__ == "__main__":
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
         model = PPO("MlpPolicy", make_glucose_env(),
-                    ent_coef=0.01, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1)
+                    ent_coef=0.01, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
         model.learn(1e5, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
@@ -95,12 +95,12 @@ if __name__ == "__main__":
         base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
-        buffer_size = 100_000
-        replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=buffer_size)
+        dataset_size = 100_000
+        replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
-            model = CallablePPO.load(ppo_agent, env=base_env, device="auto")
+            model = CallablePPO.load(ppo_agent, env=base_env, device="cpu")
             model_loaded = True
-            replay_buffer_env.fill_buffer(model=model, n_frames=buffer_size)
+            replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')
         else:
             print('='*50, '\nRe-using existing dataset.pkl...\n', '='*50)
@@ -144,10 +144,10 @@ if __name__ == "__main__":
 
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
-                epochs=1,
-                n_steps_per_epoch=20_000,
+                n_epochs_train=10 if EXPECTILE == 0.5 else 5,
+                n_epochs_eval=1,
                 evaluators=evaluators,
-                dataset_kwargs={'decoy_interval': DECOY_INTERVAL},
+                dataset_kwargs={'decoy_interval': DECOY_INTERVAL, 'batch_size': 32},
             )
             for key in evaluators.keys():
                 logs[f'{key}_eval'].append(log_dict[key][0])

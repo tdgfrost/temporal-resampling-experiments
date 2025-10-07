@@ -98,9 +98,14 @@ class ScaleAction(nn.Module):
         super().__init__()
         self.register_buffer('low', torch.tensor(low, dtype=torch.float32))
         self.register_buffer('high', torch.tensor(high, dtype=torch.float32))
+        self.device = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Scale from [0, 1] to [low, high]
+        if self.device is None or self.device != x.device:
+            self.device = x.device
+            self.register_buffer('low', self.low.to(self.device))
+            self.register_buffer('high', self.high.to(self.device))
         return x * (self.high - self.low) + self.low
 
 
@@ -248,7 +253,7 @@ class CustomIQL(nn.Module):
             nn.LayerNorm(feature_size),
             nn.ReLU(),
             nn.Dropout(p=dropout_p)
-        )
+        ).to(device)
 
         self.critic_net1 = CustomNet(output_size=2, action_encoder=self.action_encoder, feature_extractor=self.feature_extractor, **net_kwargs)
         self.critic_net2 = CustomNet(output_size=2, action_encoder=self.action_encoder, feature_extractor=self.feature_extractor, **net_kwargs)
@@ -271,8 +276,8 @@ class CustomIQL(nn.Module):
     def fit(
         self,
         dataset,
-        epochs: int = 1,
-        n_steps_per_epoch: int = 1_000,
+        n_epochs_train: int = 1,
+        n_epochs_eval: int = 1,
         evaluators=None,
         show_progress: bool = True,
         experiment_name: str = None,
@@ -281,18 +286,19 @@ class CustomIQL(nn.Module):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
         dataset.set_to_tensors(self._device)
+        dataset.set_generate_params(**dataset_kwargs)
 
         loss_dict = self._reset_loss_dict()
 
-        # Start training
-        with tqdm(total=epochs * n_steps_per_epoch, desc="Progress", mininterval=2.0, disable=not show_progress) as pbar:
-            for epoch in range(1, epochs + 1):
-                epoch_str = f"{epoch}/{epochs}"
+        epoch_eval_interval = n_epochs_train // n_epochs_eval
 
-                for update_step in range(n_steps_per_epoch):
-                    obs, acts, rews, next_obs, dones, flags, next_flags = dataset.sample_transition_batch(
-                        self._batch_size, **dataset_kwargs
-                    )
+        # Start training
+        with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0, disable=not show_progress) as pbar:
+            for epoch in range(1, n_epochs_train + 1):
+                epoch_str = f"{epoch}/{n_epochs_train}"
+
+                for batch in dataset:
+                    obs, acts, rews, next_obs, dones, flags, next_flags = batch
 
                     # Update the networks
                     if not self._cloning_only:
@@ -304,7 +310,7 @@ class CustomIQL(nn.Module):
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
                         target_param.data.copy_((1-self._tau_target) * target_param.data + self._tau_target * param.data)
 
-                    pbar.update(1)
+                    pbar.update(dataset.batch_size)
                     pbar.set_postfix(epoch=epoch_str,
                                      policy_loss=f"{np.mean(loss_dict['policy_loss']):.5f}",
                                      critic_loss=f"{np.mean(loss_dict['critic_loss']):.5f}",
@@ -312,12 +318,13 @@ class CustomIQL(nn.Module):
                                      refresh=False)
 
                 # Logging
-                loss_dict, log_dict = self._log_progress(
-                    epoch=epoch,
-                    loss_dict=loss_dict,
-                    experiment_name=experiment_name,
-                    evaluators=evaluators
-                )
+                if epoch % epoch_eval_interval == 0 and evaluators is not None:
+                    loss_dict, log_dict = self._log_progress(
+                        epoch=epoch,
+                        loss_dict=loss_dict,
+                        experiment_name=experiment_name,
+                        evaluators=evaluators
+                    )
 
         return log_dict
 

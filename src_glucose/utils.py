@@ -26,6 +26,9 @@ class ReplayBufferEnv:
         self.dones = {
             i: deque(maxlen=buffer_size) for i in range(3)
         }
+        self.sample_bool = {
+            i: deque(maxlen=buffer_size) for i in range(3)
+        }
 
         self.max_rewards_scale = None
         self.min_rewards_scale = None
@@ -33,6 +36,34 @@ class ReplayBufferEnv:
         self.env = env
         self._tensors_set = False
         self._device = None
+        self.batch_size = 32
+        self.decoy_interval = 0
+        self.n_samples = 0
+        self.segments = self.n_samples // self.batch_size
+
+    def __iter__(self):
+        return iter(self.generate())
+
+    def __len__(self):
+        return self.n_samples
+
+    def set_generate_params(self, batch_size: int = None, decoy_interval: int = None):
+        self.batch_size = batch_size if batch_size is not None else self.batch_size
+        self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
+        self.n_samples = sum(self.sample_bool[self.decoy_interval])
+        self.segments = self.n_samples // self.batch_size
+
+        assert self.n_samples >= self.batch_size, "Not enough samples in the replay buffer"
+        assert self.batch_size > 0, "Batch size must be positive"
+        assert self.decoy_interval in [0, 1, 2], "decoy_interval must be 0, 1, or 2"
+
+    def generate(self):
+        assert self.n_samples > 0, "Replay buffer is empty"
+        idxs = torch.tensor(np.random.choice(self.n_samples, size=(self.segments, self.batch_size), replace=False),
+                            dtype=torch.long, device=self._device)
+
+        for idx in idxs:
+            yield self.fetch_transition_batch(idxs=idx, decoy_interval=self.decoy_interval)
 
     def save(self, path: str):
         if os.path.exists(path):
@@ -44,6 +75,7 @@ class ReplayBufferEnv:
             ('actions', self.actions),
             ('rewards', self.rewards),
             ('dones', self.dones),
+            ('sample_bool', self.sample_bool),
         ]:
             save_dict = {i: list(value[i]) for i in range(3)}
             np.savez(os.path.join(path, f'{key}.npz'),
@@ -63,6 +95,7 @@ class ReplayBufferEnv:
             ('actions', self.actions),
             ('rewards', self.rewards),
             ('dones', self.dones),
+            ('sample_bool', self.sample_bool),
         ]:
             loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
             for k in loaded.files:
@@ -72,6 +105,7 @@ class ReplayBufferEnv:
         loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
         self.min_rewards_scale = float(loaded_scale['min'])
         self.max_rewards_scale = float(loaded_scale['max'])
+        self.set_generate_params()
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
@@ -165,8 +199,11 @@ class ReplayBufferEnv:
     def update_permanent_buffer(self, ep_buffer: dict):
         for i, decoy_maybe in [(0, ''), (1, 'decoy_')]:
             for arr, key in [
-                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')]:
+                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
+            ]:
                 arr[i] += ep_buffer[f'{decoy_maybe}{key}']
+
+            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'{decoy_maybe}done']))]
 
         # Update the decoy actions (every second step)
         # - For basal insulin, this involves taking the average of the two actions
@@ -188,11 +225,14 @@ class ReplayBufferEnv:
         self.actions[2] += actions
         self.rewards[2] += rewards
         self.dones[2] += dones
+        self.sample_bool[2] += [True for _ in range(len(dones))]
 
     def sample_transition_batch(self, batch_size: int = 32, decoy_interval: int = 0):
-        assert self._tensors_set, "Replay buffer must be set to tensors first using .set_to_tensors(model)"
         idxs = torch.randint(0, len(self.observations[decoy_interval]) - 1, (batch_size,), device=self._device)
+        return self.fetch_transition_batch(idxs, decoy_interval)
 
+    def fetch_transition_batch(self, idxs: torch.Tensor, decoy_interval: int = 0):
+        assert self._tensors_set, "Replay buffer must be set to tensors first using .set_to_tensors(model)"
         obs_batch = self.observations[decoy_interval][idxs]
         next_obs_batch = self.observations[decoy_interval][idxs + 1]
         action_batch = self.actions[decoy_interval][idxs].unsqueeze(-1)

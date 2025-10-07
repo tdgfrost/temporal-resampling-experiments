@@ -35,7 +35,7 @@ class CombinedObservationWrapper(RecordConstructorArgs, Wrapper):
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
         # Update sample time
-        new_sample_time = 6
+        new_sample_time = 60
         self.env.unwrapped.env.env.sample_time = new_sample_time
         info['sample_time'] = new_sample_time
         state = self._extract_state(info)
@@ -251,11 +251,11 @@ register(
 
 def make_glucose_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = True, **kwargs):
     env_name = "simglucose/adult8-v0"
-    env = gym.make(env_name, max_episode_steps=480, **kwargs)
+    env = gym.make(env_name, max_episode_steps=168, **kwargs)
     env = CombinedObservationWrapper(env)
     env = EpisodeRewardsOnly(env)
     env = NormalizeObservation(env)
-    env = AlternateStepWrapper(env, max_steps=480, forced_interval=forced_interval)
+    env = AlternateStepWrapper(env, max_steps=168, forced_interval=forced_interval)
     env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
     env = DecoyObsWrapper(env)
     return env
