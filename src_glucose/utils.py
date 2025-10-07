@@ -162,7 +162,7 @@ class ReplayBufferEnv:
             # Normalise rewards from 0 to 1
             for i in [0, 1, 2]:
                 rewards = np.array(self.rewards[i])
-                min_r, max_r = rewards.min(), rewards.max()
+                min_r, max_r = 0, 1 # rewards.min(), rewards.max()
                 if max_r > min_r:
                     norm_rewards = (rewards - min_r) / (max_r - min_r)
                 else:

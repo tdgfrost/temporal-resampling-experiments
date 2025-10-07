@@ -49,7 +49,7 @@ if __name__ == "__main__":
     train_ppo = args.train_ppo
     train_iql = args.train_iql
 
-    if train_iql and not os.path.exists('./dataset.pkl'):
+    if train_iql and not os.path.exists('./replay_buffer/COMPLETE'):
         ppo_agent = f'../logs_glucose/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
@@ -66,24 +66,26 @@ if __name__ == "__main__":
 
     policy_kwargs = dict(
         features_extractor_class=PPOMiniGridFeaturesExtractor,
-        features_extractor_kwargs=dict(features_dim=64),
+        features_extractor_kwargs=dict(features_dim=128),
+        activation_fn=nn.ReLU,
+        net_arch=[128, 128, 128]
     )
 
     if train_ppo:
         # Create eval callback
         save_each_best = SaveEachBestCallback(save_dir="../logs_glucose/ppo_minigrid_logs/historic_bests", verbose=1)
-        # eval_callback = EvalCallback(make_sepsis_env(max_steps=100, fixed_reward=False),
+
         eval_callback = EvalCallback(make_glucose_env(),
-                                     n_eval_episodes=10,
+                                     n_eval_episodes=20,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
                                      eval_freq=2000,
                                      deterministic=False,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = PPO("MlpPolicy", make_glucose_env(),
-                    ent_coef=0.01, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
-        model.learn(1e5, callback=eval_callback)  # Train for 500,000 step with early stopping
+        model = PPO("MlpPolicy", make_glucose_env(no_interim_rewards=True, gamma=GAMMA),
+                    ent_coef=0.001, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
+        model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
     if train_iql:

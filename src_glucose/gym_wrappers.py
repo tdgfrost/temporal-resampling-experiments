@@ -5,8 +5,12 @@ from gymnasium import spaces, ObservationWrapper
 from gymnasium.utils import RecordConstructorArgs
 from gymnasium.wrappers import NormalizeObservation
 from minigrid.wrappers import ImgObsWrapper, Wrapper
-from datetime import datetime
 from gymnasium.envs.registration import register
+from datetime import datetime, timedelta
+from simglucose.simulation.scenario import CustomScenario
+
+
+SAMPLE_TIME = 3.0  # minutes
 
 
 class CombinedObservationWrapper(RecordConstructorArgs, Wrapper):
@@ -35,9 +39,8 @@ class CombinedObservationWrapper(RecordConstructorArgs, Wrapper):
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
         # Update sample time
-        new_sample_time = 60
-        self.env.unwrapped.env.env.sample_time = new_sample_time
-        info['sample_time'] = new_sample_time
+        self.env.unwrapped.env.env.sample_time = SAMPLE_TIME
+        info['sample_time'] = SAMPLE_TIME
         state = self._extract_state(info)
         return state, info
 
@@ -66,9 +69,8 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
         self.episode_rewards = []
 
     def step(self, action):
-        obs, _, terminated, truncated, info = self.env.step(action)
-        reward = self.calc_reward(info['bg'])
-        self.episode_rewards.append(reward)
+        obs, rew, terminated, truncated, info = self.env.step(action)
+        self.episode_rewards.append(rew)
         if terminated or truncated:
             total_reward = np.sum(self.episode_rewards) if self.episode_rewards else 0.0
             reward = total_reward
@@ -77,11 +79,33 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
             reward = 0.0
         return obs, reward, terminated, truncated, info
 
-    @staticmethod
-    def calc_reward(blood_glucose):
-        if 70 <= blood_glucose <= 180:
-            return 1.0
-        return 0.0
+
+class T1DPatientEnv(Wrapper):
+    identity = "simglucose/adult8-v0"
+    scenario = [
+        # breakfast (time, carb)
+        (timedelta(hours=6), 53.),
+        # lunch
+        (timedelta(hours=12), 57.),
+        # dinner
+        (timedelta(hours=18), 86.),
+    ]
+    custom_scenario = CustomScenario(start_time=datetime(2018, 1, 1, 0, 0, 0),
+                                     scenario=scenario)
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        env = gym.make(self.identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, custom_scenario=self.custom_scenario, **kwargs)
+        super().__init__(env)
+
+    def reset(self, **kwargs):
+        # Rebuild env each reset
+        self.env.close()  # cleanup
+        self.env = gym.make(self.identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, custom_scenario=self.custom_scenario, **self.kwargs)
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        return self.env.step(action)
 
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
@@ -90,7 +114,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     'bonus' steps using the same action.
     """
 
-    def __init__(self, env: gym.Env, max_steps: int = 100, forced_interval: int = 0) -> None:
+    def __init__(self, env: gym.Env, forced_interval: int = 0, gamma: float = 1.0) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
         # super().__init__(env)
@@ -98,6 +122,8 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         self.current_step_mode = 0
         assert 0 <= forced_interval <= 1, "Forced interval must be 0 or 1"
         self.forced_interval = forced_interval
+        self.gamma = gamma
+        assert 0.0 < gamma <= 1.0, "Gamma must be in (0.0, 1.0]"
 
     def reset(self, *args, **kwargs) -> np.ndarray:
         self.last_step_mode = 0
@@ -135,18 +161,19 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
         # Take 3-steps
         elif self.current_step_mode == 1:
+            gamma = self.gamma
             # Update step_mode for next observation
             self._flip_step_modes()
 
             # Take another step (second)
-            obs, reward, term, trunc, info = self._take_another_step(action, info)
+            obs, reward, term, trunc, info, gamma = self._take_another_step(action, reward, gamma, info)
             done = term or trunc
             if done:
                 info['done'][-1] = done
                 return obs, reward, term, trunc, info
 
             # Take another step (third)
-            obs, reward, term, trunc, info = self._take_another_step(action, info)
+            obs, reward, term, trunc, info, gamma = self._take_another_step(action, reward, gamma, info)
             done = term or trunc
             info['done'][-1] = done
             return obs, reward, term, trunc, info
@@ -171,19 +198,20 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         info['bonus_step_taken'] = False
         return info
 
-    def _take_another_step(self, action: Any, base_info: Dict[str, Any]) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+    def _take_another_step(self, action: Any, reward: Any, gamma: float, base_info: Dict[str, Any]) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         # Take additional step
         base_info['bonus_step_taken'] = True
 
-        obs, reward, term, trunc, new_info = self.env.step(action)
+        obs, new_reward, term, trunc, new_info = self.env.step(action)
+        reward += gamma * new_reward
 
         # Update return variables
         base_info = self._update_info(base_info, new_info)
         base_info['obs'].append(obs)
         base_info['action'].append(action)
-        base_info['reward'].append(reward)
+        base_info['reward'].append(new_reward)
         base_info['done'].append(term or trunc)
-        return obs, reward, term, trunc, base_info
+        return obs, reward, term, trunc, base_info, gamma * self.gamma
 
     @staticmethod
     def _update_info(base_info, new_info):
@@ -249,13 +277,14 @@ register(
 )
 
 
-def make_glucose_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = True, **kwargs):
-    env_name = "simglucose/adult8-v0"
-    env = gym.make(env_name, max_episode_steps=168, **kwargs)
+def make_glucose_env(*, no_interim_rewards: bool = True, gamma: float = 1.0, forced_interval: int = 0,
+                     use_flag: bool = True, **kwargs):
+    env = T1DPatientEnv(**kwargs)
     env = CombinedObservationWrapper(env)
-    env = EpisodeRewardsOnly(env)
+    if no_interim_rewards:
+        env = EpisodeRewardsOnly(env)
     env = NormalizeObservation(env)
-    env = AlternateStepWrapper(env, max_steps=168, forced_interval=forced_interval)
+    env = AlternateStepWrapper(env, forced_interval=forced_interval, gamma=gamma)
     env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
     env = DecoyObsWrapper(env)
     return env
