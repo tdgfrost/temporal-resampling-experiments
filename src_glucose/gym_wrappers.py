@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 
-SAMPLE_TIME = 60.0  # minutes
+SAMPLE_TIME = 10.0  # minutes
 for i in range(1, 6):
     register(
         id=f"simglucose/adult{i}-v0",
@@ -76,6 +76,22 @@ class T1DPatientEnv(Wrapper):
 
     def step(self, action):
         return self.env.step(action)
+
+
+class FixedScaler(ObservationWrapper):
+
+    def __init__(self, env, **kwargs):
+        self.kwargs = kwargs
+        ObservationWrapper.__init__(self, env)
+
+    def observation(self, obs):
+        # Max BG = 600, min BG = 10
+        # Max insulin = 30, min insulin = 0
+        # Max CHO = 300, min = 0
+        obs[0] = (obs[0] - 10) / (600 - 10)  # BG
+        obs[1] = obs[1] / 30.0                # insulin
+        obs[2] = obs[2] / 300.0               # CHO
+        return obs
 
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
@@ -154,7 +170,7 @@ def make_glucose_env(*, no_interim_rewards: bool = True, gamma: float = 1.0, for
     env = SampleTimeWrapper(env)
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
-    env = NormalizeObservation(env)
     env = AlternateStepWrapper(env, forced_interval=forced_interval)
+    env = FixedScaler(env)
     env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
     return env
