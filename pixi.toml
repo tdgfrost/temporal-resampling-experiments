@@ -25,4 +25,5 @@ inquirer = ">=3.4.1, <4"
 jupyter = ">=1.1.1, <2"
 simglucose = { git = "https://github.com/tdgfrost/simglucose_with_numba.git" }
 numba = ">=0.62.1, <0.63"
+sb3-contrib = ">=2.7.0, <3"
 

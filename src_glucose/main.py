@@ -68,7 +68,7 @@ if __name__ == "__main__":
         features_extractor_class=PPOMiniGridFeaturesExtractor,
         features_extractor_kwargs=dict(features_dim=128),
         activation_fn=nn.ReLU,
-        net_arch=[128, 128, 128]
+        net_arch=[128, 128]
     )
 
     if train_ppo:
@@ -83,8 +83,8 @@ if __name__ == "__main__":
                                      deterministic=False,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = PPO("MlpPolicy", make_glucose_env(),
-                    ent_coef=0.001, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
+        model = RecurrentPPO("MlpLstmPolicy", make_glucose_env(),
+                             ent_coef=0.005, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
@@ -98,9 +98,9 @@ if __name__ == "__main__":
 
         # Fill our replay buffer (or load pre-filled)
         dataset_size = 100_000
-        replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
+        replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
-            model = CallablePPO.load(ppo_agent, env=base_env, device="cpu")
+            model = CallableRecurrentPPO.load(ppo_agent, env=base_env, device="cpu")
             model_loaded = True
             replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')
@@ -130,7 +130,7 @@ if __name__ == "__main__":
             logs['dataset_reward'].append(dataset_rewards.mean())
 
             # Alternately collect and training
-            algo = CustomIQL(observation_shape=base_env.observation_space.shape,
+            algo = RecurrentIQL(observation_shape=base_env.observation_space.shape,
                              action_space=base_env.action_space,
                              feature_size=ceil(128 / (1-args.dropout_p)),
                              batch_size=ceil(128 / (1-args.dropout_p)),

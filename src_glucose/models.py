@@ -4,6 +4,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,18 @@ class CallablePPO(PPO):
     def __call__(self, obs):
         action, _ = self.predict(obs, deterministic=True)
         return action
+
+
+class CallableRecurrentPPO(RecurrentPPO):
+    """
+    A version of PPO that can be called like a function to get actions.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def __call__(self, obs, *args, **kwargs):
+        action, lstm_states = self.predict(obs, deterministic=True, *args, **kwargs)
+        return action, lstm_states
 
 
 class MiniGridEncoder(nn.Module):
@@ -211,6 +224,99 @@ class CustomNet(nn.Module):
         self.apply(apply_mc_dropout)
 
 
+class RecurrentNet(nn.Module):
+    def __init__(self, observation_shape: Tuple[int, int, int], output_size: int, feature_size: int = 128,
+                 recurrent_hidden_size: int = 128, device: str = 'cpu', action_encoder=None,
+                 feature_extractor=None, dropout_p: float = 0.0, has_sigmoid: bool = False, *args, **kwargs) -> None:
+        super().__init__()
+        self._device = device
+        self.recurrent_hidden_size = recurrent_hidden_size
+
+        if feature_extractor is None:
+            # This encoder now processes individual frames
+            self.encoder = OfflineMiniGridEncoder(observation_shape=observation_shape, feature_size=feature_size,
+                                                  dropout_p=dropout_p).to(device)
+        else:
+            self.encoder = feature_extractor
+
+        self.action_encoder = action_encoder
+        self._has_actions = action_encoder is not None
+        self._has_sigmoid = has_sigmoid
+
+        # Input to LSTM is the feature vector (plus action embedding if present)
+        lstm_input_size = feature_size * (1 + int(self._has_actions))
+
+        # --- Recurrent Layer ---
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_size,
+            hidden_size=recurrent_hidden_size,
+            num_layers=1,
+            batch_first=True  # Crucial for easier tensor manipulation
+        ).to(device)
+
+        # Decoder now takes the output of the LSTM
+        decoder_input_size = recurrent_hidden_size
+        self.decoder = nn.Sequential(
+            nn.Linear(decoder_input_size, decoder_input_size // 2),
+            nn.LayerNorm(decoder_input_size // 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(decoder_input_size // 2, output_size)
+        ).to(device)
+
+        # Note: Weight initialization is omitted for brevity but should be the same as in your original code.
+        # self.init_weights()
+
+    def forward(self, x: torch.Tensor, actions: torch.Tensor = None,
+                hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, flags: torch.Tensor = None) -> Tuple[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # x shape: (N, T, C, H, W), where T is sequence length
+        batch_size, seq_len = x.shape[0], x.shape[1]
+
+        # Reshape to process each frame through the encoder
+        # (N, T, C, H, W) -> (N * T, C, H, W)
+        x_reshaped = x.reshape(-1, *x.shape[2:])
+
+        # (N * T, C, H, W) -> (N * T, feature_size)
+        hidden = self.encoder(x_reshaped.to(dtype=torch.float32))
+
+        if self._has_actions:
+            # actions shape: (N, T, 1) -> (N * T, 1)
+            actions_reshaped = actions.reshape(-1, 1).to(dtype=torch.float32)
+            action_embedding = self.action_encoder(actions_reshaped)
+            hidden = torch.cat([hidden, action_embedding], dim=-1)
+
+        # Reshape back to sequence format for LSTM
+        # (N * T, lstm_input_size) -> (N, T, lstm_input_size)
+        lstm_input = hidden.view(batch_size, seq_len, -1)
+
+        # Process sequence through LSTM
+        # lstm_out shape: (N, T, recurrent_hidden_size)
+        # next_hidden_state is a tuple (h_n, c_n)
+        lstm_out, next_hidden_state = self.lstm(lstm_input, hidden_state)
+
+        # Reshape for the decoder
+        # (N, T, recurrent_hidden_size) -> (N * T, recurrent_hidden_size)
+        decoder_input = lstm_out.reshape(-1, self.recurrent_hidden_size)
+
+        # (N * T, recurrent_hidden_size) -> (N * T, output_size)
+        output = self.decoder(decoder_input)
+
+        # Reshape final output back to sequence format
+        # (N * T, output_size) -> (N, T, output_size)
+        output = output.view(batch_size, seq_len, -1)
+
+        # Note: 'flags' logic might need adjustment depending on its role with sequences.
+        # This example assumes output is directly used or further processed.
+        if flags is not None:
+            output = torch.take_along_dim(output, flags.long(), 2)
+
+        if self._has_sigmoid:
+            output = torch.sigmoid(output)
+
+        return output, next_hidden_state
+
+
 class CustomIQL(nn.Module):
     def __init__(
             self,
@@ -243,6 +349,9 @@ class CustomIQL(nn.Module):
         self._beta = beta
         self._action_low = action_space.low[0]
         self._action_high = action_space.high[0]
+        self._critic_lr = critic_lr
+        self._value_lr = value_lr
+        self._actor_lr = actor_lr
 
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=device)
 
@@ -442,3 +551,125 @@ class CustomIQL(nn.Module):
             'policy_loss': deque(maxlen=100)
         }
 
+
+class RecurrentIQL(CustomIQL):  # Inherits from your original class
+    def __init__(self, *args, sequence_length: int = 10, recurrent_hidden_size: int = 128, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sequence_length = sequence_length
+        self._recurrent_hidden_size = recurrent_hidden_size
+
+        # --- Replace network instantiations with RecurrentNet ---
+        net_kwargs = dict(
+            observation_shape=kwargs.get('observation_shape'),
+            feature_size=self._feature_size,
+            recurrent_hidden_size=recurrent_hidden_size,
+            dropout_p=kwargs.get('dropout_p', 0.0),
+            device=self._device
+        )
+
+        # Re-initialize networks with RecurrentNet
+        self.critic_net1 = RecurrentNet(output_size=2, action_encoder=self.action_encoder,
+                                        feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = RecurrentNet(output_size=2, action_encoder=self.action_encoder,
+                                        feature_extractor=self.feature_extractor, **net_kwargs)
+        self.value_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_value_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.policy_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, has_sigmoid=True,
+                                       **net_kwargs)
+
+        # Give both critic nets to the critic optimizer
+        self.critic_optim = torch.optim.AdamW(list(self.critic_net1.parameters()) +
+                                              list(self.critic_net2.parameters()), lr=self._critic_lr)
+        self.value_optim = torch.optim.AdamW(self.value_net.parameters(), lr=self._value_lr)
+        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=self._actor_lr)
+
+        # clone the value net to a target network
+        for target_param, param in zip(self.target_value_net.decoder.parameters(), self.value_net.decoder.parameters()):
+            target_param.data.copy_(param.data)
+
+    def get_initial_states(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns a zero-initialized hidden state tuple for the LSTM."""
+        h_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
+        c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
+        return (h_0, c_0)
+
+    def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                deterministic: bool = False) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Predicts an action for a single observation and manages the recurrent state.
+        Returns the action and the next hidden state.
+        """
+        obs_tensor = self._to_tensors(obs)[0]
+        # Add batch and sequence dimensions: (L,W) -> (N, L,W)
+        obs_tensor = obs_tensor.unsqueeze(0)
+
+        flags = self._extract_flag(obs_tensor)
+
+        # Pass the current hidden_state to the policy network
+        action_unit, next_hidden_state = self.policy_net(obs_tensor, flags=flags, hidden_state=hidden_state)
+
+        # Remove sequence dimension for scaling
+        action_unit = action_unit.squeeze(1)
+
+        # Scale up
+        action = action_unit * (self._action_high - self._action_low) + self._action_low
+
+        return action.squeeze(-1).cpu().numpy(), next_hidden_state
+
+    # --- Update methods now handle sequences ---
+    # The core logic remains the same, but we unpack the network output
+
+    def _update_critic(self, obs, acts, rews, next_obs, dones, flags=None, next_flags=None):
+        # We only need the network output, not the final hidden state for training
+        q1, _ = self.critic_net1(obs, acts, flags=flags)
+        q2, _ = self.critic_net2(obs, acts, flags=flags)
+
+        with torch.no_grad():
+            v_next, _ = self.target_value_net(next_obs, flags=next_flags)
+            r = rews.float()
+            next_multistep_discount = torch.where(flags == 1, 3, 1)  # Note: flags shape is (N, T, 1)
+            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
+
+        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+        self.critic_optim.zero_grad()
+        loss.backward()
+        self.critic_optim.step()
+        return loss.item()
+
+    # The _update_value and _update_actor methods are updated similarly
+    def _update_value(self, obs, acts, flags=None):
+        v, _ = self.value_net(obs, flags=flags)
+        with torch.no_grad():
+            q1, _ = self.critic_net1(obs, acts, flags=flags)
+            q2, _ = self.critic_net2(obs, acts, flags=flags)
+            q = torch.min(q1, q2)
+        # ... rest of the function is the same ...
+        diff = q - v
+        self._batch_diff = diff.detach()  # Shape is now (N, T, 1)
+        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
+        value_loss = (weights * (diff ** 2)).mean()
+
+        self.value_optim.zero_grad()
+        value_loss.backward()
+        self.value_optim.step()
+        return value_loss.item()
+
+    def _update_actor(self, obs, acts, flags=None):
+        action_unit_preds, _ = self.policy_net(obs, flags=flags)
+        predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
+        # ... rest of the function is similar ...
+        weights = 1.0
+        if not self._cloning_only:
+            weights = self._batch_diff
+            if self._has_dropout:
+                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
+            else:
+                weights = torch.clip(torch.exp(self._beta * weights), -100, 100)
+
+        policy_loss = F.mse_loss(predicted_actions, acts.squeeze(-1), reduction='none')
+        policy_loss = (policy_loss * weights).mean()
+
+        self.policy_optim.zero_grad()
+        policy_loss.backward()
+        self.policy_optim.step()
+        return policy_loss.item()

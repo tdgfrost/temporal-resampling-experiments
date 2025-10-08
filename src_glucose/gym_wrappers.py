@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 
-SAMPLE_TIME = 20.0  # minutes
+SAMPLE_TIME = 3.0  # minutes
 for i in range(1, 6):
     register(
         id=f"simglucose/adult{i}-v0",
@@ -19,49 +19,20 @@ for i in range(1, 6):
     )
 
 
-class CombinedObservationWrapper(RecordConstructorArgs, Wrapper):
+class SampleTimeWrapper(RecordConstructorArgs, Wrapper):
     """
-    Replace observations with the continuous state vector carried in `info[state_key]`.
-    You must supply the expected length so we can set observation_space up-front.
+    Allow adjustment of sample time
     """
     def __init__(self, env: gym.Env):
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
-        self.state_key = 'patient_state'
-
-        # Get our info obs
-        patient_state_example = self.env.reset()[1]['patient_state']
-        self.state_dim = patient_state_example.shape
-        self.dtype = patient_state_example.dtype
-
-        # Advertise the new observation space
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=self.state_dim, dtype=self.dtype
-        )
-
-    def observation(self, observation):  # not used; we override via step/reset directly
-        return observation
 
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
         # Update sample time
         self.env.unwrapped.env.env.sample_time = SAMPLE_TIME
         info['sample_time'] = SAMPLE_TIME
-        state = self._extract_state(info)
-        return state, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        state = self._extract_state(info)
-        return state, reward, terminated, truncated, info
-
-    def _extract_state(self, info):
-        if self.state_key not in info:
-            raise KeyError(f"Expected '{self.state_key}' in info, got keys: {list(info.keys())}")
-        state = np.asarray(info[self.state_key], dtype=self.dtype)
-        if state.shape != self.state_dim:
-            raise ValueError(f"{self.state_key} shape {state.shape} != {self.state_dim}")
-        return state
+        return obs, info
 
 
 class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
@@ -158,13 +129,13 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             # return obs, reward, (term or trunc), False, info
             return obs, reward, term, trunc, info
 
-        # Take 5-steps (additional 4 steps)
+        # Take 3-steps (additional 2 steps)
         elif self.current_step_mode == 1:
             gamma = self.gamma
             # Update step_mode for next observation
             self._flip_step_modes()
 
-            for _ in range(4):
+            for _ in range(2):
                 # Take another step (second)
                 obs, reward, term, trunc, info, gamma = self._take_another_step(action, reward, gamma, info)
                 done = term or trunc
@@ -226,8 +197,9 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
 
         assert isinstance(env.observation_space, spaces.Box)
         low, high = env.observation_space.low, env.observation_space.high
+        self.state_dim = (low.shape[0] + 1,)
+        self.dtype = low.dtype
         low, high = np.concatenate([[0], low]), np.concatenate([[1], high])
-        self.state_dim = (self.state_dim[0] + 1,)
         self.observation_space = spaces.Box(
             low=low, high=high, shape=self.state_dim, dtype=self.dtype
         )
@@ -269,7 +241,7 @@ class DecoyObsWrapper(RecordConstructorArgs, Wrapper):
 def make_glucose_env(*, no_interim_rewards: bool = True, gamma: float = 1.0, forced_interval: int = 0,
                      use_flag: bool = True, **kwargs):
     env = T1DPatientEnv(**kwargs)
-    env = CombinedObservationWrapper(env)
+    env = SampleTimeWrapper(env)
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
     env = NormalizeObservation(env)

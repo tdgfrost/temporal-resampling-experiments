@@ -119,15 +119,18 @@ class ReplayBufferEnv:
 
             obs, info, ep_buffer = self.reset(seed=seed)
             model.set_random_seed(seed)
+            lstm_states = None
 
             while frame_count < n_frames:
                 done = False
+                episode_starts = np.ones((1,), dtype=bool)
                 while not done:
-                    action, _ = model.predict(obs)
+                    action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
                     # if with_random and np.random.random() < rand_p:
                         # action = np.random.randint(0, 4)
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
+                    episode_starts[0] = done
 
                     self.update_episode_buffer(obs, action, reward, done, info, ep_buffer)
 
@@ -183,20 +186,22 @@ class ReplayBufferEnv:
 
             self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'{decoy_maybe}done']))]
 
-        # Update the decoy actions (every third step)
-        # - For basal insulin, this involves taking the average of the three actions
+        # Update the decoy actions (every second step)
+        # - For basal insulin, this involves taking the average of the two actions
         actions = [
-            np.mean(ep_buffer['decoy_action'][idx: idx + 3])
-            for idx in range(0, len(ep_buffer['decoy_action']), 3)
+            np.mean(ep_buffer['decoy_action'][idx: idx + 2])
+            for idx in range(0, len(ep_buffer['decoy_action']), 2)
         ]
 
         rewards, dones = [
-            [np.sum(ep_buffer[f'decoy_{key}'][idx: idx + 3]) for idx in range(0, len(ep_buffer['decoy_reward']), 3)]
+            [np.sum(ep_buffer[f'decoy_{key}'][idx: idx + 2]) for idx in range(0, len(ep_buffer['decoy_reward']), 2)]
             for key in ['reward', 'done']
         ]
 
+        # For obs, take the mean observation of the two steps
         obs = [
-            ep_buffer[f'decoy_obs'][idx] for idx in range(0, len(ep_buffer[f'decoy_{key}']), 3)
+            np.mean(ep_buffer[f'decoy_obs'][idx: idx + 2], 0)
+            for idx in range(0, len(ep_buffer[f'decoy_obs']), 2)
         ]
 
         # if not dones[-1]:
@@ -229,6 +234,42 @@ class ReplayBufferEnv:
     @staticmethod
     def _extract_flags(obs):
         return obs[..., 0].unsqueeze(-1).long()
+
+
+class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original class
+    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 10):
+        super().__init__(env, buffer_size)
+        self.sequence_length = sequence_length
+
+    def set_generate_params(self, batch_size: int = None, decoy_interval: int = None, sequence_length: int = None):
+        super().set_generate_params(batch_size=batch_size, decoy_interval=decoy_interval)
+        self.sequence_length = sequence_length if sequence_length is not None else self.sequence_length
+
+        # Adjust n_samples to prevent sampling incomplete sequences
+        total_samples = sum(self.sample_bool[self.decoy_interval])
+        self.n_samples = total_samples - self.sequence_length + 1
+        self.segments = self.n_samples // self.batch_size
+
+    def fetch_transition_batch(self, idxs: torch.Tensor, decoy_interval: int = 0):
+        # This method is now overridden to return sequences
+        assert self._tensors_set, "Replay buffer must be set to tensors first."
+
+        # Instead of indexing, we create sequences for each starting index in idxs
+        obs_batch = torch.stack([self.observations[decoy_interval][i: i + self.sequence_length] for i in idxs])
+        # The 'next_obs' sequence is shifted by one step
+        next_obs_batch = torch.stack(
+            [self.observations[decoy_interval][i + 1: i + self.sequence_length + 1] for i in idxs])
+
+        action_batch = torch.stack([self.actions[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(
+            -1)
+        reward_batch = torch.stack([self.rewards[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(
+            -1)
+        done_batch = torch.stack([self.dones[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(-1)
+
+        flags = self._extract_flags(obs_batch)
+        next_flags = self._extract_flags(next_obs_batch)
+
+        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, flags, next_flags
 
 
 class SaveEachBestCallback(BaseCallback):
@@ -266,10 +307,12 @@ class EnvironmentEvaluator:
             obs, info = self.env.reset()
             done = False
             total_reward = 0.0
+            hidden_state = algo.get_initial_states(batch_size=1)
 
             while not done:
                 with torch.no_grad():
-                    action = algo.predict(np.expand_dims(obs, 0))
+                    action, hidden_state = algo.predict(np.expand_dims(obs, 0),
+                                                        hidden_state=hidden_state)
                 obs, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
                 total_reward += reward
