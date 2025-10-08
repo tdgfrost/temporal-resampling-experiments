@@ -268,7 +268,7 @@ class RecurrentNet(nn.Module):
         # self.init_weights()
 
     def forward(self, x: torch.Tensor, actions: torch.Tensor = None,
-                hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, flags: torch.Tensor = None) -> Tuple[
+                hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # x shape: (N, T, C, H, W), where T is sequence length
         batch_size, seq_len = x.shape[0], x.shape[1]
@@ -306,11 +306,6 @@ class RecurrentNet(nn.Module):
         # (N * T, output_size) -> (N, T, output_size)
         output = output.view(batch_size, seq_len, -1)
 
-        # Note: 'flags' logic might need adjustment depending on its role with sequences.
-        # This example assumes output is directly used or further processed.
-        if flags is not None:
-            output = torch.take_along_dim(output, flags.long(), 2)
-
         if self._has_sigmoid:
             output = torch.sigmoid(output)
 
@@ -339,7 +334,7 @@ class CustomIQL(nn.Module):
         self._feature_size = feature_size
         self._batch_size = batch_size
         self._expectile = expectile
-        self._gamma = gamma
+        self._gamma = torch.tensor(gamma, device=device)
         self._batch_diff = None
         self._input_length = input_length
         self._device = device
@@ -390,12 +385,14 @@ class CustomIQL(nn.Module):
         evaluators=None,
         show_progress: bool = True,
         experiment_name: str = None,
+        decoy_interval: int = 0,
         dataset_kwargs: Optional[Dict] = None
     ):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
         dataset.set_to_tensors(self._device)
         dataset.set_generate_params(**dataset_kwargs)
+        self.decoy_interval = decoy_interval
 
         loss_dict = self._reset_loss_dict()
 
@@ -407,13 +404,13 @@ class CustomIQL(nn.Module):
                 epoch_str = f"{epoch}/{n_epochs_train}"
 
                 for batch in dataset:
-                    obs, acts, rews, next_obs, dones, flags, next_flags = batch
+                    obs, acts, rews, next_obs, dones, visible, next_visible = batch
 
                     # Update the networks
                     if not self._cloning_only:
-                        loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, flags, next_flags))
-                        loss_dict['value_loss'].append(self._update_value(obs, acts, flags))
-                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, flags))
+                        loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, visible, next_visible))
+                        loss_dict['value_loss'].append(self._update_value(obs, acts, visible))
+                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, visible))
 
                     # Soft update of target value network
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
@@ -568,13 +565,13 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         )
 
         # Re-initialize networks with RecurrentNet
-        self.critic_net1 = RecurrentNet(output_size=2, action_encoder=self.action_encoder,
+        self.critic_net1 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
                                         feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = RecurrentNet(output_size=2, action_encoder=self.action_encoder,
+        self.critic_net2 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
                                         feature_extractor=self.feature_extractor, **net_kwargs)
-        self.value_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_value_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.policy_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, has_sigmoid=True,
+        self.value_net = RecurrentNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_value_net = RecurrentNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.policy_net = RecurrentNet(output_size=1, feature_extractor=self.feature_extractor, has_sigmoid=True,
                                        **net_kwargs)
 
         # Give both critic nets to the critic optimizer
@@ -603,10 +600,8 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         # Add batch and sequence dimensions: (L,W) -> (N, L,W)
         obs_tensor = obs_tensor.unsqueeze(0)
 
-        flags = self._extract_flag(obs_tensor)
-
         # Pass the current hidden_state to the policy network
-        action_unit, next_hidden_state = self.policy_net(obs_tensor, flags=flags, hidden_state=hidden_state)
+        action_unit, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
 
         # Remove sequence dimension for scaling
         action_unit = action_unit.squeeze(1)
@@ -619,16 +614,19 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
     # --- Update methods now handle sequences ---
     # The core logic remains the same, but we unpack the network output
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flags=None, next_flags=None):
+    def _update_critic(self, obs, acts, rews, next_obs, dones, visible=None, next_visible=None):
         # We only need the network output, not the final hidden state for training
-        q1, _ = self.critic_net1(obs, acts, flags=flags)
-        q2, _ = self.critic_net2(obs, acts, flags=flags)
+        q1, _ = self.critic_net1(obs, acts)
+        q2, _ = self.critic_net2(obs, acts)
 
         with torch.no_grad():
-            v_next, _ = self.target_value_net(next_obs, flags=next_flags)
+            v_next, _ = self.target_value_net(next_obs)
             r = rews.float()
-            next_multistep_discount = torch.where(flags == 1, 3, 1)  # Note: flags shape is (N, T, 1)
-            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
+
+        if self.decoy_interval == 0:
+            q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible)
+        else:
+            q_target = r + self._gamma * (1 - dones.float()) * v_next
 
         loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
         self.critic_optim.zero_grad()
@@ -636,40 +634,106 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         self.critic_optim.step()
         return loss.item()
 
+
     # The _update_value and _update_actor methods are updated similarly
-    def _update_value(self, obs, acts, flags=None):
-        v, _ = self.value_net(obs, flags=flags)
+    def _update_value(self, obs, acts, visible=None):
+        v, _ = self.value_net(obs)
         with torch.no_grad():
-            q1, _ = self.critic_net1(obs, acts, flags=flags)
-            q2, _ = self.critic_net2(obs, acts, flags=flags)
+            q1, _ = self.critic_net1(obs, acts)
+            q2, _ = self.critic_net2(obs, acts)
             q = torch.min(q1, q2)
         # ... rest of the function is the same ...
         diff = q - v
         self._batch_diff = diff.detach()  # Shape is now (N, T, 1)
         weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
-        value_loss = (weights * (diff ** 2)).mean()
+        value_loss = (weights * (diff ** 2))
+        # Apply mask
+        if self.decoy_interval == 0:
+            value_loss = value_loss[visible.squeeze(-1)]
+        value_loss = value_loss.mean()
 
         self.value_optim.zero_grad()
         value_loss.backward()
         self.value_optim.step()
         return value_loss.item()
 
-    def _update_actor(self, obs, acts, flags=None):
-        action_unit_preds, _ = self.policy_net(obs, flags=flags)
+    def _update_actor(self, obs, acts, visible=None):
+        action_unit_preds, _ = self.policy_net(obs)
         predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
         # ... rest of the function is similar ...
         weights = 1.0
         if not self._cloning_only:
             weights = self._batch_diff
             if self._has_dropout:
-                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
+                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
             else:
-                weights = torch.clip(torch.exp(self._beta * weights), -100, 100)
+                weights = torch.clip(torch.exp(self._beta * weights), -100, 100).squeeze()
 
-        policy_loss = F.mse_loss(predicted_actions, acts.squeeze(-1), reduction='none')
-        policy_loss = (policy_loss * weights).mean()
+        policy_loss = F.mse_loss(predicted_actions, acts.view(predicted_actions.shape), reduction='none').squeeze()
+        policy_loss = (policy_loss * weights)
+        # Apply mask
+        if self.decoy_interval == 0:
+            policy_loss = policy_loss[visible.squeeze(-1)]
+        policy_loss = policy_loss.mean()
 
         self.policy_optim.zero_grad()
         policy_loss.backward()
         self.policy_optim.step()
         return policy_loss.item()
+
+    def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible):
+        # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
+        N, T = visible.shape[:2]
+        dev = q1.device
+        dtype = r.dtype
+
+        vis = visible.squeeze(-1).bool()  # (N,T)
+        nvis = next_visible.squeeze(-1).bool()  # (N,T)
+        dn = dones.squeeze(-1).bool()  # (N,T)
+
+        t_idx = torch.arange(T, device=dev).unsqueeze(0).expand(N, T)
+        none = torch.full((N, T), T, device=dev)
+
+        def next_true_idx(mask):  # earliest j >= t if exists else T
+            cand = torch.where(mask, t_idx, none)
+            rev = torch.flip(cand, dims=[1])
+            suf = torch.cummin(rev, dim=1).values
+            return torch.flip(suf, dims=[1])
+
+        next_done = next_true_idx(dn)
+        next_nv = next_true_idx(nvis)
+
+        # prefer next_visible unless dones occurs earlier or at the same time
+        target_idx = torch.where(next_done <= next_nv, next_done, next_nv)  # (N,T)
+        valid = vis & (target_idx < T)
+
+        # gather helpers
+        b_full = torch.arange(N, device=dev).unsqueeze(1).expand(N, T)
+        b = b_full[valid]  # (M,)
+        i = t_idx[valid]  # (M,)
+        j = target_idx[valid]  # (M,)
+
+        # select current Q-values at visible timesteps
+        q1_sel = q1[b, i]
+        q2_sel = q2[b, i]
+
+        # n-step reward sum over [i..j] with constant gamma
+        r_flat = r.squeeze(-1)  # (N,T)
+        pow_t = torch.pow(self._gamma, torch.arange(T, device=dev, dtype=dtype))  # (T,)
+        rg = r_flat * pow_t  # r_t * γ^t
+        S = torch.cumsum(rg, dim=1)  # prefix sum of r_t * γ^t
+
+        Sj = S[b, j]
+        Si_1 = torch.where(i > 0, S[b, i - 1], torch.zeros_like(Sj))
+        gamma_neg_i = torch.pow(self._gamma, -i.to(dtype))
+        R_i_j = gamma_neg_i * (Sj - Si_1)  # Σ_{k=i..j} γ^{k-i} r_k   (M,)
+
+        # bootstrap from s_{j+1} with γ^(j-i+1) and (1 - done_j)
+        vnext_j = v_next[b, j].squeeze(-1)  # (M,)
+        done_j = dn[b, j].to(dtype)  # (M,)
+        expo = torch.pow(self._gamma,
+                         (j - i + 1).to(dtype))  # (M,)
+
+        q_target_sel = R_i_j.unsqueeze(-1) + (expo * (1 - done_j) * vnext_j).unsqueeze(-1)
+
+        return q1_sel, q2_sel, q_target_sel

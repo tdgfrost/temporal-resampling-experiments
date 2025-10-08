@@ -84,7 +84,7 @@ if __name__ == "__main__":
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
         model = RecurrentPPO("MlpLstmPolicy", make_glucose_env(),
-                             ent_coef=0.005, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
+                             ent_coef=0.001, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
@@ -147,6 +147,7 @@ if __name__ == "__main__":
                 n_epochs_train=10 if EXPECTILE == 0.5 else 5,
                 n_epochs_eval=1,
                 evaluators=evaluators,
+                decoy_interval=DECOY_INTERVAL,
                 dataset_kwargs={'decoy_interval': DECOY_INTERVAL, 'batch_size': 32},
             )
             for key in evaluators.keys():

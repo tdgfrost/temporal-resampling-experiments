@@ -29,6 +29,9 @@ class ReplayBufferEnv:
         self.sample_bool = {
             i: deque(maxlen=buffer_size) for i in range(3)
         }
+        self.visible_states = {
+            i: deque(maxlen=buffer_size) for i in range(3)
+        }
 
         self.buffer_size = buffer_size
         self.env = env
@@ -74,6 +77,7 @@ class ReplayBufferEnv:
             ('rewards', self.rewards),
             ('dones', self.dones),
             ('sample_bool', self.sample_bool),
+            ('visible_states', self.visible_states)
         ]:
             save_dict = {i: list(value[i]) for i in range(3)}
             np.savez(os.path.join(path, f'{key}.npz'),
@@ -90,6 +94,7 @@ class ReplayBufferEnv:
             ('rewards', self.rewards),
             ('dones', self.dones),
             ('sample_bool', self.sample_bool),
+            ('visible_states', self.visible_states)
         ]:
             loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
             for k in loaded.files:
@@ -105,10 +110,11 @@ class ReplayBufferEnv:
     @staticmethod
     def _reset_ep_buffer(obs, info):
         return {
-            'obs': [obs], 'decoy_obs': [info['obs'][0]],
-            'action': [], 'decoy_action': [],
-            'reward': [], 'decoy_reward': [],
-            'done': [], 'decoy_done': [],
+            'all_obs': [obs],
+            'all_action': [],
+            'all_reward': [],
+            'all_done': [],
+            'visible_state': [obs[0] == 0]
         }
 
     def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, with_random: bool = True, rand_p: float = 0.05):
@@ -127,7 +133,7 @@ class ReplayBufferEnv:
                 while not done:
                     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
                     # if with_random and np.random.random() < rand_p:
-                        # action = np.random.randint(0, 4)
+                        # action = self.env.action_space.sample()
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
                     episode_starts[0] = done
@@ -135,8 +141,7 @@ class ReplayBufferEnv:
                     self.update_episode_buffer(obs, action, reward, done, info, ep_buffer)
 
                     if done:
-                        ep_buffer['obs'] = ep_buffer['obs'][:-1]
-                        ep_buffer['decoy_obs'] = ep_buffer['decoy_obs'][:-1]
+                        ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
                         obs, info = self.env.reset(seed=seed + frame_count)
 
                     pbar.update(1)
@@ -149,19 +154,19 @@ class ReplayBufferEnv:
                 ep_buffer = self._reset_ep_buffer(obs, info)
 
             # Add a garbage all-zeros "final obs"
-            for i in [0, 1, 2]:
+            for i in range(3):
                 self.observations[i] += [np.zeros_like(self.observations[0][0])]
 
     def set_to_tensors(self, device: str = 'cpu'):
         if self._tensors_set:
             if self._device == device:
                 return
-            for i in [0, 1, 2]:
-                for arr in [self.observations, self.actions, self.rewards, self.dones]:
+            for i in range(3):
+                for arr in [self.observations, self.actions, self.rewards, self.dones, self.visible_states]:
                     arr[i] = arr[i].to(device)
         else:
-            for i in [0, 1, 2]:
-                for arr in [self.observations, self.actions, self.rewards, self.dones]:
+            for i in range(3):
+                for arr in [self.observations, self.actions, self.rewards, self.dones, self.visible_states]:
                     arr[i] = torch.from_numpy(np.array(arr[i])).to(device)
 
         self._tensors_set = True
@@ -169,40 +174,47 @@ class ReplayBufferEnv:
 
     @staticmethod
     def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict, ep_buffer: dict):
-        for key in ['obs', 'action', 'reward', 'done']:
-            ep_buffer[f'decoy_{key}'] += info[key]
-
-        ep_buffer['obs'] += [obs]
-        ep_buffer['action'] += [action]
-        ep_buffer['reward'] += [reward]
-        ep_buffer['done'] += [done]
+        ep_buffer['all_obs'] += [obs]
+        ep_buffer['all_action'] += [action]
+        ep_buffer['all_reward'] += [reward]
+        ep_buffer['all_done'] += [done]
+        ep_buffer['visible_state'] += [obs[0] == 0]
 
     def update_permanent_buffer(self, ep_buffer: dict):
-        for i, decoy_maybe in [(0, ''), (1, 'decoy_')]:
+        visible_idxs = ep_buffer['visible_state']
+        for i in range(2):
             for arr, key in [
                 (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
             ]:
-                arr[i] += ep_buffer[f'{decoy_maybe}{key}']
+                if i == 1 and key == 'obs':
+                    ep_buffer[f'all_{key}'] = np.stack(ep_buffer[f'all_{key}'])
+                    ep_buffer[f'all_{key}'][:, :2] = 0  # Set the flags to 0 for the non-decoy buffer
+                    ep_buffer[f'all_{key}'] = ep_buffer[f'all_{key}'].tolist()
+                arr[i] += ep_buffer[f'all_{key}']
+                self.visible_states[0] += visible_idxs
 
-            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'{decoy_maybe}done']))]
+            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
 
         # Update the decoy actions (every second step)
         # - For basal insulin, this involves taking the average of the two actions
         actions = [
-            np.mean(ep_buffer['decoy_action'][idx: idx + 2])
-            for idx in range(0, len(ep_buffer['decoy_action']), 2)
+            np.mean(ep_buffer['all_action'][idx: idx + 2])
+            for idx in range(0, len(ep_buffer['all_action']), 2)
         ]
 
         rewards, dones = [
-            [np.sum(ep_buffer[f'decoy_{key}'][idx: idx + 2]) for idx in range(0, len(ep_buffer['decoy_reward']), 2)]
+            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 2]) for idx in range(0, len(ep_buffer['all_reward']), 2)]
             for key in ['reward', 'done']
         ]
 
         # For obs, take the mean observation of the two steps
-        obs = [
-            np.mean(ep_buffer[f'decoy_obs'][idx: idx + 2], 0)
-            for idx in range(0, len(ep_buffer[f'decoy_obs']), 2)
-        ]
+        obs = np.stack([
+            np.mean(ep_buffer['all_obs'][idx: idx + 2], 0)
+            for idx in range(0, len(ep_buffer['all_obs']), 2)
+        ])
+        # Change the steps_remaining flag to 0
+        obs[:, :2] = 0
+        obs = obs.tolist()
 
         # if not dones[-1]:
             # rewards[-1] = ep_buffer['reward'][-1]
@@ -213,6 +225,7 @@ class ReplayBufferEnv:
         self.rewards[2] += rewards
         self.dones[2] += dones
         self.sample_bool[2] += [True for _ in range(len(dones))]
+        self.visible_states[2] += [True for _ in range(len(dones))]
 
     def sample_transition_batch(self, batch_size: int = 32, decoy_interval: int = 0):
         idxs = torch.randint(0, len(self.observations[decoy_interval]) - 1, (batch_size,), device=self._device)
@@ -247,7 +260,7 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
 
         # Adjust n_samples to prevent sampling incomplete sequences
         total_samples = sum(self.sample_bool[self.decoy_interval])
-        self.n_samples = total_samples - self.sequence_length + 1
+        self.n_samples = total_samples - self.sequence_length
         self.segments = self.n_samples // self.batch_size
 
     def fetch_transition_batch(self, idxs: torch.Tensor, decoy_interval: int = 0):
@@ -266,10 +279,15 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
             -1)
         done_batch = torch.stack([self.dones[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(-1)
 
-        flags = self._extract_flags(obs_batch)
-        next_flags = self._extract_flags(next_obs_batch)
+        visible_batch = torch.stack(
+            [self.visible_states[decoy_interval][i: i + self.sequence_length] for
+                i in idxs]).unsqueeze(-1)
 
-        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, flags, next_flags
+        next_visible_batch = torch.stack(
+            [self.visible_states[decoy_interval][i + 1: i + self.sequence_length + 1] for
+        i in idxs]).unsqueeze(-1)
+
+        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, visible_batch, next_visible_batch
 
 
 class SaveEachBestCallback(BaseCallback):

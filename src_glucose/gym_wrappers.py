@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 
-SAMPLE_TIME = 3.0  # minutes
+SAMPLE_TIME = 60.0  # minutes
 for i in range(1, 6):
     register(
         id=f"simglucose/adult{i}-v0",
@@ -84,106 +84,41 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     'bonus' steps using the same action.
     """
 
-    def __init__(self, env: gym.Env, forced_interval: int = 0, gamma: float = 1.0) -> None:
+    def __init__(self, env: gym.Env, forced_interval: int = 0) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
-        # super().__init__(env)
-        self.last_step_mode = 0
-        self.current_step_mode = 0
+        self.last_action = None
+        self.steps_until_action_available = 0
+        self.next_waiting_period = 0
         assert 0 <= forced_interval <= 1, "Forced interval must be 0 or 1"
         self.forced_interval = forced_interval
-        self.gamma = gamma
-        assert 0.0 < gamma <= 1.0, "Gamma must be in (0.0, 1.0]"
 
     def reset(self, *args, **kwargs) -> np.ndarray:
-        self.last_step_mode = 0
-        self.current_step_mode = 0
-        # self.step_count = 0
+        self.last_action = None
+        self.steps_until_action_available = 0
+        self.next_waiting_period = 0
         obs, info = self.env.reset(*args, **kwargs)
-        info['obs'] = [obs]
-        info['action'] = []
-        info['reward'] = []
-        info['done'] = []
-        info = self._take_no_additional_steps(info)
         return obs, info
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        # Do our first genuine environment step
-        obs, reward, term, trunc, info = self._take_first_step(action)
-        done = term or trunc
-
-        # Decide if we are forcing 1-step intervals
-        if self.forced_interval:
-            info = self._take_no_additional_steps(info)
-            info['done'][-1] = done
-            # return obs, reward, (term or trunc), False, info
-            return obs, reward, term, trunc, info
-
-        # Take 1-step only (or if environment has already terminated)
-        if done or self.current_step_mode == 0:
-            # Update step_mode for next observation
-            self._flip_step_modes()
-
-            info = self._take_no_additional_steps(info)
-            info['done'][-1] = done
-            # return obs, reward, (term or trunc), False, info
-            return obs, reward, term, trunc, info
-
-        # Take 3-steps (additional 2 steps)
-        elif self.current_step_mode == 1:
-            gamma = self.gamma
-            # Update step_mode for next observation
-            self._flip_step_modes()
-
-            for _ in range(2):
-                # Take another step (second)
-                obs, reward, term, trunc, info, gamma = self._take_another_step(action, reward, gamma, info)
-                done = term or trunc
-                if done:
-                    break
-
-            info['done'][-1] = done
-            return obs, reward, term, trunc, info
-
+        if self.steps_until_action_available == 0:
+            # Do the action
+            obs, reward, term, trunc, info = self.env.step(action)
+            # flip the steps, calculate steps remaining
+            self._flip_step_modes(action)
         else:
-            raise ValueError(f"Invalid step_mode: {self.step_mode}")
+            # Repeat the last action
+            obs, reward, term, trunc, info = self.env.step(self.last_action)
 
-    def _flip_step_modes(self):
-        self.last_step_mode = self.current_step_mode
-        self.current_step_mode = np.random.randint(0, 2)
+            # Deduce 1 step from steps remaining
+            self.steps_until_action_available -= 1
 
-    def _take_first_step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs, reward, term, trunc, info = self.env.step(action)
-        info['obs'] = [obs]
-        info['action'] = [action]
-        info['reward'] = [reward]
-        info['done'] = [term or trunc]
-        info['bonus_steps_taken'] = 0
         return obs, reward, term, trunc, info
 
-    @staticmethod
-    def _take_no_additional_steps(info):
-        return info
-
-    def _take_another_step(self, action: Any, reward: Any, gamma: float, base_info: Dict[str, Any]) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        # Take additional step
-        base_info['bonus_steps_taken'] += 1
-
-        obs, new_reward, term, trunc, new_info = self.env.step(action)
-        reward += gamma * new_reward
-
-        # Update return variables
-        base_info = self._update_info(base_info, new_info)
-        base_info['obs'].append(obs)
-        base_info['action'].append(action)
-        base_info['reward'].append(new_reward)
-        base_info['done'].append(term or trunc)
-        return obs, reward, term, trunc, base_info, gamma * self.gamma
-
-    @staticmethod
-    def _update_info(base_info, new_info):
-        base_info.update(new_info)
-        return base_info
+    def _flip_step_modes(self, action: Any):
+        self.steps_until_action_available = self.next_waiting_period
+        self.next_waiting_period = np.random.choice([0, 2])
+        self.last_action = action
 
 
 class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
@@ -197,9 +132,9 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
 
         assert isinstance(env.observation_space, spaces.Box)
         low, high = env.observation_space.low, env.observation_space.high
-        self.state_dim = (low.shape[0] + 1,)
+        self.state_dim = (low.shape[0] + 2,)
         self.dtype = low.dtype
-        low, high = np.concatenate([[0], low]), np.concatenate([[1], high])
+        low, high = np.concatenate([[0, 0], low]), np.concatenate([[1, 2], high])
         self.observation_space = spaces.Box(
             low=low, high=high, shape=self.state_dim, dtype=self.dtype
         )
@@ -208,34 +143,9 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     def observation(self, obs):
         # Concat flag (0/1) to the start of the channels
         # - always set to 0 if use_flag = False
-        val = 1 if self.env.get_wrapper_attr("current_step_mode") == 1 and self.use_flag else 0 # 0 for no repeat, 1 for repeat
-        flag = np.full((1,), val, dtype=np.uint8)
-        return np.concatenate([flag, obs], axis=-1)
-
-
-class DecoyObsWrapper(RecordConstructorArgs, Wrapper):
-    def __init__(self, env):
-        RecordConstructorArgs.__init__(self)
-        Wrapper.__init__(self, env)
-
-    def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
-        info = self._fill_obs(info)
-        return obs, info
-
-    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs, rew, term, trunc, info = self.env.step(action)
-        info = self._fill_obs(info)
-        return obs, rew, term, trunc, info
-
-    @staticmethod
-    def _fill_obs(info):
-        for idx, vanilla_obs in enumerate(info['obs']):
-            # Always set decoy obs flag to zero and concat to the start of the channels
-            flag = np.full((1,), 0, dtype=vanilla_obs.dtype)
-            obs = np.concatenate([flag, vanilla_obs], axis=-1)
-            info['obs'][idx] = obs
-        return info
+        steps_left = self.env.get_wrapper_attr("steps_until_action_available") if self.use_flag else 0
+        waiting_period = self.env.get_wrapper_attr("next_waiting_period") if self.use_flag else 0
+        return np.concatenate([[steps_left, waiting_period], obs], axis=-1)
 
 
 def make_glucose_env(*, no_interim_rewards: bool = True, gamma: float = 1.0, forced_interval: int = 0,
@@ -245,7 +155,6 @@ def make_glucose_env(*, no_interim_rewards: bool = True, gamma: float = 1.0, for
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
     env = NormalizeObservation(env)
-    env = AlternateStepWrapper(env, forced_interval=forced_interval, gamma=gamma)
+    env = AlternateStepWrapper(env, forced_interval=forced_interval)
     env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
-    env = DecoyObsWrapper(env)
     return env
