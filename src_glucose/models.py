@@ -108,6 +108,58 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
         return self.net(observations)
 
 
+class CustomNormalDistribution(DiagGaussianDistribution):
+    def __init__(self, action_dim: int = 1, low=0.0, high=2.0, k: float = 1.5, eps: float = 1e-8):
+        super().__init__(action_dim)
+        self.low = torch.as_tensor(low)
+        self.high = torch.as_tensor(high)
+        self.range = self.high - self.low
+        self.k = torch.as_tensor(k)              # allow tensor per-dim if needed
+        self.eps = eps
+        self._pre = None
+
+    @staticmethod
+    def _logit(x, eps):
+        x = x.clamp(eps, 1 - eps)
+        return torch.log(x) - torch.log1p(-x)
+
+    def _squash(self, u):
+        s = torch.sigmoid(u)
+        a01 = s.pow(self.k)                   # power warp
+        return self.low + self.range * a01
+
+    def _unsquash(self, a_env):
+        a01 = ((a_env - self.low) / self.range).clamp(self.eps, 1 - self.eps)
+        s = a01.pow(1.0 / self.k).clamp(self.eps, 1 - self.eps)
+        return self._logit(s, self.eps), s, a01
+
+    def sample(self):
+        self._pre = super().sample()
+        return self._squash(self._pre)
+
+    def mode(self):
+        self._pre = super().mode()
+        return self._squash(self._pre)
+
+    def log_prob(self, a_env):
+        u, s, a01 = self._unsquash(a_env)
+        lp = super().log_prob(u)
+        # Jacobian: -log(range*k) - k*log(s) - log(1-s)
+        c = torch.sum(torch.log(self.range)) + torch.sum(torch.log(self.k))
+        jac = - (self.k * torch.log(s.clamp(self.eps, 1 - self.eps))).sum(dim=1) \
+              - (torch.log1p(-s.clamp(self.eps, 1 - self.eps))).sum(dim=1) \
+              - c
+        return lp + jac
+
+    def entropy(self):
+        return None
+
+    def log_prob_from_params(self, mean_actions, log_std):
+        a_env = self.actions_from_params(mean_actions, log_std)
+        return a_env, self.log_prob(a_env)
+
+
+
 class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
     """
     A custom recurrent policy that applies a transformation to the action logits.
@@ -117,28 +169,30 @@ class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        self.action_dist = CustomNormalDistribution()
+
         # ✅ Initialize the final layer (action_net) for small initial actions
         # We set the bias to a large negative number.
         # This makes the initial logits negative, pushing tanh(logits) towards -1.
         # The result is an initial action close to `(-1 + 1) * 15 = 0`.
         # The weight initialization helps stabilize learning at the start.
-        # if hasattr(self.action_net, "bias"):
+        if hasattr(self.action_net, "bias"):
             # A value like -5 or -10 is a good starting point
-            # nn.init.constant_(self.action_net.bias, -1)
+            nn.init.constant_(self.action_net.bias, -2)
 
         # It's also good practice to initialize the weights to a small scale
         # nn.init.orthogonal_(self.action_net.weight, 0.01)
-
+    """
     def _get_action_dist_from_latent(
         self, latent_pi: torch.Tensor, latent_sde: Optional[torch.Tensor] = None
     ) -> DiagGaussianDistribution:
-        """
+        '''
         Overrides the base method to apply the custom transformation.
 
         :param latent_pi: Features from the policy network.
         :param latent_sde: Features for state-dependent exploration (not used here).
         :return: A Gaussian distribution with the transformed mean.
-        """
+        '''
         # Get the raw network output (logits)
         mean_actions = self.action_net(latent_pi)
 
@@ -156,6 +210,7 @@ class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
         return self.action_dist.proba_distribution(
             transformed_mean_actions, self.log_std
         )
+    """
 
 
 class ScaleAction(nn.Module):
@@ -514,7 +569,7 @@ class CustomIQL(nn.Module):
             # current_multistep_discount = torch.where(flags == 1, 2, 0)
             # r = self._gamma ** current_multistep_discount * rews.float()
             r = rews.float()
-            next_multistep_discount = torch.where(flags == 1, 6, 1)
+            next_multistep_discount = torch.where(flags == 1, 3, 1)
             q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
 
         loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
