@@ -134,8 +134,8 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
     def _flip_step_modes(self, action: Any):
         self.steps_until_action_available = self.next_waiting_period
-        # self.next_waiting_period = np.random.choice([0, 5])
-        self.next_waiting_period, self.last_waiting_period = self.last_waiting_period, self.next_waiting_period
+        self.next_waiting_period = np.random.choice([0, 2])
+        # self.next_waiting_period, self.last_waiting_period = self.last_waiting_period, self.next_waiting_period
         self.last_action = action
 
 
