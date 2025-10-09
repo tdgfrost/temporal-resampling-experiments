@@ -3,14 +3,14 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces, ObservationWrapper
 from gymnasium.utils import RecordConstructorArgs
-from gymnasium.wrappers import NormalizeObservation
+from gymnasium.wrappers import NormalizeObservation, NormalizeReward
 from minigrid.wrappers import ImgObsWrapper, Wrapper
 from gymnasium.envs.registration import register
 from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 
-SAMPLE_TIME = 10.0  # minutes
+SAMPLE_TIME = 3.0  # minutes
 for i in range(1, 6):
     register(
         id=f"simglucose/adult{i}-v0",
@@ -61,7 +61,7 @@ class T1DPatientEnv(Wrapper):
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        i = np.random.randint(1, 6)
+        i = 1  # np.random.randint(1, 6)
         identity = f"simglucose/adult{i}-v0"
         env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
@@ -69,7 +69,7 @@ class T1DPatientEnv(Wrapper):
     def reset(self, **kwargs):
         # Rebuild env each reset
         self.env.close()  # cleanup
-        i = np.random.randint(1, 6)
+        i = 1  # np.random.randint(1, 6)
         identity = f"simglucose/adult{i}-v0"
         self.env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
@@ -165,9 +165,11 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
 
 
 def make_glucose_env(*, no_interim_rewards: bool = True, gamma: float = 1.0, forced_interval: int = 0,
-                     use_flag: bool = True, **kwargs):
+                     use_flag: bool = True, use_scaling: bool = False, **kwargs):
     env = T1DPatientEnv(**kwargs)
     env = SampleTimeWrapper(env)
+    if use_scaling:
+        env = NormalizeReward(env, gamma=gamma)
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
     env = AlternateStepWrapper(env, forced_interval=forced_interval)

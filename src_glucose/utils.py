@@ -41,6 +41,8 @@ class ReplayBufferEnv:
         self.decoy_interval = 0
         self.n_samples = 0
         self.segments = self.n_samples // self.batch_size
+        self.max_rewards_scale = None
+        self.min_rewards_scale = None
 
     def __iter__(self):
         return iter(self.generate())
@@ -83,6 +85,10 @@ class ReplayBufferEnv:
             np.savez(os.path.join(path, f'{key}.npz'),
                      **{str(k): v for k, v in save_dict.items()})
 
+        # Also save min/max rewards scale
+        np.savez(os.path.join(path, 'rewards_scale.npz'),
+                 ** {'min': self.min_rewards_scale, 'max': self.max_rewards_scale})
+
         # Mark saving as complete
         with open(os.path.join(path, 'COMPLETE'), 'w') as f:
             f.close()
@@ -99,6 +105,11 @@ class ReplayBufferEnv:
             loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
             for k in loaded.files:
                 value[int(k)] = deque(loaded[k], maxlen=self.buffer_size)
+
+        # Load min/max rewards scale
+        loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
+        self.min_rewards_scale = float(loaded_scale['min'])
+        self.max_rewards_scale = float(loaded_scale['max'])
 
         self.set_generate_params()
 
@@ -156,6 +167,18 @@ class ReplayBufferEnv:
             # Add a garbage all-zeros "final obs"
             for i in range(3):
                 self.observations[i] += [np.zeros_like(self.observations[0][0])]
+
+            # Normalise rewards from 0 to 1
+            for i in [0, 1, 2]:
+                rewards = np.array(self.rewards[i])
+                min_r, max_r = rewards.min(), rewards.max()
+                if max_r > min_r:
+                    norm_rewards = (rewards - min_r) / (max_r - min_r)
+                else:
+                    norm_rewards = rewards - min_r  # All zeros
+                self.rewards[i] = deque(norm_rewards.tolist(), maxlen=self.buffer_size)
+                self.min_rewards_scale = min_r
+                self.max_rewards_scale = max_r
 
     def set_to_tensors(self, device: str = 'cpu'):
         if self._tensors_set:
@@ -314,10 +337,15 @@ class SaveEachBestCallback(BaseCallback):
 
 
 class EnvironmentEvaluator:
-    def __init__(self, env, n_trials: int):
+    def __init__(self, env, n_trials: int, min_scale_rewards: float = 0.0, max_scale_rewards: float = 1.0):
         assert n_trials > 0, "n_trials must be positive"
+        assert max_scale_rewards > min_scale_rewards, "max_scale_rewards must be greater than min_scale_rewards"
+        # Scale rewards to [0, 1]
         self.env = env
         self.n_trials = n_trials
+
+        self.min_scale = min_scale_rewards
+        self.max_scale = max_scale_rewards
 
     def __call__(self, algo) -> float:
         mean_returns = []
@@ -335,6 +363,8 @@ class EnvironmentEvaluator:
                 done = terminated or truncated
                 total_reward += reward
 
+            # Scale total reward to [0, 1]
+            total_reward = (total_reward - self.min_scale) / (self.max_scale - self.min_scale)
             mean_returns.append(total_reward)
 
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))

@@ -68,7 +68,7 @@ if __name__ == "__main__":
         features_extractor_class=PPOMiniGridFeaturesExtractor,
         features_extractor_kwargs=dict(features_dim=128),
         activation_fn=nn.ReLU,
-        net_arch=[128, 128]
+        net_arch=[128, 128],
     )
 
     if train_ppo:
@@ -83,7 +83,7 @@ if __name__ == "__main__":
                                      deterministic=False,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = RecurrentPPO("MlpLstmPolicy", make_glucose_env(),
+        model = RecurrentPPO("MlpLstmPolicy", env=make_glucose_env(no_interim_rewards=False, use_scaling=True), learning_rate=0.001,
                              ent_coef=0.01, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
@@ -122,7 +122,10 @@ if __name__ == "__main__":
         ]:
             evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=flag,
                                                                     forced_interval=interval),
-                                                   n_trials=20)
+                                                   n_trials=20,
+                                                   min_scale_rewards = replay_buffer_env.min_rewards_scale,
+                                                   max_scale_rewards = replay_buffer_env.max_rewards_scale,
+            )
 
         for n_trial in range(10):
             logs['expectile'].append(EXPECTILE)
