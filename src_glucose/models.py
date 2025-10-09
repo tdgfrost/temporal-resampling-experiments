@@ -12,6 +12,8 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch.distributions import Categorical
 from tqdm import tqdm
 from collections import deque
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+from stable_baselines3.common.distributions import DiagGaussianDistribution
 
 
 class CallablePPO(PPO):
@@ -104,6 +106,56 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.net(observations)
+
+
+class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
+    """
+    A custom recurrent policy that applies a transformation to the action logits.
+    Transformation: (tanh(logits) + 1) * 15
+    This maps the output of the action network to the range [0, 30].
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # ✅ Initialize the final layer (action_net) for small initial actions
+        # We set the bias to a large negative number.
+        # This makes the initial logits negative, pushing tanh(logits) towards -1.
+        # The result is an initial action close to `(-1 + 1) * 15 = 0`.
+        # The weight initialization helps stabilize learning at the start.
+        # if hasattr(self.action_net, "bias"):
+            # A value like -5 or -10 is a good starting point
+            # nn.init.constant_(self.action_net.bias, -1)
+
+        # It's also good practice to initialize the weights to a small scale
+        # nn.init.orthogonal_(self.action_net.weight, 0.01)
+
+    def _get_action_dist_from_latent(
+        self, latent_pi: torch.Tensor, latent_sde: Optional[torch.Tensor] = None
+    ) -> DiagGaussianDistribution:
+        """
+        Overrides the base method to apply the custom transformation.
+
+        :param latent_pi: Features from the policy network.
+        :param latent_sde: Features for state-dependent exploration (not used here).
+        :return: A Gaussian distribution with the transformed mean.
+        """
+        # Get the raw network output (logits)
+        mean_actions = self.action_net(latent_pi)
+
+        # Apply your custom transformation
+        transformed_mean_actions = torch.sigmoid(mean_actions) * 30
+
+        # This example assumes a continuous action space (DiagGaussianDistribution).
+        # If you have a different action distribution, you'll need to adapt this part.
+        if not isinstance(self.action_dist, DiagGaussianDistribution):
+            raise ValueError(
+                "This custom policy is designed for DiagGaussianDistribution."
+            )
+
+        # Return the action distribution using the transformed mean
+        return self.action_dist.proba_distribution(
+            transformed_mean_actions, self.log_std
+        )
 
 
 class ScaleAction(nn.Module):

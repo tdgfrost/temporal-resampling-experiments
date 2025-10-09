@@ -80,10 +80,10 @@ if __name__ == "__main__":
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
                                      eval_freq=2000,
-                                     deterministic=False,
+                                     deterministic=True,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = RecurrentPPO("MlpLstmPolicy", env=make_glucose_env(no_interim_rewards=False, use_scaling=True), learning_rate=0.001,
+        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.001,
                              ent_coef=0.01, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
