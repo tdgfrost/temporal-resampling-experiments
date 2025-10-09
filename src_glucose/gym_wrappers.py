@@ -118,7 +118,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         return obs, info
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        if self.steps_until_action_available == 0:
+        if self.steps_until_action_available == 0 or self.forced_interval == 1:
             # Do the action
             obs, reward, term, trunc, info = self.env.step(action)
             # flip the steps, calculate steps remaining
