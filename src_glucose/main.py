@@ -118,7 +118,7 @@ if __name__ == "__main__":
         # Get our evaluators
         evaluators = {}
         for key, (interval, flag) in [
-            ["glucose_1_3", (0, not DECOY_INTERVAL)],
+            ["glucose_1_5", (0, not DECOY_INTERVAL)],
             ["glucose_1_1", (1, False)],
         ]:
             evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=flag,
@@ -149,7 +149,7 @@ if __name__ == "__main__":
 
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
-                n_epochs_train=5 if EXPECTILE == 0.5 else 2,
+                n_epochs_train=5,
                 n_epochs_eval=1,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
