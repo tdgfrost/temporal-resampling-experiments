@@ -23,7 +23,7 @@ parser.add_argument('--dropout_p', default=0.2, type=float, help='MC dropout pro
 parser.add_argument('--beta', default=1., type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
-GAMMA = 1.0
+GAMMA = 0.99
 
 
 """
@@ -86,7 +86,7 @@ if __name__ == "__main__":
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
         model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.001, ent_coef=0.01,
-                             clip_range=0.02, policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1, device='cpu')
+                             clip_range=0.02, policy_kwargs=policy_kwargs, gamma=1.0, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
