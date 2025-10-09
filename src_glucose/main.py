@@ -69,7 +69,6 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=128),
         activation_fn=nn.ReLU,
         net_arch=[128, 128],
-        log_std_init=-3,
     )
 
 

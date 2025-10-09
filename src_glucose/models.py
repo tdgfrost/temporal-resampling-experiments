@@ -9,12 +9,17 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from torch.distributions import Categorical
+from stable_baselines3.common.distributions import TanhBijector
+from torch.distributions import Categorical, Beta, constraints, TransformedDistribution, AffineTransform, Normal
+from stable_baselines3.common.distributions import Distribution, sum_independent_dims
+from stable_baselines3.common.utils import FloatSchedule, ConstantSchedule
 from tqdm import tqdm
 from collections import deque
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
-from stable_baselines3.common.distributions import DiagGaussianDistribution
+from stable_baselines3.common.distributions import DiagGaussianDistribution, SquashedDiagGaussianDistribution
+from typing import TypeVar
 
+SelfSquashedDiagGaussianDistribution = TypeVar("SelfSquashedDiagGaussianDistribution", bound="SquashedDiagGaussianDistribution")
 
 class CallablePPO(PPO):
     """
@@ -108,55 +113,73 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
         return self.net(observations)
 
 
-class CustomNormalDistribution(DiagGaussianDistribution):
-    def __init__(self, action_dim: int = 1, low=0.0, high=2.0, k: float = 1.5, eps: float = 1e-8):
+class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
+    """
+    Gaussian distribution with diagonal covariance matrix, followed by a squashing function (tanh) to ensure bounds.
+
+    :param action_dim: Dimension of the action space.
+    :param epsilon: small value to avoid NaN due to numerical imprecision.
+    """
+
+    def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
         super().__init__(action_dim)
-        self.low = torch.as_tensor(low)
-        self.high = torch.as_tensor(high)
-        self.range = self.high - self.low
-        self.k = torch.as_tensor(k)              # allow tensor per-dim if needed
-        self.eps = eps
-        self._pre = None
+        self.scale = float(high - low) / 2.0
+        self.bias = float(high + low) / 2.0
+        self.param_head = None
+        self.dummy_log_std = None
+        self.gaussian_actions = None
+        self.epsilon = 1e-6
 
-    @staticmethod
-    def _logit(x, eps):
-        x = x.clamp(eps, 1 - eps)
-        return torch.log(x) - torch.log1p(-x)
+    def proba_distribution_net(self, latent_dim: int, log_std_init: float = 0.0):
+        # one linear head -> 2*action_dim
+        self.param_head = nn.Linear(latent_dim, 2 * self.action_dim)
+        # init: small std
+        with torch.no_grad():
+            nn.init.zeros_(self.param_head.weight)
+            self.param_head.bias[: self.action_dim].zero_()                # mean ~ 0 pre-tanh
+            self.param_head.bias[self.action_dim :].fill_(log_std_init)         # log_std init
+        # return dummy nn.Parameter to satisfy SB3 signature
+        self.dummy_log_std = nn.Parameter(torch.zeros(self.action_dim), requires_grad=False)
+        return self.param_head, self.dummy_log_std
 
-    def _squash(self, u):
-        s = torch.sigmoid(u)
-        a01 = s.pow(self.k)                   # power warp
-        return self.low + self.range * a01
+    def proba_distribution(self, params: torch.Tensor, _dummy: torch.Tensor):
+        mean, log_std = torch.chunk(params, 2, dim=-1)
+        log_std = torch.clamp(log_std, -20.0, 2.0)
+        self.mean_actions = mean
+        self.log_std = log_std
+        std = log_std.exp()
+        self.distribution = Normal(mean, std)  # pre-tanh
+        return self
 
-    def _unsquash(self, a_env):
-        a01 = ((a_env - self.low) / self.range).clamp(self.eps, 1 - self.eps)
-        s = a01.pow(1.0 / self.k).clamp(self.eps, 1 - self.eps)
-        return self._logit(s, self.eps), s, a01
+    def sample(self) -> torch.Tensor:
+        self.gaussian_actions = self.distribution.rsample()         # pre-tanh
+        u = torch.tanh(self.gaussian_actions)                          # in [-1,1]
+        return self.scale * u + self.bias
 
-    def sample(self):
-        self._pre = super().sample()
-        return self._squash(self._pre)
+    def mode(self) -> torch.Tensor:
+        self.gaussian_actions = self.distribution.mean
+        u = torch.tanh(self.gaussian_actions)
+        return self.scale * u + self.bias
 
-    def mode(self):
-        self._pre = super().mode()
-        return self._squash(self._pre)
+    def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
+        # map actions back to [-1,1]
+        u = (actions - self.bias) / self.scale
+        u = torch.clamp(u, -1 + self.epsilon, 1 - self.epsilon)
 
-    def log_prob(self, a_env):
-        u, s, a01 = self._unsquash(a_env)
-        lp = super().log_prob(u)
-        # Jacobian: -log(range*k) - k*log(s) - log(1-s)
-        c = torch.sum(torch.log(self.range)) + torch.sum(torch.log(self.k))
-        jac = - (self.k * torch.log(s.clamp(self.eps, 1 - self.eps))).sum(dim=1) \
-              - (torch.log1p(-s.clamp(self.eps, 1 - self.eps))).sum(dim=1) \
-              - c
-        return lp + jac
+        if gaussian_actions is None:
+            gaussian_actions = TanhBijector.inverse(u)
 
-    def entropy(self):
-        return None
+        # base Normal log-prob in pre-tanh space
+        log_prob = self.distribution.log_prob(gaussian_actions)
+        log_prob = sum_independent_dims(log_prob)
 
-    def log_prob_from_params(self, mean_actions, log_std):
-        a_env = self.actions_from_params(mean_actions, log_std)
-        return a_env, self.log_prob(a_env)
+        # tanh Jacobian
+        log_prob -= torch.sum(torch.log(1 - u**2 + self.epsilon), dim=1)
+
+        # affine scaling Jacobian
+        if self.scale != 1.0:
+            log_prob -= u.shape[-1] * torch.log(torch.tensor(self.scale, device=u.device, dtype=u.dtype))
+        return log_prob
 
 
 
@@ -169,48 +192,12 @@ class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.action_dist = CustomNormalDistribution()
+        self.action_dist = CustomSquashedDiagGaussianDistribution(action_dim=1)
+        self._build(FloatSchedule(ConstantSchedule(val=0.001)))
 
-        # ✅ Initialize the final layer (action_net) for small initial actions
-        # We set the bias to a large negative number.
-        # This makes the initial logits negative, pushing tanh(logits) towards -1.
-        # The result is an initial action close to `(-1 + 1) * 15 = 0`.
-        # The weight initialization helps stabilize learning at the start.
-        if hasattr(self.action_net, "bias"):
-            # A value like -5 or -10 is a good starting point
-            nn.init.constant_(self.action_net.bias, -2)
-
-        # It's also good practice to initialize the weights to a small scale
-        # nn.init.orthogonal_(self.action_net.weight, 0.01)
-    """
-    def _get_action_dist_from_latent(
-        self, latent_pi: torch.Tensor, latent_sde: Optional[torch.Tensor] = None
-    ) -> DiagGaussianDistribution:
-        '''
-        Overrides the base method to apply the custom transformation.
-
-        :param latent_pi: Features from the policy network.
-        :param latent_sde: Features for state-dependent exploration (not used here).
-        :return: A Gaussian distribution with the transformed mean.
-        '''
-        # Get the raw network output (logits)
-        mean_actions = self.action_net(latent_pi)
-
-        # Apply your custom transformation
-        transformed_mean_actions = torch.sigmoid(mean_actions) * 30
-
-        # This example assumes a continuous action space (DiagGaussianDistribution).
-        # If you have a different action distribution, you'll need to adapt this part.
-        if not isinstance(self.action_dist, DiagGaussianDistribution):
-            raise ValueError(
-                "This custom policy is designed for DiagGaussianDistribution."
-            )
-
-        # Return the action distribution using the transformed mean
-        return self.action_dist.proba_distribution(
-            transformed_mean_actions, self.log_std
-        )
-    """
+        # self.action_dist = BetaScaledDistribution()
+        nn.init.constant_(self.action_net.bias[0], -2)  # Mean to a low value
+        nn.init.constant_(self.action_net.bias[1], -3)  # Small initial stddev
 
 
 class ScaleAction(nn.Module):
