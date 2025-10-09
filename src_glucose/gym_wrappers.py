@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 
-SAMPLE_TIME = 5.0  # minutes
+SAMPLE_TIME = 60.0  # minutes
 for i in range(1, 6):
     register(
         id=f"simglucose/adult{i}-v0",
@@ -105,7 +105,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         Wrapper.__init__(self, env)
         self.last_action = None
         self.steps_until_action_available = 0
-        self.last_waiting_period = 5
+        self.last_waiting_period = 2
         self.next_waiting_period = 0
         assert 0 <= forced_interval <= 1, "Forced interval must be 0 or 1"
         self.forced_interval = forced_interval

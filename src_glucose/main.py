@@ -106,7 +106,7 @@ if __name__ == "__main__":
             replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')
         else:
-            print('='*50, '\nRe-using existing dataset.pkl...\n', '='*50)
+            print('='*50, '\nRe-using existing dataset...\n', '='*50)
             replay_buffer_env.load('./replay_buffer')
 
         dataset_rewards = np.array(replay_buffer_env.rewards[0])[np.array(replay_buffer_env.dones[0]) == 1]

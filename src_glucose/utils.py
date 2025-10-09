@@ -143,8 +143,9 @@ class ReplayBufferEnv:
                 episode_starts = np.ones((1,), dtype=bool)
                 while not done:
                     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
-                    # if with_random and np.random.random() < rand_p:
+                    if with_random and np.random.random() < rand_p:
                         # action = self.env.action_space.sample()
+                        action = np.random.uniform(low=0, high=1, size=1)
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
                     episode_starts[0] = done
