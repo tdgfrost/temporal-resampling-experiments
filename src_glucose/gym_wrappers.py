@@ -61,7 +61,7 @@ class T1DPatientEnv(Wrapper):
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        id_choice = np.random.randint(1, 6)
+        id_choice = 1 # np.random.randint(1, 6)
         identity = f"simglucose/adult{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
@@ -69,7 +69,7 @@ class T1DPatientEnv(Wrapper):
     def reset(self, **kwargs):
         # Rebuild env each reset
         self.env.close() # cleanup
-        id_choice = np.random.randint(1, 6)
+        id_choice = 1 # np.random.randint(1, 6)
         identity = f"simglucose/adult{id_choice}-v0"
         self.env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
