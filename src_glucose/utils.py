@@ -137,10 +137,12 @@ class ReplayBufferEnv:
             obs, info, ep_buffer = self.reset(seed=seed)
             model.set_random_seed(seed)
             lstm_states = None
+            total_rewards = []
 
             while frame_count < n_frames:
                 done = False
                 episode_starts = np.ones((1,), dtype=bool)
+                total_reward = 0
                 while not done:
                     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
                     # if with_random and np.random.random() < rand_p:
@@ -149,6 +151,7 @@ class ReplayBufferEnv:
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
                     episode_starts[0] = done
+                    total_reward += reward
 
                     self.update_episode_buffer(obs, action, reward, done, info, ep_buffer)
 
@@ -165,14 +168,17 @@ class ReplayBufferEnv:
                 # Reset ep_buffer and add 'obs' to it
                 ep_buffer = self._reset_ep_buffer(obs, info)
 
+                # Keep track of total rewards for stats
+                total_rewards.append(total_reward)
+
             # Add a garbage all-zeros "final obs"
             for i in range(3):
                 self.observations[i] += [np.zeros_like(self.observations[0][0])]
 
             # Normalise rewards from 0 to 1
+            min_r, max_r = min(total_rewards), 200 # max(total_rewards)
             for i in [0, 1, 2]:
                 rewards = np.array(self.rewards[i])
-                min_r, max_r = rewards.min(), rewards.max()
                 if max_r > min_r:
                     norm_rewards = (rewards - min_r) / (max_r - min_r)
                 else:
