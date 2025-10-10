@@ -361,6 +361,7 @@ class RecurrentNet(nn.Module):
         # Note: Weight initialization is omitted for brevity but should be the same as in your original code.
         # self.init_weights()
 
+    @torch.compile
     def forward(self, x: torch.Tensor, actions: torch.Tensor = None,
                 hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -502,9 +503,9 @@ class CustomIQL(nn.Module):
 
                     # Update the networks
                     if not self._cloning_only:
-                        loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, visible, next_visible))
-                        loss_dict['value_loss'].append(self._update_value(obs, acts, visible))
-                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, visible))
+                        loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, visible, next_visible).item())
+                        loss_dict['value_loss'].append(self._update_value(obs, acts, visible).item())
+                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, visible).item())
 
                     # Soft update of target value network
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
@@ -563,7 +564,7 @@ class CustomIQL(nn.Module):
         self.critic_optim.zero_grad()
         loss.backward()
         self.critic_optim.step()
-        return loss.item()
+        return loss
 
     def _update_value(self, obs, acts, flags=None):
         v = self.value_net(obs, flags=flags)
@@ -579,7 +580,7 @@ class CustomIQL(nn.Module):
         self.value_optim.zero_grad()
         value_loss.backward()
         self.value_optim.step()
-        return value_loss.item()
+        return value_loss
 
     def _update_actor(self, obs, acts, flags=None):
         action_unit_preds = self.policy_net(obs, flags=flags)
@@ -600,7 +601,7 @@ class CustomIQL(nn.Module):
         self.policy_optim.zero_grad()
         policy_loss.backward()
         self.policy_optim.step()
-        return policy_loss.item()
+        return policy_loss
 
     def _extract_flag(self, obs):
         obs = self._to_tensors(obs)[0]
@@ -708,6 +709,7 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
     # --- Update methods now handle sequences ---
     # The core logic remains the same, but we unpack the network output
 
+    @torch.compile
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible=None, next_visible=None):
         # We only need the network output, not the final hidden state for training
         q1, _ = self.critic_net1(obs, acts)
@@ -726,10 +728,9 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         self.critic_optim.zero_grad()
         loss.backward()
         self.critic_optim.step()
-        return loss.item()
+        return loss
 
-
-    # The _update_value and _update_actor methods are updated similarly
+    @torch.compile
     def _update_value(self, obs, acts, visible=None):
         v, _ = self.value_net(obs)
         with torch.no_grad():
@@ -749,8 +750,9 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         self.value_optim.zero_grad()
         value_loss.backward()
         self.value_optim.step()
-        return value_loss.item()
+        return value_loss
 
+    @torch.compile
     def _update_actor(self, obs, acts, visible=None):
         action_unit_preds, _ = self.policy_net(obs)
         predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
@@ -773,8 +775,9 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         self.policy_optim.zero_grad()
         policy_loss.backward()
         self.policy_optim.step()
-        return policy_loss.item()
+        return policy_loss
 
+    @torch.compile
     def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
         N, T = visible.shape[:2]
