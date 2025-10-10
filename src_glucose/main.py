@@ -25,6 +25,8 @@ parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interva
 
 GAMMA = 0.99
 
+torch.set_float32_matmul_precision('high')
+
 
 """
 Trained on natural dataset:

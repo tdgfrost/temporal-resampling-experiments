@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Tuple, Dict, Optional
 import numpy as np
 
@@ -442,6 +443,8 @@ class CustomIQL(nn.Module):
         self._critic_lr = critic_lr
         self._value_lr = value_lr
         self._actor_lr = actor_lr
+        self.decoy_interval = None
+        self.scaler = None
 
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=device)
 
@@ -488,6 +491,7 @@ class CustomIQL(nn.Module):
         dataset.set_to_tensors(self._device)
         dataset.set_generate_params(**dataset_kwargs)
         self.decoy_interval = decoy_interval
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
 
         loss_dict = self._reset_loss_dict()
 
@@ -711,70 +715,89 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
 
     @torch.compile
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible=None, next_visible=None):
-        # We only need the network output, not the final hidden state for training
-        q1, _ = self.critic_net1(obs, acts)
-        q2, _ = self.critic_net2(obs, acts)
+        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+            # We only need the network output, not the final hidden state for training
+            q1, _ = self.critic_net1(obs, acts)
+            q2, _ = self.critic_net2(obs, acts)
 
-        with torch.no_grad():
-            v_next, _ = self.target_value_net(next_obs)
-            r = rews.float()
+            with torch.no_grad():
+                v_next, _ = self.target_value_net(next_obs)
+                r = rews.float()
 
-        if self.decoy_interval == 0:
-            q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible)
-        else:
-            q_target = r + self._gamma * (1 - dones.float()) * v_next
+            if self.decoy_interval == 0:
+                q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible)
+            else:
+                q_target = r + self._gamma * (1 - dones.float()) * v_next
 
-        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+            loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+
+        # Scale the loss and perform the backward pass
         self.critic_optim.zero_grad()
-        loss.backward()
-        self.critic_optim.step()
+        self.scaler.scale(loss).backward() if self.scaler is not None else loss.backward()
+
+        # Unscale gradients and step the optimizer
+        self.scaler.step(self.critic_optim) if self.scaler is not None else self.critic_optim.step()
+        self.scaler.update() if self.scaler is not None else None
+
         return loss
 
     @torch.compile
     def _update_value(self, obs, acts, visible=None):
-        v, _ = self.value_net(obs)
-        with torch.no_grad():
-            q1, _ = self.critic_net1(obs, acts)
-            q2, _ = self.critic_net2(obs, acts)
-            q = torch.min(q1, q2)
-        # ... rest of the function is the same ...
-        diff = q - v
-        self._batch_diff = diff.detach()  # Shape is now (N, T, 1)
-        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
-        value_loss = (weights * (diff ** 2))
-        # Apply mask
-        if self.decoy_interval == 0:
-            value_loss = value_loss[visible.squeeze(-1)]
-        value_loss = value_loss.mean()
+        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+            v, _ = self.value_net(obs)
+            with torch.no_grad():
+                q1, _ = self.critic_net1(obs, acts)
+                q2, _ = self.critic_net2(obs, acts)
+                q = torch.min(q1, q2)
+            # ... rest of the function is the same ...
+            diff = q - v
+            self._batch_diff = diff.detach()  # Shape is now (N, T, 1)
+            weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
+            value_loss = (weights * (diff ** 2))
+            # Apply mask
+            if self.decoy_interval == 0:
+                value_loss = value_loss[visible.squeeze(-1)]
+            value_loss = value_loss.mean()
 
+        # Scale the loss and perform the backward pass
         self.value_optim.zero_grad()
-        value_loss.backward()
-        self.value_optim.step()
+        self.scaler.scale(value_loss).backward() if self.scaler is not None else value_loss.backward()
+
+        # Unscale gradients and step the optimizer
+        self.scaler.step(self.value_optim) if self.scaler is not None else self.value_optim.step()
+        self.scaler.update() if self.scaler is not None else None
+
         return value_loss
 
     @torch.compile
     def _update_actor(self, obs, acts, visible=None):
-        action_unit_preds, _ = self.policy_net(obs)
-        predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
-        # ... rest of the function is similar ...
-        weights = 1.0
-        if not self._cloning_only:
-            weights = self._batch_diff
-            if self._has_dropout:
-                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-            else:
-                weights = torch.clip(torch.exp(self._beta * weights), -100, 100).squeeze()
+        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+            action_unit_preds, _ = self.policy_net(obs)
+            predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
+            # ... rest of the function is similar ...
+            weights = 1.0
+            if not self._cloning_only:
+                weights = self._batch_diff
+                if self._has_dropout:
+                    weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+                else:
+                    weights = torch.clip(torch.exp(self._beta * weights), -100, 100).squeeze()
 
-        policy_loss = F.mse_loss(predicted_actions, acts.view(predicted_actions.shape), reduction='none').squeeze()
-        policy_loss = (policy_loss * weights)
-        # Apply mask
-        if self.decoy_interval == 0:
-            policy_loss = policy_loss[visible.squeeze(-1)]
-        policy_loss = policy_loss.mean()
+            policy_loss = F.mse_loss(predicted_actions, acts.view(predicted_actions.shape), reduction='none').squeeze()
+            policy_loss = (policy_loss * weights)
+            # Apply mask
+            if self.decoy_interval == 0:
+                policy_loss = policy_loss[visible.squeeze(-1)]
+            policy_loss = policy_loss.mean()
 
+        # Scale the loss and perform the backward pass
         self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
+        self.scaler.scale(policy_loss).backward() if self.scaler is not None else policy_loss.backward()
+
+        # Unscale gradients and step the optimizer
+        self.scaler.step(self.policy_optim) if self.scaler is not None else self.policy_optim.step()
+        self.scaler.update() if self.scaler is not None else None
+
         return policy_loss
 
     @torch.compile
