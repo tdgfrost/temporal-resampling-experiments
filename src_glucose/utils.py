@@ -8,7 +8,6 @@ from collections import deque
 import argparse
 import inquirer
 import os
-import json
 import shutil
 
 
@@ -56,7 +55,7 @@ class ReplayBufferEnv:
         self.batch_size = batch_size if batch_size is not None else self.batch_size
         self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
         self.n_samples = sum(self.sample_bool[self.decoy_interval])
-        self.segments = self.n_samples // self.batch_size
+        self.segments = self.n_samples // self.batch_size if self.n_samples > 0 else 0
 
         assert self.n_samples >= self.batch_size, "Not enough samples in the replay buffer"
         assert self.batch_size > 0, "Batch size must be positive"
@@ -64,8 +63,17 @@ class ReplayBufferEnv:
 
     def generate(self):
         assert self.n_samples > 0, "Replay buffer is empty"
-        idxs = torch.tensor(np.random.choice(self.n_samples, size=(self.segments, self.batch_size), replace=False),
-                            dtype=torch.long, device=self._device)
+        # The base class samples from a contiguous range.
+        valid_indices = np.where(self.sample_bool[self.decoy_interval])[0]
+        # We must subtract 1 because fetch_transition_batch accesses idxs+1
+        valid_indices = valid_indices[valid_indices < len(self.observations[self.decoy_interval]) - 1]
+
+        self.n_samples = len(valid_indices)
+        self.segments = self.n_samples // self.batch_size
+        assert self.segments > 0, f"Not enough valid samples to form a batch. Have {self.n_samples}, need {self.batch_size}"
+
+        idxs_np = np.random.choice(valid_indices, size=(self.segments, self.batch_size), replace=False)
+        idxs = torch.tensor(idxs_np, dtype=torch.long, device=self._device)
 
         for idx in idxs:
             yield self.fetch_transition_batch(idxs=idx, decoy_interval=self.decoy_interval)
@@ -116,8 +124,6 @@ class ReplayBufferEnv:
         self.dataset_avg = float(loaded_scale['dataset_avg'])
         self.dataset_std = float(loaded_scale['dataset_std'])
 
-        self.set_generate_params()
-
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
         ep_buffer = self._reset_ep_buffer(obs, info)
@@ -152,7 +158,7 @@ class ReplayBufferEnv:
                     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
                     # if with_random and np.random.random() < rand_p:
                         # action = self.env.action_space.sample()
-                        # action = np.random.uniform(low=0, high=1, size=1).astype(np.float32)
+                        # action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
                     episode_starts[0] = done
@@ -197,16 +203,15 @@ class ReplayBufferEnv:
             self.dataset_std = norm_total_rewards.std()
 
     def set_to_tensors(self, device: str = 'cpu'):
-        if self._tensors_set:
-            if self._device == device:
-                return
-            for i in range(3):
-                for arr in [self.observations, self.actions, self.rewards, self.dones, self.visible_states]:
-                    arr[i] = arr[i].to(device)
-        else:
-            for i in range(3):
-                for arr in [self.observations, self.actions, self.rewards, self.dones, self.visible_states]:
-                    arr[i] = torch.from_numpy(np.array(arr[i])).to(device)
+        if self._tensors_set and self._device == device:
+            return
+
+        for i in range(3):
+            self.observations[i] = torch.from_numpy(np.array(self.observations[i])).float().to(device)
+            self.actions[i] = torch.from_numpy(np.array(self.actions[i])).float().to(device)
+            self.rewards[i] = torch.from_numpy(np.array(self.rewards[i])).float().to(device)
+            self.dones[i] = torch.from_numpy(np.array(self.dones[i])).bool().to(device)
+            self.visible_states[i] = torch.from_numpy(np.array(self.visible_states[i])).bool().to(device)
 
         self._tensors_set = True
         self._device = device
@@ -290,44 +295,183 @@ class ReplayBufferEnv:
 
 
 class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original class
-    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 50):
+    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64):
         super().__init__(env, buffer_size)
-        self.sequence_length = sequence_length
+        self.max_sequence_length = sequence_length
+        # This will store the valid start indices for each decoy interval
+        self.sequence_info = {i: [] for i in range(3)}
 
-    def set_generate_params(self, batch_size: int = None, decoy_interval: int = None, sequence_length: int = None):
-        super().set_generate_params(batch_size=batch_size, decoy_interval=decoy_interval)
-        self.sequence_length = sequence_length if sequence_length is not None else self.sequence_length
+    def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None, max_sequence_length: int = None):
+        """
+        Scans the buffer to identify all episodes and their lengths, preparing for sampling.
+        """
+        self.batch_size = batch_size if batch_size is not None else self.batch_size
+        self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
+        self.max_sequence_length = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
 
-        # Adjust n_samples to prevent sampling incomplete sequences
-        total_samples = sum(self.sample_bool[self.decoy_interval])
-        self.n_samples = total_samples - self.sequence_length
-        self.segments = self.n_samples // self.batch_size
+        if self.decoy_interval == 0:
+            self.max_sequence_length *= int((1 + 18) / 2)
+
+        # --- CORE LOGIC CHANGE: Identify episodes instead of fixed-length sequences ---
+        dones_data = self.dones[self.decoy_interval]
+        if isinstance(dones_data, torch.Tensor):
+            dones_np = dones_data.cpu().numpy()
+        else:  # Handles list, deque, or numpy array
+            dones_np = np.array(dones_data, dtype=bool)
+
+        if not dones_np.any():
+            self.n_samples = 0
+            self.segments = 0
+            return
+
+        # Clear previous episode info for this interval
+        self.sequence_info[self.decoy_interval] = []
+
+        done_indices = np.where(dones_np)[0]
+
+        last_ep_start_idx = 0
+        if done_indices.size > 0:
+            # --- Your efficient NumPy logic for finding terminated episodes ---
+            start_indices = np.roll(done_indices, 1) + 1
+            start_indices[0] = 0
+            lengths = done_indices - start_indices + 1
+
+            # --- Integrate sliding window logic into your loop ---
+            for start_idx, length in zip(start_indices, lengths):
+                if length <= self.max_sequence_length:
+                    # Short episode: Add one sequence to be padded.
+                    self.sequence_info[self.decoy_interval].append((start_idx, length))
+                else:
+                    # Long episode: Use sliding window.
+                    last_possible_start = start_idx + length - self.max_sequence_length
+                    for seq_start in range(start_idx, last_possible_start + 1):
+                        self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length))
+
+            # The next episode will start after the last 'done'
+            last_ep_start_idx = done_indices[-1] + 1
+
+        # --- ADDED: Handle the final, possibly unterminated episode ---
+        final_buffer_len = len(dones_np)
+        if last_ep_start_idx < final_buffer_len:
+            final_ep_len = final_buffer_len - last_ep_start_idx
+
+            if final_ep_len <= self.max_sequence_length:
+                # The final short episode.
+                self.sequence_info[self.decoy_interval].append((last_ep_start_idx, final_ep_len))
+            else:
+                # The final long episode.
+                last_possible_start = last_ep_start_idx + final_ep_len - self.max_sequence_length
+                for seq_start in range(last_ep_start_idx, last_possible_start + 1):
+                    self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length))
+
+        # n_samples is now the number of sequences in the buffer
+        self.n_samples = len(self.sequence_info[self.decoy_interval])
+        self.segments = self.n_samples // self.batch_size if self.n_samples > 0 else 0
+
+        if self.segments == 0:
+            print(f"Warning: Not enough episodes for sampling. "
+                  f"Found {self.n_samples} episodes but batch size is {self.batch_size}.")
+
+        self.set_to_tensors(device)
+
+    def set_to_tensors(self, device: str = 'cpu'):
+        def _set_device(some_arr):
+            if isinstance(some_arr, torch.Tensor):
+                return some_arr.to(device)
+            return torch.from_numpy(np.array(some_arr)).to(device)
+
+        i = self.decoy_interval
+
+        self.observations[i] = _set_device(self.observations[i]).float()
+        self.actions[i] = _set_device(self.actions[i]).float()
+        self.rewards[i] = _set_device(self.rewards[i]).float()
+        self.dones[i] = _set_device(self.dones[i]).bool()
+        self.visible_states[i] = _set_device(self.visible_states[i]).bool()
+        self.sequence_info[i] = _set_device(self.sequence_info[i]).long()
+
+        self._tensors_set = True
+        self._device = device
+
+    def generate(self):
+        """
+        Generates batches by sampling EPISODE indices and then padding them.
+        """
+        assert self.segments > 0, "Not enough episodes to generate a batch. Call set_generate_params()."
+
+        # Sample indices corresponding to the episodes, not timesteps
+        episode_indices = np.random.choice(
+            self.n_samples,
+            size=(self.segments, self.batch_size),
+            replace=False
+        )
+
+        idxs_tensor = torch.tensor(episode_indices, dtype=torch.long, device=self._device)
+
+        for batch_of_episode_indices in idxs_tensor:
+            yield self.fetch_transition_batch(idxs=batch_of_episode_indices, decoy_interval=self.decoy_interval)
 
     def fetch_transition_batch(self, idxs: torch.Tensor, decoy_interval: int = 0):
-        # This method is now overridden to return sequences
+        """
+        Fetches data for a batch of sequences, pads them to max_sequence_length,
+        and returns the padded tensors along with a mask.
+        """
         assert self._tensors_set, "Replay buffer must be set to tensors first."
 
-        # Instead of indexing, we create sequences for each starting index in idxs
-        obs_batch = torch.stack([self.observations[decoy_interval][i: i + self.sequence_length] for i in idxs])
-        # The 'next_obs' sequence is shifted by one step
-        next_obs_batch = torch.stack(
-            [self.observations[decoy_interval][i + 1: i + self.sequence_length + 1] for i in idxs])
+        batch_size = len(idxs)
+        max_len = self.max_sequence_length
 
-        action_batch = torch.stack([self.actions[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(
-            -1)
-        reward_batch = torch.stack([self.rewards[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(
-            -1)
-        done_batch = torch.stack([self.dones[decoy_interval][i: i + self.sequence_length] for i in idxs]).unsqueeze(-1)
+        obs_shape = self.observations[decoy_interval][0].shape
+        act_shape = self.actions[decoy_interval][0].shape if self.actions[decoy_interval].numel() > 0 else (1,)
 
-        visible_batch = torch.stack(
-            [self.visible_states[decoy_interval][i: i + self.sequence_length] for
-                i in idxs]).unsqueeze(-1)
+        obs_batch = torch.zeros((batch_size, max_len, *obs_shape), dtype=torch.float32, device=self._device)
+        next_obs_batch = torch.zeros_like(obs_batch)
+        action_batch = torch.zeros((batch_size, max_len, *act_shape), dtype=torch.float32, device=self._device)
+        reward_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.float32, device=self._device)
+        done_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
+        visible_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
+        mask_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
 
-        next_visible_batch = torch.stack(
-            [self.visible_states[decoy_interval][i + 1: i + self.sequence_length + 1] for
-        i in idxs]).unsqueeze(-1)
+        # This loop is vectorized for performance using advanced indexing
+        # 1. Get sequence start indices and lengths from the sampled indices
+        seq_info_batch = self.sequence_info[decoy_interval][idxs]
+        starts = seq_info_batch[:, 0]
+        actual_lens = seq_info_batch[:, 1]
 
-        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, visible_batch, next_visible_batch
+        # 2. Create index grids for fetching all data in one go
+        # `arange` creates the sequence offsets (0, 1, ..., max_len-1)
+        # `starts.unsqueeze(1)` broadcasts the start indices for each sequence
+        # Shape of `indices`: (batch_size, max_len)
+        base_indices = torch.arange(max_len, device=self._device).unsqueeze(0)
+        indices = starts.unsqueeze(1) + base_indices
+        next_indices = indices + 1
+
+        # 3. Create a mask to select only the valid, non-padded indices
+        # Shape of `fetch_mask`: (batch_size, max_len)
+        fetch_mask = base_indices < actual_lens.unsqueeze(1)
+
+        # 4. Fetch all data using the masks and indices
+        obs_batch[fetch_mask] = self.observations[decoy_interval][indices[fetch_mask]]
+        action_batch[fetch_mask] = self.actions[decoy_interval][indices[fetch_mask]]
+        reward_batch[fetch_mask] = self.rewards[decoy_interval][indices[fetch_mask]].unsqueeze(-1)
+        done_batch[fetch_mask] = self.dones[decoy_interval][indices[fetch_mask]].unsqueeze(-1)
+        visible_batch[fetch_mask] = self.visible_states[decoy_interval][indices[fetch_mask]].unsqueeze(-1)
+
+        # 5. --- CORRECTED NEXT_OBS LOGIC ---
+        # The next_obs sequence is the obs sequence shifted by one.
+        # We use `next_indices` and the same `fetch_mask`. This works because the buffer
+        # should have a terminal zero-pad, making the last `next_index` valid.
+        next_obs_batch[fetch_mask] = self.observations[decoy_interval][next_indices[fetch_mask]]
+
+        # 6. The training mask is just the fetch_mask with an added dimension
+        mask_batch = fetch_mask.unsqueeze(-1)
+
+        # This can be derived from the visible_batch after fetching
+        next_visible_batch = torch.roll(visible_batch, shifts=-1, dims=1)
+        next_visible_batch[:, -1] = False  # Last step has no defined next step
+
+        return (obs_batch, action_batch.unsqueeze(-1) if action_batch.dim() == 2 else action_batch,
+                reward_batch, next_obs_batch, done_batch,
+                visible_batch, next_visible_batch, mask_batch)
 
 
 class SaveEachBestCallback(BaseCallback):

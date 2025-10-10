@@ -488,10 +488,9 @@ class CustomIQL(nn.Module):
     ):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
-        dataset.set_to_tensors(self._device)
-        dataset.set_generate_params(**dataset_kwargs)
+        dataset.set_generate_params(self._device, **dataset_kwargs)
         self.decoy_interval = decoy_interval
-        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
         loss_dict = self._reset_loss_dict()
 
@@ -503,13 +502,12 @@ class CustomIQL(nn.Module):
                 epoch_str = f"{epoch}/{n_epochs_train}"
 
                 for batch in dataset:
-                    obs, acts, rews, next_obs, dones, visible, next_visible = batch
 
                     # Update the networks
                     if not self._cloning_only:
-                        loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, visible, next_visible).item())
-                        loss_dict['value_loss'].append(self._update_value(obs, acts, visible).item())
-                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, visible).item())
+                        loss_dict['critic_loss'].append(self._update_critic(*batch).item())
+                        loss_dict['value_loss'].append(self._update_value(*batch).item())
+                    loss_dict['policy_loss'].append(self._update_actor(*batch).item())
 
                     # Soft update of target value network
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
@@ -553,60 +551,6 @@ class CustomIQL(nn.Module):
         # return Categorical(logits=logits).sample().cpu().numpy()
         return action_unit.squeeze(-1).cpu().numpy()
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flags=None, next_flags=None):
-        q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
-        with torch.no_grad():
-            v_next = self.target_value_net(next_obs, flags=next_flags)
-            # next_multistep_discount = torch.where(next_flags == 1, 3, 1)
-            # current_multistep_discount = torch.where(flags == 1, 2, 0)
-            # r = self._gamma ** current_multistep_discount * rews.float()
-            r = rews.float()
-            next_multistep_discount = torch.where(flags == 1, 3, 1)
-            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
-
-        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
-        self.critic_optim.zero_grad()
-        loss.backward()
-        self.critic_optim.step()
-        return loss
-
-    def _update_value(self, obs, acts, flags=None):
-        v = self.value_net(obs, flags=flags)
-        with torch.no_grad():
-            q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
-            q = torch.min(q1, q2)
-
-        diff = q - v
-        self._batch_diff = diff.detach().squeeze()
-        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-        value_loss = (weights * (diff.squeeze() ** 2)).mean()
-
-        self.value_optim.zero_grad()
-        value_loss.backward()
-        self.value_optim.step()
-        return value_loss
-
-    def _update_actor(self, obs, acts, flags=None):
-        action_unit_preds = self.policy_net(obs, flags=flags)
-        predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
-
-        weights = 1.0
-        if not self._cloning_only:
-            weights = self._batch_diff
-            if self._has_dropout:
-                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-            else:
-                weights = torch.clip(torch.exp(self._beta * weights), -torch.inf, 100).squeeze()
-
-        # policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
-        policy_loss = F.mse_loss(predicted_actions.squeeze(), acts.squeeze(), reduction='none')
-        policy_loss = (policy_loss * weights).mean()
-
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
-        return policy_loss
-
     def _extract_flag(self, obs):
         obs = self._to_tensors(obs)[0]
         return obs[..., 0].unsqueeze(-1).long()
@@ -649,7 +593,7 @@ class CustomIQL(nn.Module):
 
 
 class RecurrentIQL(CustomIQL):  # Inherits from your original class
-    def __init__(self, *args, sequence_length: int = 50, recurrent_hidden_size: int = 128, **kwargs):
+    def __init__(self, *args, sequence_length: int = 100, recurrent_hidden_size: int = 128, **kwargs):
         super().__init__(*args, **kwargs)
         self._sequence_length = sequence_length
         self._recurrent_hidden_size = recurrent_hidden_size
@@ -714,7 +658,7 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
     # The core logic remains the same, but we unpack the network output
 
     @torch.compile
-    def _update_critic(self, obs, acts, rews, next_obs, dones, visible=None, next_visible=None):
+    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, masks):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # We only need the network output, not the final hidden state for training
             q1, _ = self.critic_net1(obs, acts)
@@ -725,7 +669,7 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
                 r = rews.float()
 
             if self.decoy_interval == 0:
-                q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible)
+                q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible, masks)
             else:
                 q_target = r + self._gamma * (1 - dones.float()) * v_next
 
@@ -742,70 +686,115 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         return loss
 
     @torch.compile
-    def _update_value(self, obs, acts, visible=None):
+    def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, masks):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             v, _ = self.value_net(obs)
             with torch.no_grad():
                 q1, _ = self.critic_net1(obs, acts)
                 q2, _ = self.critic_net2(obs, acts)
                 q = torch.min(q1, q2)
-            # ... rest of the function is the same ...
+
             diff = q - v
             self._batch_diff = diff.detach()  # Shape is now (N, T, 1)
             weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
-            value_loss = (weights * (diff ** 2))
-            # Apply mask
+            value_loss_unmasked = (weights * (diff ** 2))  # Loss per timestep
+
+            # --- CORRECTED MASKING LOGIC ---
+            # Start with the mask for valid (non-padded) timesteps
+            final_mask = masks.squeeze(-1)  # Shape (N, T)
+
+            # If the decoy_interval logic is active, also apply the 'visible' mask
             if self.decoy_interval == 0:
-                value_loss = value_loss[visible.squeeze(-1)]
-            value_loss = value_loss.mean()
+                final_mask = final_mask & visible.squeeze(-1)
 
-        # Scale the loss and perform the backward pass
+            # Apply the final mask to the loss
+            masked_loss = value_loss_unmasked.squeeze(-1) * final_mask.float()
+
+            # Calculate the mean loss ONLY over the valid, masked timesteps
+            # Add a small epsilon to prevent division by zero
+            value_loss = masked_loss.sum() / (final_mask.sum() + 1e-8)
+            # --- END OF CORRECTION ---
+
+        # The rest of the function remains the same
         self.value_optim.zero_grad()
-        self.scaler.scale(value_loss).backward() if self.scaler is not None else value_loss.backward()
-
-        # Unscale gradients and step the optimizer
-        self.scaler.step(self.value_optim) if self.scaler is not None else self.value_optim.step()
-        self.scaler.update() if self.scaler is not None else None
+        if self.scaler:
+            self.scaler.scale(value_loss).backward()
+            self.scaler.step(self.value_optim)
+            self.scaler.update()
+        else:
+            value_loss.backward()
+            self.value_optim.step()
 
         return value_loss
 
     @torch.compile
-    def _update_actor(self, obs, acts, visible=None):
+    def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, masks):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             action_unit_preds, _ = self.policy_net(obs)
             predicted_actions = action_unit_preds * (self._action_high - self._action_low) + self._action_low
-            # ... rest of the function is similar ...
+
             weights = 1.0
             if not self._cloning_only:
                 weights = self._batch_diff
                 if self._has_dropout:
-                    weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+                    weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
                 else:
-                    weights = torch.clip(torch.exp(self._beta * weights), -100, 100).squeeze()
+                    weights = torch.clip(torch.exp(self._beta * weights), -100, 100)
 
-            policy_loss = F.mse_loss(predicted_actions, acts.view(predicted_actions.shape), reduction='none').squeeze()
-            policy_loss = (policy_loss * weights)
-            # Apply mask
+                # Ensure weights have the same shape as policy_loss for broadcasting
+                weights = weights.squeeze(-1)  # Shape (N, T)
+
+            policy_loss_unmasked = F.mse_loss(predicted_actions, acts, reduction='none').mean(dim=-1)  # Shape (N, T)
+
+            # --- CORRECTED MASKING LOGIC ---
+            # Start with the mask for valid (non-padded) timesteps
+            final_mask = masks.squeeze(-1)  # Shape (N, T)
+
+            # If the decoy_interval logic is active, also apply the 'visible' mask
             if self.decoy_interval == 0:
-                policy_loss = policy_loss[visible.squeeze(-1)]
-            policy_loss = policy_loss.mean()
+                final_mask = final_mask & visible.squeeze(-1)
 
-        # Scale the loss and perform the backward pass
+            # Apply the final mask and weights to the loss
+            masked_loss = policy_loss_unmasked * weights * final_mask.float()
+
+            # Calculate the mean loss ONLY over the valid, masked timesteps
+            policy_loss = masked_loss.sum() / (final_mask.sum() + 1e-8)
+            # --- END OF CORRECTION ---
+
+        # The rest of the function remains the same
         self.policy_optim.zero_grad()
-        self.scaler.scale(policy_loss).backward() if self.scaler is not None else policy_loss.backward()
-
-        # Unscale gradients and step the optimizer
-        self.scaler.step(self.policy_optim) if self.scaler is not None else self.policy_optim.step()
-        self.scaler.update() if self.scaler is not None else None
+        if self.scaler:
+            self.scaler.scale(policy_loss).backward()
+            self.scaler.step(self.policy_optim)
+            self.scaler.update()
+        else:
+            policy_loss.backward()
+            self.policy_optim.step()
 
         return policy_loss
 
     @torch.compile
-    def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible):
+    def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible, mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
         N, T = visible.shape[:2]
         dev = q1.device
         dtype = r.dtype
+
+        # --- NEW: Apply the mask to sanitize inputs ---
+        mask_squeezed = mask.squeeze(-1)  # Shape (N, T)
+
+        # Zero out rewards in the padded region before cumsum
+        r = r * mask.to(dtype)
+
+        # In the padded region, treat every step as if it were 'done'.
+        # This prevents the 'next_true_idx' from looking past the real sequence end.
+        dones = dones.squeeze(-1).bool() | ~mask_squeezed
+        dones = dones.unsqueeze(-1)
+
+        # Ensure no visible flags are true in the padded region
+        visible = visible & mask
+        next_visible = next_visible & mask
+        # --- END OF NEW CODE ---
 
         vis = visible.squeeze(-1).bool()  # (N,T)
         nvis = next_visible.squeeze(-1).bool()  # (N,T)
