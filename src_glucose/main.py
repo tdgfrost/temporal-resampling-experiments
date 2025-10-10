@@ -121,7 +121,7 @@ if __name__ == "__main__":
             ["glucose_1_5", (0, not DECOY_INTERVAL)],
             ["glucose_1_1", (1, False)],
         ]:
-            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=flag,
+            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
                                                                     forced_interval=interval),
                                                    n_trials=20,
                                                    min_scale_rewards = replay_buffer_env.min_rewards_scale,

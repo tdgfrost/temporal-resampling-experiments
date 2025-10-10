@@ -225,7 +225,8 @@ class ReplayBufferEnv:
             for arr, key in [
                 (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
             ]:
-                if i == 1 and key == 'obs':
+                # if i == 1 and key == 'obs':
+                if key == 'obs':
                     ep_buffer[f'all_{key}'] = np.stack(ep_buffer[f'all_{key}'])
                     ep_buffer[f'all_{key}'][:, :2] = 0  # Set the flags to 0 for the non-decoy buffer
                     ep_buffer[f'all_{key}'] = ep_buffer[f'all_{key}'].tolist()
@@ -242,14 +243,14 @@ class ReplayBufferEnv:
         ]
 
         rewards, dones = [
-            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 3]) for idx in range(0, len(ep_buffer['all_reward']), 3)]
+            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 3]) for idx in range(3, len(ep_buffer['all_reward']), 3)]
             for key in ['reward', 'done']
         ]  # Note to self <- should this be recalculated from scratch using the average blood glucose?
 
         # For obs, take the mean observation of the two steps
         obs = np.stack([
-            np.mean(ep_buffer['all_obs'][idx: idx + 3], 0)
-            for idx in range(0, len(ep_buffer['all_obs']), 3)
+            np.mean(ep_buffer['all_obs'][idx-3: idx], 0)
+            for idx in range(3, len(ep_buffer['all_obs']), 3)
         ])
         # Change the steps_remaining flag to 0
         obs[:, :2] = 0
