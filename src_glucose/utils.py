@@ -229,7 +229,7 @@ class ReplayBufferEnv:
         rewards, dones = [
             [np.sum(ep_buffer[f'all_{key}'][idx: idx + 3]) for idx in range(0, len(ep_buffer['all_reward']), 3)]
             for key in ['reward', 'done']
-        ]
+        ]  # Note to self <- should this be recalculated from scratch using the average blood glucose?
 
         # For obs, take the mean observation of the two steps
         obs = np.stack([

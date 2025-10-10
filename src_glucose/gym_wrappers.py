@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 
-SAMPLE_TIME = 30.0  # minutes
+SAMPLE_TIME = 10.0  # minutes
 for i in range(1, 6):
     register(
         id=f"simglucose/adult{i}-v0",
@@ -134,7 +134,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
     def _flip_step_modes(self, action: Any):
         self.steps_until_action_available = self.next_waiting_period
-        self.next_waiting_period = np.random.choice([0, 5])
+        self.next_waiting_period = np.random.randint(18)  # 1 to 18 steps # np.random.choice([0, 10])  # 1 vs 11 steps
         # self.next_waiting_period, self.last_waiting_period = self.last_waiting_period, self.next_waiting_period
         self.last_action = action
 
