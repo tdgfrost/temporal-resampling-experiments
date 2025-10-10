@@ -43,6 +43,8 @@ class ReplayBufferEnv:
         self.segments = self.n_samples // self.batch_size
         self.max_rewards_scale = None
         self.min_rewards_scale = None
+        self.dataset_avg = None
+        self.dataset_std = None
 
     def __iter__(self):
         return iter(self.generate())
@@ -85,9 +87,10 @@ class ReplayBufferEnv:
             np.savez(os.path.join(path, f'{key}.npz'),
                      **{str(k): v for k, v in save_dict.items()})
 
-        # Also save min/max rewards scale
+        # Also save min/max rewards scale and dataset avg
         np.savez(os.path.join(path, 'rewards_scale.npz'),
-                 ** {'min': self.min_rewards_scale, 'max': self.max_rewards_scale})
+                 ** {'min': self.min_rewards_scale, 'max': self.max_rewards_scale,
+                     'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
 
         # Mark saving as complete
         with open(os.path.join(path, 'COMPLETE'), 'w') as f:
@@ -110,6 +113,8 @@ class ReplayBufferEnv:
         loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
         self.min_rewards_scale = float(loaded_scale['min'])
         self.max_rewards_scale = float(loaded_scale['max'])
+        self.dataset_avg = float(loaded_scale['dataset_avg'])
+        self.dataset_std = float(loaded_scale['dataset_std'])
 
         self.set_generate_params()
 
@@ -186,6 +191,10 @@ class ReplayBufferEnv:
                 self.rewards[i] = deque(norm_rewards.tolist(), maxlen=self.buffer_size)
                 self.min_rewards_scale = min_r
                 self.max_rewards_scale = max_r
+
+            norm_total_rewards = (np.array(total_rewards) - min_r) / (max_r - min_r)
+            self.dataset_avg = norm_total_rewards.mean()
+            self.dataset_std = norm_total_rewards.std()
 
     def set_to_tensors(self, device: str = 'cpu'):
         if self._tensors_set:

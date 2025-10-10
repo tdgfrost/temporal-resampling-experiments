@@ -109,11 +109,9 @@ if __name__ == "__main__":
             print('='*50, '\nRe-using existing dataset...\n', '='*50)
             replay_buffer_env.load('./replay_buffer')
 
-        dataset_rewards = np.array(replay_buffer_env.rewards[0])[np.array(replay_buffer_env.dones[0]) == 1]
-        dataset_n_episodes = len(dataset_rewards)
+        print(f"Baseline reward of the dataset: {replay_buffer_env.dataset_avg:.2f} "
+              f"+/- {replay_buffer_env.dataset_std:.2f}")
 
-        print(f"Baseline reward of the dataset: {dataset_rewards.mean():.2f} "
-              f"+/- {dataset_rewards.std() / np.sqrt(dataset_n_episodes):.2f}")
 
         # Get our evaluators
         evaluators = {}
@@ -131,7 +129,7 @@ if __name__ == "__main__":
         for n_trial in range(10):
             logs['expectile'].append(EXPECTILE)
             logs['decoy_interval'].append(DECOY_INTERVAL)
-            logs['dataset_reward'].append(dataset_rewards.mean())
+            logs['dataset_reward'].append(replay_buffer_env.dataset_avg)
 
             # Alternately collect and training
             algo = RecurrentIQL(observation_shape=base_env.observation_space.shape,
