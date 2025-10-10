@@ -649,7 +649,7 @@ class CustomIQL(nn.Module):
 
 
 class RecurrentIQL(CustomIQL):  # Inherits from your original class
-    def __init__(self, *args, sequence_length: int = 10, recurrent_hidden_size: int = 128, **kwargs):
+    def __init__(self, *args, sequence_length: int = 50, recurrent_hidden_size: int = 128, **kwargs):
         super().__init__(*args, **kwargs)
         self._sequence_length = sequence_length
         self._recurrent_hidden_size = recurrent_hidden_size

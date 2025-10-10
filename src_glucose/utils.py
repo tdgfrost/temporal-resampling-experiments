@@ -290,7 +290,7 @@ class ReplayBufferEnv:
 
 
 class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original class
-    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 10):
+    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 50):
         super().__init__(env, buffer_size)
         self.sequence_length = sequence_length
 
