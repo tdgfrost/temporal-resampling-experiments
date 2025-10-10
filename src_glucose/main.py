@@ -86,8 +86,8 @@ if __name__ == "__main__":
                                      deterministic=True,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.001, ent_coef=0.01,
-                             clip_range=0.02, policy_kwargs=policy_kwargs, gamma=1.0, verbose=1, device='cpu')
+        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.0003, ent_coef=0.01,
+                             clip_range=0.2, policy_kwargs=policy_kwargs, gamma=1.0, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 

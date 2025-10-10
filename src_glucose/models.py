@@ -197,8 +197,8 @@ class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
         self._build(FloatSchedule(ConstantSchedule(val=0.001)))
 
         # self.action_dist = BetaScaledDistribution()
-        nn.init.constant_(self.action_net.bias[0], -2)  # Mean to a low value
-        nn.init.constant_(self.action_net.bias[1], -3)  # Small initial stddev
+        nn.init.constant_(self.action_net.bias[0], 0)  # Mean to a low value
+        nn.init.constant_(self.action_net.bias[1], -1)  # Small initial stddev
 
 
 class ScaleAction(nn.Module):
