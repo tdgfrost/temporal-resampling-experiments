@@ -114,19 +114,27 @@ if __name__ == "__main__":
         print(f"Baseline reward of the dataset: {replay_buffer_env.dataset_avg:.2f} "
               f"+/- {replay_buffer_env.dataset_std:.2f}")
 
-
         # Get our evaluators
         evaluators = {}
         for key, (interval, flag) in [
-            ["glucose_1_5", (0, not DECOY_INTERVAL)],
-            ["glucose_1_1", (1, False)],
+            ["glucose_irregular", (0, not DECOY_INTERVAL)],
+            ["glucose_regular", (1, False)],
         ]:
             evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
-                                                                    forced_interval=interval),
+                                                                    forced_interval=interval,),
                                                    n_trials=20,
                                                    min_scale_rewards = replay_buffer_env.min_rewards_scale,
                                                    max_scale_rewards = replay_buffer_env.max_rewards_scale,
             )
+ 
+        if DECOY_INTERVAL == 2:
+            evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
+                                                                    forced_interval=interval,),
+                                                                              n_trials=20,
+                                                                              running_average_obs=True,
+                                                                              min_scale_rewards = replay_buffer_env.min_rewards_scale,
+                                                                              max_scale_rewards = replay_buffer_env.max_rewards_scale,
+                                                                              )
 
         for n_trial in range(10):
             logs['expectile'].append(EXPECTILE)

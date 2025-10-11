@@ -500,26 +500,32 @@ class SaveEachBestCallback(BaseCallback):
 
 
 class EnvironmentEvaluator:
-    def __init__(self, env, n_trials: int, min_scale_rewards: float = 0.0, max_scale_rewards: float = 1.0):
+    def __init__(self, env, n_trials: int, min_scale_rewards: float = 0.0, max_scale_rewards: float = 1.0,
+                 running_average_obs: bool = False):
         assert n_trials > 0, "n_trials must be positive"
         assert max_scale_rewards > min_scale_rewards, "max_scale_rewards must be greater than min_scale_rewards"
         # Scale rewards to [0, 1]
         self.env = env
         self.n_trials = n_trials
+        self.running_average_obs = running_average_obs
 
         self.min_scale = min_scale_rewards
         self.max_scale = max_scale_rewards
 
     def __call__(self, algo) -> float:
         mean_returns = []
+        running_average_obs = deque(maxlen=12)
         for _ in range(self.n_trials):
             obs, info = self.env.reset()
+            running_average_obs.append(obs)
             done = False
             total_reward = 0.0
             hidden_state = algo.get_initial_states(batch_size=1)
 
             while not done:
                 with torch.no_grad():
+                    if self.running_average_obs:
+                        obs = np.mean(np.stack(running_average_obs), axis=0)
                     action, hidden_state = algo.predict(np.expand_dims(obs, 0),
                                                         hidden_state=hidden_state)
                 obs, reward, terminated, truncated, info = self.env.step(action)
