@@ -148,7 +148,7 @@ if __name__ == "__main__":
 
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
-                n_epochs_train=500,
+                n_epochs_train=500 if DECOY_INTERVAL in [0, 2] else 5,
                 n_epochs_eval=1,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
