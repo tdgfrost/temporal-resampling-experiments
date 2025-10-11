@@ -248,20 +248,20 @@ class ReplayBufferEnv:
         # Update the decoy actions (every second step)
         # - For basal insulin, this involves taking the average of the two actions
         actions = [
-            np.mean(ep_buffer['all_action'][idx: idx + 12])
-            for idx in range(12, len(ep_buffer['all_action']), 12)
+            np.mean(ep_buffer['all_action'][idx: idx + 6])
+            for idx in range(6, len(ep_buffer['all_action']), 6)
         ]
 
         rewards, dones = [
-            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 12]) for idx in range(12, len(ep_buffer['all_reward']), 12)]
+            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 6]) for idx in range(6, len(ep_buffer['all_reward']), 6)]
             for key in ['reward', 'done']
         ]  # Note to self <- should this be recalculated from scratch using the average blood glucose?
 
         # For obs, take the mean observation of the two steps
         # this is from t-11 to t0 (inclusive)
         obs = np.stack([
-            np.mean(ep_buffer['all_obs'][idx-12 + 1: idx + 1], 0)
-            for idx in range(12, len(ep_buffer['all_obs']), 12)
+            np.mean(ep_buffer['all_obs'][idx-6 + 1: idx + 1], 0)
+            for idx in range(6, len(ep_buffer['all_obs']), 6)
         ])
         # Change the steps_remaining flag to 0
         obs[:, :2] = 0

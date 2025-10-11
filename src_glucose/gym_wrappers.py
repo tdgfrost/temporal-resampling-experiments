@@ -1,4 +1,4 @@
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces, ObservationWrapper
@@ -11,11 +11,11 @@ from simglucose.simulation.scenario import CustomScenario
 
 
 SAMPLE_TIME = 10.0  # minutes
-for i in range(1, 6):
+for i in range(1, 11):
     register(
         id=f"simglucose/adult{i}-v0",
         entry_point="simglucose.envs:T1DSimGymnaisumEnv",
-        kwargs={"patient_name": f"adult#00{i}"},
+        kwargs={"patient_name": f"adult#0{i:02}"},
     )
 
 
@@ -59,9 +59,10 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
 
 class T1DPatientEnv(Wrapper):
 
-    def __init__(self, **kwargs):
+    def __init__(self, use_test_ids: bool = False, **kwargs):
         self.kwargs = kwargs
-        id_choice = 1 # np.random.randint(1, 6)
+        self._id_choices = [1,2,3,4,5,6,7,8] if not use_test_ids else [9,10]
+        id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
@@ -69,7 +70,7 @@ class T1DPatientEnv(Wrapper):
     def reset(self, **kwargs):
         # Rebuild env each reset
         self.env.close() # cleanup
-        id_choice = 1 # np.random.randint(1, 6)
+        id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
         self.env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
@@ -134,7 +135,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
     def _flip_step_modes(self, action: Any):
         self.steps_until_action_available = self.next_waiting_period
-        self.next_waiting_period = np.random.randint(18)  # 1 to 18 steps # np.random.choice([0, 10])  # 1 vs 11 steps
+        self.next_waiting_period = np.random.randint(12)  # 1 to 18 steps # np.random.choice([0, 10])  # 1 vs 11 steps
         # self.next_waiting_period, self.last_waiting_period = self.last_waiting_period, self.next_waiting_period
         self.last_action = action
 
@@ -166,15 +167,15 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         return np.concatenate([[steps_left, waiting_period], obs], axis=-1)
 
 
-def make_glucose_env(*, no_interim_rewards: bool = False, gamma: float = 1.0, forced_interval: int = 0,
+def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0, forced_interval: int = 0,
                      use_flag: bool = True, use_scaling: bool = False, **kwargs):
-    env = T1DPatientEnv(**kwargs)
+    env = T1DPatientEnv(use_test_ids, **kwargs)
     env = SampleTimeWrapper(env)
     if use_scaling:
         env = NormalizeReward(env, gamma=gamma)
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
-    env = AlternateStepWrapper(env, forced_interval=forced_interval)
     env = FixedScaler(env)
+    env = AlternateStepWrapper(env, forced_interval=forced_interval)
     env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
     return env

@@ -164,7 +164,7 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
 
     def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
         # map actions back to [-1,1]
-        u = (actions - self.bias) / self.scale
+        u = (actions - self.bias) / (self.scale + 1e-6)
         u = torch.clamp(u, -1 + self.epsilon, 1 - self.epsilon)
 
         if gaussian_actions is None:
@@ -175,11 +175,13 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
         log_prob = sum_independent_dims(log_prob)
 
         # tanh Jacobian
-        log_prob -= torch.sum(torch.log(1 - u**2 + self.epsilon), dim=1)
+        log_prob -= torch.sum(torch.log(torch.clamp(1 - u**2, self.epsilon, 1 - self.epsilon)), dim=1)
 
         # affine scaling Jacobian
         if self.scale != 1.0:
-            log_prob -= u.shape[-1] * torch.log(torch.tensor(self.scale, device=u.device, dtype=u.dtype))
+            log_prob -= u.shape[-1] * torch.log(
+                torch.clamp(torch.tensor(self.scale, device=u.device, dtype=u.dtype), self.epsilon, 1 - self.epsilon)
+            )
         return log_prob
 
 

@@ -78,7 +78,7 @@ if __name__ == "__main__":
         # Create eval callback
         save_each_best = SaveEachBestCallback(save_dir="../logs_glucose/ppo_minigrid_logs/historic_bests", verbose=1)
 
-        eval_callback = EvalCallback(make_glucose_env(),
+        eval_callback = EvalCallback(make_glucose_env(use_test_ids=True),
                                      n_eval_episodes=20,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
@@ -86,8 +86,9 @@ if __name__ == "__main__":
                                      deterministic=True,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.0003, ent_coef=0.01,
-                             clip_range=0.2, policy_kwargs=policy_kwargs, gamma=1.0, verbose=1, device='cpu')
+        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.00001, ent_coef=0.1,
+                             clip_range=0.1, batch_size=32, n_steps=64,
+                             policy_kwargs=policy_kwargs, gamma=0.99, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
@@ -100,7 +101,7 @@ if __name__ == "__main__":
         base_env = make_glucose_env(no_interim_rewards=True)
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 500_000
+        dataset_size = 100_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
             model = CallableRecurrentPPO.load(ppo_agent, env=base_env, device="cpu")
@@ -122,7 +123,8 @@ if __name__ == "__main__":
         ]:
             evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
                                                                     forced_interval=interval,
-                                                                    no_interim_rewards=True),
+                                                                    no_interim_rewards=True,
+                                                                    use_test_ids=True),
                                                    n_trials=20,
                                                    min_scale_rewards = replay_buffer_env.min_rewards_scale,
                                                    max_scale_rewards = replay_buffer_env.max_rewards_scale,
@@ -131,7 +133,8 @@ if __name__ == "__main__":
         if DECOY_INTERVAL == 2:
             evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
                                                                                                forced_interval=interval,
-                                                                                               no_interim_rewards=True),
+                                                                                               no_interim_rewards=True,
+                                                                                               use_test_ids=True),
                                                                               n_trials=20,
                                                                               running_average_obs=True,
                                                                               min_scale_rewards = replay_buffer_env.min_rewards_scale,
