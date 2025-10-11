@@ -97,7 +97,7 @@ if __name__ == "__main__":
         logs = defaultdict(list)
 
         # Get our PPO model
-        base_env = make_glucose_env()
+        base_env = make_glucose_env(no_interim_rewards=True)
 
         # Fill our replay buffer (or load pre-filled)
         dataset_size = 500_000
@@ -121,15 +121,17 @@ if __name__ == "__main__":
             ["glucose_regular", (1, False)],
         ]:
             evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
-                                                                    forced_interval=interval,),
+                                                                    forced_interval=interval,
+                                                                    no_interim_rewards=True),
                                                    n_trials=20,
                                                    min_scale_rewards = replay_buffer_env.min_rewards_scale,
                                                    max_scale_rewards = replay_buffer_env.max_rewards_scale,
             )
- 
+
         if DECOY_INTERVAL == 2:
             evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
-                                                                    forced_interval=interval,),
+                                                                                               forced_interval=interval,
+                                                                                               no_interim_rewards=True),
                                                                               n_trials=20,
                                                                               running_average_obs=True,
                                                                               min_scale_rewards = replay_buffer_env.min_rewards_scale,
