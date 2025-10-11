@@ -100,7 +100,7 @@ if __name__ == "__main__":
         base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 100_000
+        dataset_size = 500_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
             model = CallableRecurrentPPO.load(ppo_agent, env=base_env, device="cpu")
@@ -137,9 +137,10 @@ if __name__ == "__main__":
             algo = RecurrentIQL(observation_shape=base_env.observation_space.shape,
                              action_space=base_env.action_space,
                              feature_size=ceil(128 / (1-args.dropout_p)),
-                             batch_size=ceil(128 / (1-args.dropout_p)),
+                             batch_size=32,
                              expectile=EXPECTILE,
                              gamma=GAMMA,
+                             decoy_interval=DECOY_INTERVAL,
                              dropout_p=args.dropout_p,
                              beta=args.beta,
                              device='cuda' if torch.cuda.is_available() else 'cpu')

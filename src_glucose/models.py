@@ -593,8 +593,11 @@ class CustomIQL(nn.Module):
 
 
 class RecurrentIQL(CustomIQL):  # Inherits from your original class
-    def __init__(self, *args, sequence_length: int = 64, recurrent_hidden_size: int = 128, **kwargs):
+    def __init__(self, *args, sequence_length: int = 64, decoy_interval: int = 0, recurrent_hidden_size: int = 128, **kwargs):
         super().__init__(*args, **kwargs)
+        if decoy_interval == 0:
+            sequence_length *= int((1 + 18) / 2)
+
         self._sequence_length = sequence_length
         self._recurrent_hidden_size = recurrent_hidden_size
         self._buffered_sequence_arange = torch.arange(sequence_length, device=self._device).unsqueeze(0).expand(self._batch_size, sequence_length)

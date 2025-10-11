@@ -160,11 +160,13 @@ class ReplayBufferEnv:
                         # action = self.env.action_space.sample()
                         # action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
                     obs, reward, term, trunc, info = self.env.step(action)
+                    # Get the real action delivered
+                    real_action = obs[3] * 30
                     done = term or trunc
                     episode_starts[0] = done
                     total_reward += reward
 
-                    self.update_episode_buffer(obs, action, reward, done, info, ep_buffer)
+                    self.update_episode_buffer(obs, real_action, reward, done, info, ep_buffer)
 
                     if done:
                         ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
@@ -246,19 +248,20 @@ class ReplayBufferEnv:
         # Update the decoy actions (every second step)
         # - For basal insulin, this involves taking the average of the two actions
         actions = [
-            np.mean(ep_buffer['all_action'][idx: idx + 3])
-            for idx in range(0, len(ep_buffer['all_action']), 3)
+            np.mean(ep_buffer['all_action'][idx: idx + 12])
+            for idx in range(12, len(ep_buffer['all_action']), 12)
         ]
 
         rewards, dones = [
-            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 3]) for idx in range(3, len(ep_buffer['all_reward']), 3)]
+            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 12]) for idx in range(12, len(ep_buffer['all_reward']), 12)]
             for key in ['reward', 'done']
         ]  # Note to self <- should this be recalculated from scratch using the average blood glucose?
 
         # For obs, take the mean observation of the two steps
+        # this is from t-11 to t0 (inclusive)
         obs = np.stack([
-            np.mean(ep_buffer['all_obs'][idx-3: idx], 0)
-            for idx in range(3, len(ep_buffer['all_obs']), 3)
+            np.mean(ep_buffer['all_obs'][idx-12 + 1: idx + 1], 0)
+            for idx in range(12, len(ep_buffer['all_obs']), 12)
         ])
         # Change the steps_remaining flag to 0
         obs[:, :2] = 0
@@ -311,9 +314,6 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         self.batch_size = batch_size if batch_size is not None else self.batch_size
         self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
         self.max_sequence_length = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
-
-        if self.decoy_interval == 0:
-            self.max_sequence_length *= int((1 + 18) / 2)
 
         # --- CORE LOGIC CHANGE: Identify episodes instead of fixed-length sequences ---
         dones_data = self.dones[self.decoy_interval]
