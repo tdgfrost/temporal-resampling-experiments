@@ -488,7 +488,7 @@ class CustomIQL(nn.Module):
     ):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
-        dataset.set_generate_params(self._device, **dataset_kwargs)
+        dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length, **dataset_kwargs)
         self.decoy_interval = decoy_interval
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
@@ -593,10 +593,14 @@ class CustomIQL(nn.Module):
 
 
 class RecurrentIQL(CustomIQL):  # Inherits from your original class
-    def __init__(self, *args, sequence_length: int = 100, recurrent_hidden_size: int = 128, **kwargs):
+    def __init__(self, *args, sequence_length: int = 64, recurrent_hidden_size: int = 128, **kwargs):
         super().__init__(*args, **kwargs)
         self._sequence_length = sequence_length
         self._recurrent_hidden_size = recurrent_hidden_size
+        self._buffered_sequence_arange = torch.arange(sequence_length, device=self._device).unsqueeze(0).expand(self._batch_size, sequence_length)
+        self._buffered_batch_arange = torch.arange(self._batch_size, device=self._device).unsqueeze(1).expand(self._batch_size, sequence_length)
+        self._buffered_empty = torch.full((self._batch_size, sequence_length), sequence_length, device=self._device)
+        self._buffered_pow_t = torch.pow(self._gamma, torch.arange(sequence_length, device=self._device, dtype=self._gamma.dtype))
 
         # --- Replace network instantiations with RecurrentNet ---
         net_kwargs = dict(
@@ -800,8 +804,8 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         nvis = next_visible.squeeze(-1).bool()  # (N,T)
         dn = dones.squeeze(-1).bool()  # (N,T)
 
-        t_idx = torch.arange(T, device=dev).unsqueeze(0).expand(N, T)
-        none = torch.full((N, T), T, device=dev)
+        t_idx = self._buffered_sequence_arange
+        none = self._buffered_empty
 
         def next_true_idx(mask):  # earliest j >= t if exists else T
             cand = torch.where(mask, t_idx, none)
@@ -817,7 +821,7 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
         valid = vis & (target_idx < T)
 
         # gather helpers
-        b_full = torch.arange(N, device=dev).unsqueeze(1).expand(N, T)
+        b_full = self._buffered_batch_arange
         b = b_full[valid]  # (M,)
         i = t_idx[valid]  # (M,)
         j = target_idx[valid]  # (M,)
@@ -828,7 +832,7 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
 
         # n-step reward sum over [i..j] with constant gamma
         r_flat = r.squeeze(-1)  # (N,T)
-        pow_t = torch.pow(self._gamma, torch.arange(T, device=dev, dtype=dtype))  # (T,)
+        pow_t = self._buffered_pow_t  # (T,)
         rg = r_flat * pow_t  # r_t * γ^t
         S = torch.cumsum(rg, dim=1)  # prefix sum of r_t * γ^t
 
