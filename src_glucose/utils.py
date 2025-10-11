@@ -236,9 +236,12 @@ class ReplayBufferEnv:
                     ep_buffer[f'all_{key}'][:, :2] = 0  # Set the flags to 0 for the non-decoy buffer
                     ep_buffer[f'all_{key}'] = ep_buffer[f'all_{key}'].tolist()
                 arr[i] += ep_buffer[f'all_{key}']
-                self.visible_states[0] += visible_idxs
 
             self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
+
+        # Update visible states
+        self.visible_states[0] += visible_idxs
+        self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
 
         # Update the decoy actions (every second step)
         # - For basal insulin, this involves taking the average of the two actions
@@ -429,7 +432,6 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         reward_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.float32, device=self._device)
         done_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
         visible_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
-        mask_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
 
         # This loop is vectorized for performance using advanced indexing
         # 1. Get sequence start indices and lengths from the sampled indices
