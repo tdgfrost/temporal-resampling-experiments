@@ -17,6 +17,7 @@ for p in paths:
     # Below is safe: if present in file, it will simply overwrite with the same values.
     # Example file name pattern: log_expectile=0.5_decoy=0.csv
     import re
+
     m = re.search(r"expectile=([0-9.]+)_decoy=([0-9]+)", p)
     if m:
         exp_from_name = float(m.group(1))
@@ -44,28 +45,28 @@ df = df_long_pl.to_pandas()
 
 task_name_map = {
     "lavagap_1_3_eval": "LavaGap 1-3",
-    "lavagap_1_1_eval":  "LavaGap 1-1",
+    "lavagap_1_1_eval": "LavaGap 1-1",
 }
 df["task"] = df["task"].map(task_name_map)
 # df["expectile"] = df["expectile"].astype(float)
 
 # Fixed ordering
 expectile_order = ["Cloning", "0.6", "0.7", "0.8", "0.9"]
-dataset_order   = ['Real 1-3', 'Artificial 2-2', 'Artificial 1-1']
-task_order      = ["LavaGap 1-3", "LavaGap 1-1"]
+dataset_order = ['Real 1-3', 'Artificial 2-2', 'Artificial 1-1']
+task_order = ["LavaGap 1-3", "LavaGap 1-1"]
 
 df["expectile"] = pd.Categorical(df["expectile"], categories=expectile_order, ordered=True)
-df["dataset"]   = pd.Categorical(df["dataset"],   categories=dataset_order,   ordered=True)
-df["task"]      = pd.Categorical(df["task"],      categories=task_order,      ordered=True)
+df["dataset"] = pd.Categorical(df["dataset"], categories=dataset_order, ordered=True)
+df["task"] = pd.Categorical(df["task"], categories=task_order, ordered=True)
 
 # -----------------------------------------------------------
 # 2) Summarize: mean and standard error across 10 repeats
 # -----------------------------------------------------------
 summary = (
     df.groupby(["expectile", "dataset", "task"], observed=True)
-      .agg(mean_score=("score", "mean"),
-           sem_score =("score", "sem"))     # standard error of the mean
-      .reset_index()
+    .agg(mean_score=("score", "mean"),
+         sem_score=("score", "sem"))  # standard error of the mean
+    .reset_index()
 )
 
 # Optionally use 95% CI instead of SEM:
@@ -84,7 +85,7 @@ fig, ax = plt.subplots(figsize=(12, 5.2))
 
 # Geometry
 x_positions = np.arange(len(expectile_order))  # one base position per expectile
-group_width = 0.8                              # total width per expectile cluster
+group_width = 0.8  # total width per expectile cluster
 D = len(dataset_order)
 T = len(task_order)
 subgroup_spacing = 0.20  # 15% of each dataset slot reserved as empty gap
@@ -110,11 +111,11 @@ for d_idx, dataset in enumerate(dataset_order):
     for t_idx, task in enumerate(task_order):
         # positions for this (dataset, task) across expectiles
         xpos = (
-            x_positions
-            - group_width/2
-            + d_idx * dataset_slot_width
-            + t_idx * bar_width
-            + bar_width/2
+                x_positions
+                - group_width / 2
+                + d_idx * dataset_slot_width
+                + t_idx * bar_width
+                + bar_width / 2
         )
 
         # Fetch y and yerr for this slice in expectile order
@@ -139,7 +140,7 @@ for d_idx, dataset in enumerate(dataset_order):
             task_handles_once[task] = bars[0]
         if dataset_handles_once[dataset] is None:
             # Make a proxy artist for dataset hatch without relying on specific height
-            proxy = plt.Rectangle((0,0),1,1,
+            proxy = plt.Rectangle((0, 0), 1, 1,
                                   facecolor="white",
                                   edgecolor="black",
                                   hatch=dataset_hatches[d_idx],
@@ -172,7 +173,6 @@ os.makedirs('../figures', exist_ok=True)
 fig.subplots_adjust(right=0.75, left=0.1, bottom=0.15)
 plt.savefig('../figures/Time Binning All Expectiles.png', dpi=1500)
 plt.show()
-
 
 #### Flip so that the x-axis is the evaluation task nd the group is the dataset type
 

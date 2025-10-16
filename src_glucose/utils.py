@@ -99,8 +99,8 @@ class ReplayBufferEnv:
 
         # Also save min/max rewards scale and dataset avg
         np.savez(os.path.join(path, 'rewards_scale.npz'),
-                 ** {'min': self.min_rewards_scale, 'max': self.max_rewards_scale,
-                     'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
+                 **{'min': self.min_rewards_scale, 'max': self.max_rewards_scale,
+                    'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
 
         # Mark saving as complete
         with open(os.path.join(path, 'COMPLETE'), 'w') as f:
@@ -141,7 +141,8 @@ class ReplayBufferEnv:
             'visible_state': [obs[0] == 0]
         }
 
-    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, with_random: bool = True, rand_p: float = 0.05):
+    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, with_random: bool = True,
+                    rand_p: float = 0.05):
         with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
             frame_count = 0
             if seed is None:
@@ -159,8 +160,8 @@ class ReplayBufferEnv:
                 while not done:
                     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
                     # if with_random and np.random.random() < rand_p:
-                        # action = self.env.action_space.sample()
-                        # action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
+                    #       action = self.env.action_space.sample()
+                    #       action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
                     obs, reward, term, trunc, info = self.env.step(action)
                     # Get the real action delivered
                     real_action = obs[3] * INSULIN_SCALE
@@ -191,7 +192,7 @@ class ReplayBufferEnv:
                 self.observations[i] += [np.zeros_like(self.observations[0][0])]
 
             # Normalise rewards from 0 to 1
-            min_r, max_r = min(total_rewards), 200 # max(total_rewards)
+            min_r, max_r = min(total_rewards), 200  # max(total_rewards)
             for i in [0, 1, 2]:
                 rewards = np.array(self.rewards[i])
                 if max_r > min_r:
@@ -221,7 +222,8 @@ class ReplayBufferEnv:
         self._device = device
 
     @staticmethod
-    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict, ep_buffer: dict):
+    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict,
+                              ep_buffer: dict):
         ep_buffer['all_obs'] += [obs]
         ep_buffer['all_action'] += [action]
         ep_buffer['all_reward'] += [reward]
@@ -264,7 +266,7 @@ class ReplayBufferEnv:
         ]
 
         actions = [
-            np.mean(ep_buffer['all_action'][(idx-1): (idx-1) + agg_window])
+            np.mean(ep_buffer['all_action'][(idx - 1): (idx - 1) + agg_window])
             for idx in range(agg_window, len(ep_buffer['all_action']), agg_window)
         ]
 
@@ -282,8 +284,8 @@ class ReplayBufferEnv:
         rewards = [bg_in_range([i]) * SAMPLE_TIME for i in bg_levels]
 
         # if not dones[-1]:
-            # rewards[-1] = ep_buffer['reward'][-1]
-            # dones[-1] = ep_buffer['done'][-1]
+        # rewards[-1] = ep_buffer['reward'][-1]
+        # dones[-1] = ep_buffer['done'][-1]
         assert dones[-1], "Last done flag should be True"
         self.observations[2] += obs
         self.actions[2] += actions
@@ -321,7 +323,8 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         # This will store the valid start indices for each decoy interval
         self.sequence_info = {i: [] for i in range(3)}
 
-    def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None, max_sequence_length: int = None):
+    def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None,
+                            max_sequence_length: int = None):
         """
         Scans the buffer to identify all episodes and their lengths, preparing for sampling.
         """
@@ -492,6 +495,7 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
 
 class SaveEachBestCallback(BaseCallback):
     """Called by EvalCallback when a new best model is found."""
+
     def __init__(self, save_dir: str, verbose: int = 0):
         super().__init__(verbose)
         self.save_dir = Path(save_dir)

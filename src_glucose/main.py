@@ -12,7 +12,6 @@ from utils import *
 from gym_wrappers import *
 from models import *
 
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
 parser.add_argument('--train_iql', default=False, type=parse_bool, help='Train IQL agent')
@@ -26,7 +25,6 @@ parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interva
 GAMMA = 0.99
 
 torch.set_float32_matmul_precision('high')
-
 
 """
 Trained on natural dataset:
@@ -42,7 +40,6 @@ Trained on artificial 1-step decoy dataset - flag forced to 0
 - evaluated on forced 1-step environment - flag forced to 0
 """
 
-
 if __name__ == "__main__":
     args = parser.parse_args()
     if args.dropout_p > 0:
@@ -55,8 +52,9 @@ if __name__ == "__main__":
         ppo_agent = f'../logs_glucose/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
-        assert ppo_agent is not None, ("Please provide a pre-trained PPO agent from the logs_glucose/ppo_minigrid_logs folder "
-                                       "for IQL training.")
+        assert ppo_agent is not None, (
+            "Please provide a pre-trained PPO agent from the logs_glucose/ppo_minigrid_logs folder "
+            "for IQL training.")
         assert os.path.exists(ppo_agent), "Provided PPO agent path does not exist."
 
     assert not (train_ppo and train_iql), "Please choose to train either PPO or IQL, not both."
@@ -73,27 +71,27 @@ if __name__ == "__main__":
         net_arch=[128, 128],
     )
 
-
     if train_ppo:
         # Create eval callback
         save_each_best = SaveEachBestCallback(save_dir="../logs_glucose/ppo_minigrid_logs/historic_bests", verbose=1)
 
         eval_callback = EvalCallback(make_glucose_env(use_test_ids=True),
-                                     n_eval_episodes=20,
+                                     n_eval_episodes=50,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
                                      eval_freq=2000,
                                      deterministic=True,
                                      best_model_save_path="../logs_glucose/ppo_minigrid_logs")
 
-        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(), learning_rate=0.00001, ent_coef=0.1,
-                             clip_range=0.1, batch_size=32, n_steps=64,
+        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(),
+                             learning_rate=0.00001, ent_coef=0.1, clip_range=0.1, batch_size=32, n_steps=64,
                              policy_kwargs=policy_kwargs, gamma=0.99, verbose=1, device='cpu')
         model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
     if train_iql:
-        print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
+        print(
+            f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
 
         logs = defaultdict(list)
 
@@ -109,7 +107,7 @@ if __name__ == "__main__":
             replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')
         else:
-            print('='*50, '\nRe-using existing dataset...\n', '='*50)
+            print('=' * 50, '\nRe-using existing dataset...\n', '=' * 50)
             replay_buffer_env.load('./replay_buffer')
 
         dataset_rew_avg, dataset_rew_std = replay_buffer_env.dataset_avg, replay_buffer_env.dataset_std
@@ -126,24 +124,24 @@ if __name__ == "__main__":
             ["glucose_irregular", (0, not DECOY_INTERVAL)],
             ["glucose_regular", (1, False)],
         ]:
-            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
+            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False,  # flag,
                                                                     forced_interval=interval,
                                                                     no_interim_rewards=True,
                                                                     use_test_ids=True),
                                                    n_trials=20,
-                                                   min_scale_rewards = replay_buffer_env.min_rewards_scale,
-                                                   max_scale_rewards = replay_buffer_env.max_rewards_scale,
-            )
+                                                   min_scale_rewards=replay_buffer_env.min_rewards_scale,
+                                                   max_scale_rewards=replay_buffer_env.max_rewards_scale,
+                                                   )
 
         if DECOY_INTERVAL == 2:
-            evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(use_flag=False, # flag,
+            evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(use_flag=False,  # flag,
                                                                                                forced_interval=interval,
                                                                                                no_interim_rewards=True,
                                                                                                use_test_ids=True),
                                                                               n_trials=20,
                                                                               running_average_obs=True,
-                                                                              min_scale_rewards = replay_buffer_env.min_rewards_scale,
-                                                                              max_scale_rewards = replay_buffer_env.max_rewards_scale,
+                                                                              min_scale_rewards=replay_buffer_env.min_rewards_scale,
+                                                                              max_scale_rewards=replay_buffer_env.max_rewards_scale,
                                                                               )
 
         for n_trial in range(10):
@@ -153,15 +151,15 @@ if __name__ == "__main__":
 
             # Alternately collect and training
             algo = RecurrentIQL(observation_shape=base_env.observation_space.shape,
-                             action_space=base_env.action_space,
-                             feature_size=ceil(128 / (1-args.dropout_p)),
-                             batch_size=32,
-                             expectile=EXPECTILE,
-                             gamma=GAMMA,
-                             decoy_interval=DECOY_INTERVAL,
-                             dropout_p=args.dropout_p,
-                             beta=args.beta,
-                             device='cuda' if torch.cuda.is_available() else 'cpu')
+                                action_space=base_env.action_space,
+                                feature_size=ceil(128 / (1 - args.dropout_p)),
+                                batch_size=32,
+                                expectile=EXPECTILE,
+                                gamma=GAMMA,
+                                decoy_interval=DECOY_INTERVAL,
+                                dropout_p=args.dropout_p,
+                                beta=args.beta,
+                                device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
 
@@ -178,5 +176,6 @@ if __name__ == "__main__":
 
         # Save logs
         os.makedirs('../logs_glucose/iql_minigrid_logs', exist_ok=True)
-        pl.DataFrame(logs).write_csv(f'../logs_glucose/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}'
-                                     f'_dropout={args.dropout_p}_beta={args.beta}.csv')
+        pl.DataFrame(logs).write_csv(
+            f'../logs_glucose/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}'
+            f'_dropout={args.dropout_p}_beta={args.beta}.csv')

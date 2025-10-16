@@ -9,7 +9,6 @@ from gymnasium.envs.registration import register
 from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
-
 SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 3  # 3 * 10 minutes = 30 minutes
 TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 10 minutes)
@@ -17,7 +16,6 @@ TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 1
 # Scaling parameters
 INSULIN_SCALE = 30.0
 CHO_SCALE = 300.0
-
 
 # Get our adult patients
 for i in range(1, 11):
@@ -32,6 +30,7 @@ class SampleTimeWrapper(RecordConstructorArgs, Wrapper):
     """
     Allow adjustment of sample time
     """
+
     def __init__(self, env: gym.Env):
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
@@ -49,6 +48,7 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
     Set all intermediate rewards to 0.
     At the end of the episode, give the sum of all rewards received.
     """
+
     def __init__(self, env: gym.Env):
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
@@ -70,7 +70,7 @@ class T1DPatientEnv(Wrapper):
 
     def __init__(self, use_test_ids: bool = False, **kwargs):
         self.kwargs = kwargs
-        self._id_choices = [1,2,3,4,5,6,7,8] if not use_test_ids else [9,10]
+        self._id_choices = [1, 2, 3, 4, 5, 6, 7, 8] if not use_test_ids else [9, 10]
         id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
@@ -78,7 +78,7 @@ class T1DPatientEnv(Wrapper):
 
     def reset(self, **kwargs):
         # Rebuild env each reset
-        self.env.close() # cleanup
+        self.env.close()  # cleanup
         id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
         self.env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
@@ -99,8 +99,8 @@ class FixedScaler(ObservationWrapper):
         # Max insulin = 30, min insulin = 0
         # Max CHO = 300, min = 0
         obs[0] = (obs[0] - 10) / (600 - 10)  # BG
-        obs[1] = obs[1] / INSULIN_SCALE      # insulin
-        obs[2] = obs[2] / CHO_SCALE          # CHO
+        obs[1] = obs[1] / INSULIN_SCALE  # insulin
+        obs[2] = obs[2] / CHO_SCALE  # CHO
         return obs
 
 
@@ -154,6 +154,7 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     Original obs shape (47,). Append a 1-channel flag at the start to make (48).
     0 -> next action repeats once; 1 -> next action repeats twice.
     """
+
     def __init__(self, env, use_flag: bool = True):
         RecordConstructorArgs.__init__(self)
         ObservationWrapper.__init__(self, env)
@@ -176,7 +177,8 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         return np.concatenate([[steps_left, waiting_period], obs], axis=-1)
 
 
-def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0, forced_interval: int = 0,
+def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
+                     forced_interval: int = 0,
                      use_flag: bool = True, use_scaling: bool = False, **kwargs):
     env = T1DPatientEnv(use_test_ids, **kwargs)
     env = SampleTimeWrapper(env)
@@ -186,5 +188,5 @@ def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = F
         env = EpisodeRewardsOnly(env)
     env = FixedScaler(env)
     env = AlternateStepWrapper(env, forced_interval=forced_interval)
-    env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
+    env = RepeatFlagChannel(env, use_flag=use_flag)  # +1 channel flag
     return env

@@ -20,12 +20,15 @@ from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from stable_baselines3.common.distributions import DiagGaussianDistribution, SquashedDiagGaussianDistribution
 from typing import TypeVar
 
-SelfSquashedDiagGaussianDistribution = TypeVar("SelfSquashedDiagGaussianDistribution", bound="SquashedDiagGaussianDistribution")
+SelfSquashedDiagGaussianDistribution = TypeVar("SelfSquashedDiagGaussianDistribution",
+                                               bound="SquashedDiagGaussianDistribution")
+
 
 class CallablePPO(PPO):
     """
     A version of PPO that can be called like a function to get actions.
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -38,6 +41,7 @@ class CallableRecurrentPPO(RecurrentPPO):
     """
     A version of PPO that can be called like a function to get actions.
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -66,6 +70,7 @@ class MiniGridEncoder(nn.Module):
         biases with zeros, Norm layers with weight=1, bias=0.
         The final Linear layer in the decoder is zero-initialized.
         """
+
         def _init_fn(m: nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
@@ -85,7 +90,6 @@ class MiniGridEncoder(nn.Module):
         return self.fc(shrink_x)
 
 
-
 class PPOMiniGridEncoder(MiniGridEncoder):
     def __init__(self, observation_shape: Tuple[int,], feature_size: int = 128,
                  *args, **kwargs) -> None:
@@ -97,7 +101,6 @@ class PPOMiniGridEncoder(MiniGridEncoder):
 class OfflineMiniGridEncoder(MiniGridEncoder):
     def __init__(self, observation_shape: Tuple[int,], feature_size: int = 128,
                  input_scaling: bool = True, *args, **kwargs) -> None:
-
         # additionally ignore flag channel at the start
         self.shrink_obs = lambda x: x[:, 1:]
         new_obs_shape = (observation_shape[0] - 1,)
@@ -106,7 +109,8 @@ class OfflineMiniGridEncoder(MiniGridEncoder):
 
 
 class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.Space, features_dim: int = 512) -> None: #, normalized_image: bool = False) -> None:
+    def __init__(self, observation_space: gym.Space,
+                 features_dim: int = 512) -> None:  # , normalized_image: bool = False) -> None:
         super().__init__(observation_space, features_dim)
         self.net = PPOMiniGridEncoder(observation_space.shape, feature_size=features_dim)
 
@@ -137,8 +141,8 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
         # init: small std
         with torch.no_grad():
             nn.init.zeros_(self.param_head.weight)
-            self.param_head.bias[: self.action_dim].zero_()                # mean ~ 0 pre-tanh
-            self.param_head.bias[self.action_dim :].fill_(log_std_init)         # log_std init
+            self.param_head.bias[: self.action_dim].zero_()  # mean ~ 0 pre-tanh
+            self.param_head.bias[self.action_dim:].fill_(log_std_init)  # log_std init
         # return dummy nn.Parameter to satisfy SB3 signature
         self.dummy_log_std = nn.Parameter(torch.zeros(self.action_dim), requires_grad=False)
         return self.param_head, self.dummy_log_std
@@ -153,8 +157,8 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
         return self
 
     def sample(self) -> torch.Tensor:
-        self.gaussian_actions = self.distribution.rsample()         # pre-tanh
-        u = torch.tanh(self.gaussian_actions)                          # in [-1,1]
+        self.gaussian_actions = self.distribution.rsample()  # pre-tanh
+        u = torch.tanh(self.gaussian_actions)  # in [-1,1]
         return self.scale * u + self.bias
 
     def mode(self) -> torch.Tensor:
@@ -175,7 +179,7 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
         log_prob = sum_independent_dims(log_prob)
 
         # tanh Jacobian
-        log_prob -= torch.sum(torch.log(torch.clamp(1 - u**2, self.epsilon, 1 - self.epsilon)), dim=1)
+        log_prob -= torch.sum(torch.log(torch.clamp(1 - u ** 2, self.epsilon, 1 - self.epsilon)), dim=1)
 
         # affine scaling Jacobian
         if self.scale != 1.0:
@@ -185,13 +189,13 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
         return log_prob
 
 
-
 class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
     """
     A custom recurrent policy that applies a transformation to the action logits.
     Transformation: (tanh(logits) + 1) * 15
     This maps the output of the action network to the range [0, 30].
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -221,7 +225,7 @@ class ScaleAction(nn.Module):
 
 class CustomNet(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], output_size: int, feature_size: int = 128,
-                 device: str = 'cpu', action_encoder = None, feature_extractor=None, dropout_p: float = 0.0,
+                 device: str = 'cpu', action_encoder=None, feature_extractor=None, dropout_p: float = 0.0,
                  has_sigmoid: bool = False, *args, **kwargs) -> None:
         super().__init__()
         self._device = device
@@ -260,6 +264,7 @@ class CustomNet(nn.Module):
         biases with zeros, Norm layers with weight=1, bias=0.
         The final Linear layer in the decoder is zero-initialized.
         """
+
         def _init_fn(m: nn.Module):
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
@@ -315,9 +320,11 @@ class CustomNet(nn.Module):
 
     def enable_mc_dropout(self):
         """Enable MC Dropout during inference."""
+
         def apply_mc_dropout(m):
             if isinstance(m, nn.Dropout):
                 m.train()
+
         self.apply(apply_mc_dropout)
 
 
@@ -448,7 +455,8 @@ class CustomIQL(nn.Module):
         self.decoy_interval = None
         self.scaler = None
 
-        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=device)
+        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p,
+                          device=device)
 
         self.feature_extractor = OfflineMiniGridEncoder(**net_kwargs).to(device)
         self.action_encoder = nn.Sequential(
@@ -459,13 +467,16 @@ class CustomIQL(nn.Module):
             nn.Dropout(p=dropout_p)
         ).to(device)
 
-        self.critic_net1 = CustomNet(output_size=2, action_encoder=self.action_encoder, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = CustomNet(output_size=2, action_encoder=self.action_encoder, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net1 = CustomNet(output_size=2, action_encoder=self.action_encoder,
+                                     feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=2, action_encoder=self.action_encoder,
+                                     feature_extractor=self.feature_extractor, **net_kwargs)
 
         self.value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
         self.target_value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
 
-        self.policy_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, has_sigmoid=True, **net_kwargs)
+        self.policy_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, has_sigmoid=True,
+                                    **net_kwargs)
 
         # Give both critic nets to the critic optimizer
         self.critic_optim = torch.optim.AdamW(list(self.critic_net1.parameters()) +
@@ -478,15 +489,15 @@ class CustomIQL(nn.Module):
             target_param.data.copy_(param.data)
 
     def fit(
-        self,
-        dataset,
-        n_epochs_train: int = 1,
-        n_epochs_eval: int = 1,
-        evaluators=None,
-        show_progress: bool = True,
-        experiment_name: str = None,
-        decoy_interval: int = 0,
-        dataset_kwargs: Optional[Dict] = None
+            self,
+            dataset,
+            n_epochs_train: int = 1,
+            n_epochs_eval: int = 1,
+            evaluators=None,
+            show_progress: bool = True,
+            experiment_name: str = None,
+            decoy_interval: int = 0,
+            dataset_kwargs: Optional[Dict] = None
     ):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
@@ -499,7 +510,8 @@ class CustomIQL(nn.Module):
         epoch_eval_interval = n_epochs_train // n_epochs_eval
 
         # Start training
-        with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0, disable=not show_progress) as pbar:
+        with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0,
+                  disable=not show_progress) as pbar:
             for epoch in range(1, n_epochs_train + 1):
                 epoch_str = f"{epoch}/{n_epochs_train}"
 
@@ -513,7 +525,8 @@ class CustomIQL(nn.Module):
 
                     # Soft update of target value network
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-                        target_param.data.copy_((1-self._tau_target) * target_param.data + self._tau_target * param.data)
+                        target_param.data.copy_(
+                            (1 - self._tau_target) * target_param.data + self._tau_target * param.data)
 
                     pbar.update(dataset.batch_size)
                     pbar.set_postfix(epoch=epoch_str,
@@ -549,7 +562,7 @@ class CustomIQL(nn.Module):
         # Scale up
         action_unit = action_unit * (self._action_high - self._action_low) + self._action_low
         # if deterministic:
-            # return logits.argmax(dim=-1).cpu().numpy()
+        # return logits.argmax(dim=-1).cpu().numpy()
         # return Categorical(logits=logits).sample().cpu().numpy()
         return action_unit.squeeze(-1).cpu().numpy()
 
@@ -598,17 +611,21 @@ class CustomIQL(nn.Module):
 
 
 class RecurrentIQL(CustomIQL):  # Inherits from your original class
-    def __init__(self, *args, sequence_length: int = 64, decoy_interval: int = 0, recurrent_hidden_size: int = 128, **kwargs):
+    def __init__(self, *args, sequence_length: int = 64, decoy_interval: int = 0, recurrent_hidden_size: int = 128,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         if decoy_interval == 0:
             sequence_length *= int((1 + 18) / 2)
 
         self._sequence_length = sequence_length
         self._recurrent_hidden_size = recurrent_hidden_size
-        self._buffered_sequence_arange = torch.arange(sequence_length, device=self._device).unsqueeze(0).expand(self._batch_size, sequence_length)
-        self._buffered_batch_arange = torch.arange(self._batch_size, device=self._device).unsqueeze(1).expand(self._batch_size, sequence_length)
+        self._buffered_sequence_arange = torch.arange(sequence_length, device=self._device).unsqueeze(0).expand(
+            self._batch_size, sequence_length)
+        self._buffered_batch_arange = torch.arange(self._batch_size, device=self._device).unsqueeze(1).expand(
+            self._batch_size, sequence_length)
         self._buffered_empty = torch.full((self._batch_size, sequence_length), sequence_length, device=self._device)
-        self._buffered_pow_t = torch.pow(self._gamma, torch.arange(sequence_length, device=self._device, dtype=self._gamma.dtype))
+        self._buffered_pow_t = torch.pow(self._gamma,
+                                         torch.arange(sequence_length, device=self._device, dtype=self._gamma.dtype))
 
         # --- Replace network instantiations with RecurrentNet ---
         net_kwargs = dict(
@@ -681,7 +698,8 @@ class RecurrentIQL(CustomIQL):  # Inherits from your original class
                 r = rews.float()
 
             if self.decoy_interval == 0:
-                q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible, masks)
+                q1, q2, q_target = self._filter_to_correct_visibles(q1, q2, r, v_next, dones, visible, next_visible,
+                                                                    masks)
             else:
                 q_target = r + self._gamma * (1 - dones.float()) * v_next
 
