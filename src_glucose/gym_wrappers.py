@@ -139,7 +139,9 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
     def _flip_step_modes(self, action: Any):
         self.steps_until_action_available = self.next_waiting_period
-        self.next_waiting_period = np.random.randint(TOTAL_SIZE)  # 1 to TOTAL_SIZE steps
+        # self.next_waiting_period = np.random.randint(TOTAL_SIZE)  # 1 to TOTAL_SIZE steps
+        # Sample from lognormal distribution mostly centered on 1 but extending up to TOTAL_SIZE.
+        self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.0, 1.0)), 1, TOTAL_SIZE)) - 1
         self.last_action = action
 
 
