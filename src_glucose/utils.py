@@ -9,6 +9,8 @@ import argparse
 import inquirer
 import os
 import shutil
+from simglucose.simulation.env import bg_in_range
+from gym_wrappers import AGGREGATE_WINDOW_SIZE, SAMPLE_TIME
 
 
 class ReplayBufferEnv:
@@ -245,27 +247,39 @@ class ReplayBufferEnv:
         self.visible_states[0] += visible_idxs
         self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
 
-        # Update the decoy actions (every second step)
-        # - For basal insulin, this involves taking the average of the two actions
-        actions = [
-            np.mean(ep_buffer['all_action'][idx: idx + 6])
-            for idx in range(6, len(ep_buffer['all_action']), 6)
+        # Generate our aggregated datapoints for decoy_interval = 2
+        # e.g., for window_size = 3, we use the following aggregates:
+        # for i in [3, 6, 9, ...]
+        #      [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
+        # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
+        # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
+        # rew:                  |---------|    |----   (t3-t5, t6-t8, etc)
+        # (reward calculated from next obs)
+
+        agg_window = AGGREGATE_WINDOW_SIZE
+
+        obs = [
+            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)
+            for idx in range(0, len(ep_buffer['all_obs']) - agg_window, agg_window)
         ]
 
-        rewards, dones = [
-            [np.sum(ep_buffer[f'all_{key}'][idx: idx + 6]) for idx in range(6, len(ep_buffer['all_reward']), 6)]
-            for key in ['reward', 'done']
-        ]  # Note to self <- should this be recalculated from scratch using the average blood glucose?
+        actions = [
+            np.mean(ep_buffer['all_action'][(idx-1): (idx-1) + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_action']), agg_window)
+        ]
 
-        # For obs, take the mean observation of the two steps
-        # this is from t-11 to t0 (inclusive)
-        obs = np.stack([
-            np.mean(ep_buffer['all_obs'][idx-6 + 1: idx + 1], 0)
-            for idx in range(6, len(ep_buffer['all_obs']), 6)
-        ])
-        # Change the steps_remaining flag to 0
-        obs[:, :2] = 0
-        obs = obs.tolist()
+        dones = [
+            np.any(ep_buffer['all_done'][idx: idx + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_done']), agg_window)
+        ]
+
+        # Manually calculate reward
+        bg_levels = np.array([
+            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[2]
+            for idx in range(agg_window, len(ep_buffer['all_obs']), agg_window)
+        ]) * (600 - 10) + 10  # Scale back to real bg levels
+
+        rewards = [bg_in_range([i]) * SAMPLE_TIME for i in bg_levels]
 
         # if not dones[-1]:
             # rewards[-1] = ep_buffer['reward'][-1]
@@ -514,7 +528,7 @@ class EnvironmentEvaluator:
 
     def __call__(self, algo) -> float:
         mean_returns = []
-        running_average_obs = deque(maxlen=12)
+        running_average_obs = deque(maxlen=AGGREGATE_WINDOW_SIZE)
         for _ in range(self.n_trials):
             obs, info = self.env.reset()
             running_average_obs.append(obs)

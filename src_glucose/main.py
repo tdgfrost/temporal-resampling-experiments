@@ -98,7 +98,7 @@ if __name__ == "__main__":
         logs = defaultdict(list)
 
         # Get our PPO model
-        base_env = make_glucose_env(no_interim_rewards=True)
+        base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
         dataset_size = 100_000
