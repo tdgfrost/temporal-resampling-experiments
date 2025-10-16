@@ -114,9 +114,10 @@ if __name__ == "__main__":
         dataset_rew_min, dataset_rew_max = replay_buffer_env.min_rewards_scale, replay_buffer_env.max_rewards_scale
         dataset_rew_diff = dataset_rew_max - dataset_rew_min
         dataset_rew_avg_raw = dataset_rew_avg * dataset_rew_diff + dataset_rew_min
-        print(f"Baseline reward of the dataset: "
+        mean_ep_duration = np.array(replay_buffer_env.observations[0]).shape[0] / sum(replay_buffer_env.dones[0])
+        print(f"\n=================\nBaseline reward of the dataset: "
               f"{dataset_rew_avg:.2f} ({dataset_rew_avg_raw:.2f}) "
-              f"+/- {dataset_rew_std:.2f}")
+              f"+/- {dataset_rew_std:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
         # Get our evaluators
         evaluators = {}

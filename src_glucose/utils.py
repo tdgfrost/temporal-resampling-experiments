@@ -158,7 +158,10 @@ class ReplayBufferEnv:
                 episode_starts = np.ones((1,), dtype=bool)
                 total_reward = 0
                 while not done:
-                    action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts)
+                    action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts,
+                                                        deterministic=True)
+                    # If desired, could add randomness here, either by setting deterministic=False,
+                    # or by selecting random actions:
                     # if with_random and np.random.random() < rand_p:
                     #       action = self.env.action_space.sample()
                     #       action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
