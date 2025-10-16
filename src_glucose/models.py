@@ -575,7 +575,10 @@ class CustomIQL(nn.Module):
 
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
         for key in rewards.keys():
-            eval_str += f"\n     {key} = {rewards[key][0]:.2f} +/- {rewards[key][1]:.2f}"
+            avg_rew, std_rew = rewards[key]
+            min_r, max_r = evaluators[key].min_scale, evaluators[key].max_scale
+            avg_rew_raw = avg_rew * (max_r - min_r) + min_r
+            eval_str += f"\n     {key} = {avg_rew:.2f} ({avg_rew_raw:.2f}) +/- {std_rew:.2f}"
 
         eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
         eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"
