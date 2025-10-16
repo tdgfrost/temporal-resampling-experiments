@@ -10,7 +10,7 @@ import inquirer
 import os
 import shutil
 from simglucose.simulation.env import bg_in_range
-from gym_wrappers import AGGREGATE_WINDOW_SIZE, SAMPLE_TIME
+from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
 
 
 class ReplayBufferEnv:
@@ -163,7 +163,7 @@ class ReplayBufferEnv:
                         # action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
                     obs, reward, term, trunc, info = self.env.step(action)
                     # Get the real action delivered
-                    real_action = obs[3] * 30
+                    real_action = obs[3] * INSULIN_SCALE
                     done = term or trunc
                     episode_starts[0] = done
                     total_reward += reward

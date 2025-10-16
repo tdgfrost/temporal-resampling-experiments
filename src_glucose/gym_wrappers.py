@@ -14,6 +14,10 @@ SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 3  # 3 * 10 minutes = 30 minutes
 TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 10 minutes)
 
+# Scaling parameters
+INSULIN_SCALE = 30.0
+CHO_SCALE = 300.0
+
 
 # Get our adult patients
 for i in range(1, 11):
@@ -95,8 +99,8 @@ class FixedScaler(ObservationWrapper):
         # Max insulin = 30, min insulin = 0
         # Max CHO = 300, min = 0
         obs[0] = (obs[0] - 10) / (600 - 10)  # BG
-        obs[1] = obs[1] / 30.0                # insulin
-        obs[2] = obs[2] / 300.0               # CHO
+        obs[1] = obs[1] / INSULIN_SCALE      # insulin
+        obs[2] = obs[2] / CHO_SCALE          # CHO
         return obs
 
 
