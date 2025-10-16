@@ -112,8 +112,8 @@ class OfflineMiniGridCNN(MiniGridCNN):
 
         C, H, W = self._get_obs_shape(observation_shape)
 
-        C -= 2  # ignore flag and last (always-zero) channel
-        self.shrink_obs = lambda x: x[:, 1:C+1, :, :]
+        C -= 1  # we will ignore the final channel (the always-0 channel in LavaGap)
+        self.shrink_obs = lambda x: x[:, :C, :, :]
 
         super().__init__(C, H, W, feature_size)
 
@@ -191,8 +191,8 @@ class CustomNet(nn.Module):
             nn.init.zeros_(self.decoder[-1].weight)
             nn.init.zeros_(self.decoder[-1].bias)
 
-    def forward(self, x: torch.Tensor, actions: torch.Tensor = None, flags: torch.Tensor = None) -> torch.Tensor:
-        x, actions, flags = self._ndarray_to_tensor(x, actions, flags)
+    def forward(self, x: torch.Tensor, actions: torch.Tensor = None) -> torch.Tensor:
+        x, actions = self._ndarray_to_tensor(x, actions)
         x = x.to(dtype=torch.float32)
 
         # (N, C, H, W) -> (N, feature_size)
@@ -200,10 +200,6 @@ class CustomNet(nn.Module):
 
         # (N, feature_size) -> (N, output_size)
         output = self.decoder(hidden)
-
-        if flags is not None:
-            output = output.view(x.size(0), 2, -1)
-            output = torch.take_along_dim(output, flags.long().unsqueeze(-1), 1).squeeze(1)
 
         if actions is None:
             return output
@@ -266,13 +262,13 @@ class CustomIQL(nn.Module):
 
         self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
 
-        self.critic_net1 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net1 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
 
-        self.value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
 
-        self.policy_net = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.policy_net = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
 
         # Give both critic nets to the critic optimizer
         self.critic_optim = torch.optim.AdamW(list(self.critic_net1.encoder.parameters()) +
@@ -314,8 +310,8 @@ class CustomIQL(nn.Module):
                     # Update the networks
                     if not self._cloning_only:
                         loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, flags, next_flags))
-                        loss_dict['value_loss'].append(self._update_value(obs, acts, flags))
-                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, flags))
+                        loss_dict['value_loss'].append(self._update_value(obs, acts))
+                    loss_dict['policy_loss'].append(self._update_actor(obs, acts))
 
                     # Soft update of target value network
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
@@ -341,24 +337,22 @@ class CustomIQL(nn.Module):
     def forward(self, obs, acts, flags=None):
         if flags is None:
             flags = self._extract_flags(obs)
-        q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
-        v = self.value_net(obs, flags=flags)
-        logits = self.policy_net(obs, flags=flags)
+        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+        v = self.value_net(obs)
+        logits = self.policy_net(obs)
         return (q1, q2), v, logits
 
-    def predict(self, obs, flags=None, deterministic: bool = False):
+    def predict(self, obs, deterministic: bool = False):
         obs = self._to_tensors(obs)[0]
-        if flags is None:
-            flags = self._extract_flag(obs)
-        logits = self.policy_net(obs, flags=flags)
+        logits = self.policy_net(obs)
         if deterministic:
             return logits.argmax(dim=-1).cpu().numpy()
         return Categorical(logits=logits).sample().cpu().numpy()
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flags=None, next_flags=None):
-        q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
+    def _update_critic(self, obs, acts, rews, next_obs, dones, flags, next_flags):
+        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
         with torch.no_grad():
-            v_next = self.target_value_net(next_obs, flags=next_flags)
+            v_next = self.target_value_net(next_obs)
             next_multistep_discount = torch.where(next_flags == 1, 3, 1)
             current_multistep_discount = torch.where(flags == 1, 2, 0)
             r = self._gamma ** current_multistep_discount * rews.float()
@@ -370,10 +364,10 @@ class CustomIQL(nn.Module):
         self.critic_optim.step()
         return loss.item()
 
-    def _update_value(self, obs, acts, flags=None):
-        v = self.value_net(obs, flags=flags)
+    def _update_value(self, obs, acts):
+        v = self.value_net(obs)
         with torch.no_grad():
-            q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
+            q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
             q = torch.min(q1, q2)
 
         diff = q - v
@@ -386,8 +380,8 @@ class CustomIQL(nn.Module):
         self.value_optim.step()
         return value_loss.item()
 
-    def _update_actor(self, obs, acts, flags=None):
-        logits = self.policy_net(obs, flags=flags)
+    def _update_actor(self, obs, acts):
+        logits = self.policy_net(obs)
         weights = 1.0
         if not self._cloning_only:
             weights = self._batch_diff
