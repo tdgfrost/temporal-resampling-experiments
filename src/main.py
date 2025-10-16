@@ -12,21 +12,24 @@ from utils import *
 from gym_wrappers import *
 from models import *
 
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
-parser.add_argument('--train_iql', default=True, type=parse_bool, help='Train IQL agent')
+parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train IQL agent')
+parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql'],
+                    help='Type of offline RL model to train (iql or cql)')
 parser.add_argument('--ppo_agent', default=None, type=str, help='Path to pre-trained PPO agent')
-parser.add_argument('--render_performance', default=False, type=parse_bool, help='Whether to render performance in final eval')
-parser.add_argument('--record_video', default=False, type=parse_bool, help='Whether to record video of performance rendering')
+parser.add_argument('--render_performance', default=False, type=parse_bool,
+                    help='Whether to render performance in final eval')
+parser.add_argument('--record_video', default=False, type=parse_bool,
+                    help='Whether to record video of performance rendering')
 
-parser.add_argument('--expectile', default=0.6, type=float, help='Expectile value for IQL training (0.5 is BC)')
-parser.add_argument('--dropout_p', default=0.2, type=float, help='MC dropout probability for PPO agent')
+parser.add_argument('--alpha', default=1.0, type=float, help='Alpha parameter for CQL (1.0 is default)')
+parser.add_argument('--expectile', default=0.7, type=float, help='Expectile value for IQL training (0.5 is BC)')
+parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
 parser.add_argument('--beta', default=2.0, type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
-
 
 """
 Trained on natural dataset:
@@ -57,9 +60,9 @@ additional_wrappers = (
     ),
     # For debugging purposes only
     # WrapperSpec(
-        # name="FullyObsWrapper",
-        # entry_point="minigrid.wrappers:FullyObsWrapper",
-        # kwargs=None,
+    # name="FullyObsWrapper",
+    # entry_point="minigrid.wrappers:FullyObsWrapper",
+    # kwargs=None,
     # ),
     WrapperSpec(
         name="AlternateStepWrapper",
@@ -84,7 +87,6 @@ additional_wrappers = (
 )
 no_video_additional_wrappers = additional_wrappers[1:]
 
-
 register(
     id="LavaGapS6AltStep-v0",
     entry_point="gym_wrappers:make_lavastep_env",
@@ -96,16 +98,17 @@ register(
     additional_wrappers=additional_wrappers,
 )
 
-
 if __name__ == "__main__":
     args = parser.parse_args()
 
     train_ppo = args.train_ppo
-    train_iql = args.train_iql
+    train_offline = args.train_offline
+    offline_model = CustomIQL if args.offline_model == 'iql' else (
+        CustomCQLSAC if args.offline_model == 'cql' else None)
     render_performance = args.render_performance
     record_video = args.record_video
 
-    if (train_iql and not os.path.exists('./dataset.pkl')) or render_performance:
+    if (train_offline and not os.path.exists('./dataset.pkl')) or render_performance:
         ppo_agent = f'../logs/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
@@ -113,7 +116,7 @@ if __name__ == "__main__":
                                        "for IQL training.")
         assert os.path.exists(ppo_agent), "Provided PPO agent path does not exist."
 
-    assert not (train_ppo and train_iql), "Please choose to train either PPO or IQL, not both."
+    assert not (train_ppo and train_offline), "Please choose to train either PPO or IQL, not both."
 
     EXPECTILE = args.expectile
     DECOY_INTERVAL = args.decoy_interval
@@ -143,8 +146,9 @@ if __name__ == "__main__":
         model.learn(2e5, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
-    if train_iql:
-        print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
+    if train_offline:
+        print(
+            f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
 
         logs = defaultdict(list)
 
@@ -161,7 +165,7 @@ if __name__ == "__main__":
                 pickle.dump(replay_buffer_env, f)
                 f.close()
         else:
-            print('='*50, '\nRe-using existing dataset.pkl...\n', '='*50)
+            print('=' * 50, '\nRe-using existing dataset.pkl...\n', '=' * 50)
             with open('./dataset.pkl', 'rb') as f:
                 replay_buffer_env = pickle.load(f)
                 f.close()
@@ -190,15 +194,16 @@ if __name__ == "__main__":
             logs['dataset_reward'].append(dataset_rewards.mean())
 
             # Alternately collect and training
-            algo = CustomIQL(observation_shape=base_env.observation_space.shape,
-                             action_size=base_env.action_space.n,
-                             feature_size=ceil(64 / (1-args.dropout_p)),
-                             batch_size=ceil(64 / (1-args.dropout_p)),
-                             expectile=EXPECTILE,
-                             gamma=GAMMA,
-                             dropout_p=args.dropout_p,
-                             beta=args.beta,
-                             device='cuda' if torch.cuda.is_available() else 'cpu')
+            algo = offline_model(observation_shape=base_env.observation_space.shape,
+                                 action_size=base_env.action_space.n,
+                                 feature_size=ceil(64 / (1 - args.dropout_p)),
+                                 batch_size=ceil(64 / (1 - args.dropout_p)),
+                                 expectile=EXPECTILE,
+                                 gamma=GAMMA,
+                                 dropout_p=args.dropout_p,
+                                 beta=args.beta,
+                                 cql_alpha=args.alpha,
+                                 device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
 
@@ -228,7 +233,7 @@ if __name__ == "__main__":
 
         total_episodes = 10
         for ep_number in range(total_episodes):
-            observation, info = eval_env.reset(seed=42+ep_number)
+            observation, info = eval_env.reset(seed=42 + ep_number)
             done = False
             while not done:
                 action = model.predict(observation)[0]

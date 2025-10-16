@@ -227,59 +227,11 @@ class CustomNet(nn.Module):
         self.apply(apply_mc_dropout)
 
 
-class CustomIQL(nn.Module):
-    def __init__(
-            self,
-            observation_shape: Tuple[int, int, int],
-            action_size: int,
-            input_length: int = 2,
-            feature_size: int = 128,
-            batch_size: int = 128,
-            expectile: float = 0.7,
-            gamma: float = 0.99,
-            critic_lr: float = 3e-4,
-            value_lr: float = 3e-4,
-            actor_lr: float = 3e-4,
-            tau_target: float = 0.005,
-            dropout_p: float = 0.0,
-            beta: float = 2.0,
-            device: str = 'cpu'
-    ):
+class _CustomBase(nn.Module):
+    def __init__(self, device: str = 'cpu', *args, **kwargs):
         super().__init__()
-        self._feature_size = feature_size
-        self._batch_size = batch_size
-        self._expectile = expectile
-        self._gamma = gamma
-        self._batch_diff = None
-        self._input_length = input_length
+        self._cloning_only = False
         self._device = device
-        self._cloning_only = expectile == 0.5
-        self._tau_target = tau_target
-        self._has_dropout = dropout_p > 0.0
-        self._beta = beta
-
-        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=device)
-
-        self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
-
-        self.critic_net1 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
-
-        self.value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
-
-        self.policy_net = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
-
-        # Give both critic nets to the critic optimizer
-        self.critic_optim = torch.optim.AdamW(list(self.critic_net1.encoder.parameters()) +
-                                             list(self.critic_net1.decoder.parameters()) +
-                                             list(self.critic_net2.decoder.parameters()), lr=critic_lr)
-        self.value_optim = torch.optim.AdamW(self.value_net.parameters(), lr=value_lr)
-        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=actor_lr)
-
-        # clone the value net to a target network
-        for target_param, param in zip(self.target_value_net.decoder.parameters(), self.value_net.decoder.parameters()):
-            target_param.data.copy_(param.data)
 
     def fit(
         self,
@@ -314,8 +266,7 @@ class CustomIQL(nn.Module):
                     loss_dict['policy_loss'].append(self._update_actor(obs, acts))
 
                     # Soft update of target value network
-                    for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-                        target_param.data.copy_((1-self._tau_target) * target_param.data + self._tau_target * param.data)
+                    self.sync_target_networks()
 
                     pbar.update(1)
                     pbar.set_postfix(epoch=epoch_str,
@@ -334,69 +285,17 @@ class CustomIQL(nn.Module):
 
         return log_dict
 
-    def forward(self, obs, acts, flags=None):
-        if flags is None:
-            flags = self._extract_flags(obs)
-        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
-        v = self.value_net(obs)
-        logits = self.policy_net(obs)
-        return (q1, q2), v, logits
+    def _update_critic(self, *args):
+        return np.nan
 
-    def predict(self, obs, deterministic: bool = False):
-        obs = self._to_tensors(obs)[0]
-        logits = self.policy_net(obs)
-        if deterministic:
-            return logits.argmax(dim=-1).cpu().numpy()
-        return Categorical(logits=logits).sample().cpu().numpy()
+    def _update_value(self, *args):
+        return np.nan
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flags, next_flags):
-        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
-        with torch.no_grad():
-            v_next = self.target_value_net(next_obs)
-            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
-            current_multistep_discount = torch.where(flags == 1, 2, 0)
-            r = self._gamma ** current_multistep_discount * rews.float()
-            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
+    def _update_actor(self, *args):
+        return np.nan
 
-        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
-        self.critic_optim.zero_grad()
-        loss.backward()
-        self.critic_optim.step()
-        return loss.item()
-
-    def _update_value(self, obs, acts):
-        v = self.value_net(obs)
-        with torch.no_grad():
-            q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
-            q = torch.min(q1, q2)
-
-        diff = q - v
-        self._batch_diff = diff.detach().squeeze()
-        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-        value_loss = (weights * (diff.squeeze() ** 2)).mean()
-
-        self.value_optim.zero_grad()
-        value_loss.backward()
-        self.value_optim.step()
-        return value_loss.item()
-
-    def _update_actor(self, obs, acts):
-        logits = self.policy_net(obs)
-        weights = 1.0
-        if not self._cloning_only:
-            weights = self._batch_diff
-            if self._has_dropout:
-                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-            else:
-                weights = torch.clip(torch.exp(self._beta * weights), -torch.inf, 100)
-
-        policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
-        policy_loss = (policy_loss * weights).mean()
-
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
-        return policy_loss.item()
+    def sync_target_networks(self):
+        pass
 
     def _extract_flag(self, obs):
         obs = self._to_tensors(obs)[0]
@@ -440,3 +339,238 @@ class CustomIQL(nn.Module):
             'policy_loss': deque(maxlen=100)
         }
 
+
+class CustomIQL(_CustomBase):
+    def __init__(
+            self,
+            observation_shape: Tuple[int, int, int],
+            action_size: int,
+            input_length: int = 2,
+            feature_size: int = 128,
+            batch_size: int = 128,
+            expectile: float = 0.7,
+            gamma: float = 0.99,
+            critic_lr: float = 3e-4,
+            value_lr: float = 3e-4,
+            actor_lr: float = 3e-4,
+            tau_target: float = 0.005,
+            dropout_p: float = 0.0,
+            beta: float = 2.0,
+            *args,
+            **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self._feature_size = feature_size
+        self._batch_size = batch_size
+        self._expectile = expectile
+        self._gamma = gamma
+        self._batch_diff = None
+        self._input_length = input_length
+        self._cloning_only = expectile == 0.5
+        self._tau_target = tau_target
+        self._has_dropout = dropout_p > 0.0
+        self._beta = beta
+
+        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=self._device)
+
+        self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(self._device)
+
+        self.critic_net1 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        self.value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        self.policy_net = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        # Give both critic nets to the critic optimizer
+        self.critic_optim = torch.optim.AdamW(list(self.critic_net1.encoder.parameters()) +
+                                             list(self.critic_net1.decoder.parameters()) +
+                                             list(self.critic_net2.decoder.parameters()), lr=critic_lr)
+        self.value_optim = torch.optim.AdamW(self.value_net.parameters(), lr=value_lr)
+        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=actor_lr)
+
+        # clone the value net to a target network
+        self.sync_target_networks(tau=1.0)
+
+    def forward(self, obs, acts):
+        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+        v = self.value_net(obs)
+        logits = self.policy_net(obs)
+        return (q1, q2), v, logits
+
+    def predict(self, obs, deterministic: bool = False):
+        obs = self._to_tensors(obs)[0]
+        logits = self.policy_net(obs)
+        if deterministic:
+            return logits.argmax(dim=-1).cpu().numpy()
+        return Categorical(logits=logits).sample().cpu().numpy()
+
+    def sync_target_networks(self, tau=None):
+        tau = tau or self._tau_target
+        for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+    def _update_critic(self, obs, acts, rews, next_obs, dones, flags, next_flags):
+        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+        with torch.no_grad():
+            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
+            current_multistep_discount = torch.where(flags == 1, 2, 0)
+
+            v_next = self.target_value_net(next_obs)
+            r = self._gamma ** current_multistep_discount * rews.float()
+            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
+
+        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+        self.critic_optim.zero_grad()
+        loss.backward()
+        self.critic_optim.step()
+        return loss.item()
+
+    def _update_value(self, obs, acts):
+        v = self.value_net(obs)
+        with torch.no_grad():
+            q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+            q = torch.min(q1, q2)
+
+        diff = q - v
+        self._batch_diff = diff.detach().squeeze()
+        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+        value_loss = (weights * (diff.squeeze() ** 2)).mean()
+
+        self.value_optim.zero_grad()
+        value_loss.backward()
+        self.value_optim.step()
+        return value_loss.item()
+
+    def _update_actor(self, obs, acts):
+        logits = self.policy_net(obs)
+        weights = 1.0
+        if not self._cloning_only:
+            weights = self._batch_diff
+            if self._has_dropout:
+                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+            else:
+                weights = torch.clip(torch.exp(self._beta * weights), -torch.inf, 100)
+
+        policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
+        policy_loss = (policy_loss * weights).mean()
+
+        self.policy_optim.zero_grad()
+        policy_loss.backward()
+        self.policy_optim.step()
+        return policy_loss.item()
+
+
+class CustomCQLSAC(_CustomBase):
+    def __init__(
+        self,
+        observation_shape: tuple,
+        action_size: int,
+        feature_size: int = 128,
+        batch_size: int = 128,
+        gamma: float = 0.99,
+        cql_alpha: float = 1.0,
+        critic_lr: float = 3e-4,
+        actor_lr: float = 3e-4,
+        tau_target: float = 0.005,
+        entropy_alpha: float = 0.2,
+        dropout_p: float = 0.0,
+        *args,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self._feature_size = feature_size
+        self._batch_size = batch_size
+        self._gamma = gamma
+        self._tau_target = tau_target
+        self._cql_alpha = cql_alpha
+        self._entropy_alpha = entropy_alpha
+
+        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, dropout_p=dropout_p, device=self._device)
+
+        self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(self._device)
+
+        self.critic_net1 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_critic_net1 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_critic_net2 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.policy_net = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        self.critic_optim = torch.optim.AdamW(
+            list(self.critic_net1.parameters()) + list(self.critic_net2.parameters()), lr=critic_lr
+        )
+        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=actor_lr)
+
+        # Initialize target networks
+        self.sync_target_networks(tau=1.0)
+
+    def forward(self, obs):
+        q1_logits = self.critic_net1(obs)
+        q2_logits = self.critic_net2(obs)
+        policy_logits = self.policy_net(obs)
+        return q1_logits, q2_logits, policy_logits
+
+    def predict(self, obs, deterministic: bool = False):
+        obs = self._to_tensors(obs)[0]
+        logits = self.policy_net(obs)
+        if deterministic:
+            return logits.argmax(dim=-1).cpu().numpy()
+        return Categorical(logits=logits).sample().cpu().numpy()
+
+    def _update_critic(self, obs, acts, rews, next_obs, dones, flags, next_flags):
+        q1_logits, q2_logits = self.critic_net1(obs), self.critic_net2(obs)
+        q1_pred_logits, q2_pred_logits = q1_logits.gather(1, acts.long()), q2_logits.gather(1, acts.long())
+
+        with torch.no_grad():
+            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
+            current_multistep_discount = torch.where(flags == 1, 2, 0)
+
+            next_policy_logits = self.policy_net(next_obs)
+            next_policy_probs = torch.softmax(next_policy_logits, dim=-1)
+
+            next_q1_logits, next_q2_logits = self.target_critic_net1(next_obs), self.target_critic_net2(next_obs)
+            next_q_logits = torch.min(next_q1_logits, next_q2_logits)
+
+            next_v_logits = (next_policy_probs * (next_q_logits - self._entropy_alpha * torch.log_softmax(next_policy_logits, dim=-1))).sum(dim=-1, keepdim=True)
+
+            r = self._gamma ** current_multistep_discount * rews.float()
+            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * torch.sigmoid(next_v_logits)
+
+        q1_pred = torch.sigmoid(q1_pred_logits)
+        q2_pred = torch.sigmoid(q2_pred_logits)
+        bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
+
+        # CQL loss
+        logsumexp_q1 = torch.logsumexp(q1_logits, dim=1, keepdim=True)
+        logsumexp_q2 = torch.logsumexp(q2_logits, dim=1, keepdim=True)
+        cql_loss1 = (logsumexp_q1 - q1_pred_logits).mean()
+        cql_loss2 = (logsumexp_q2 - q2_pred_logits).mean()
+        cql_loss = cql_loss1 + cql_loss2
+
+        total_loss = bellman_loss + self._cql_alpha * cql_loss
+
+        self.critic_optim.zero_grad()
+        total_loss.backward()
+        self.critic_optim.step()
+        return total_loss.item()
+
+    def _update_actor(self, obs, acts=None):
+        logits = self.policy_net(obs)
+        probs = torch.softmax(logits, dim=-1)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        with torch.no_grad():
+            q1_logits, q2_logits = self.critic_net1(obs), self.critic_net2(obs)
+            q_logits = torch.min(q1_logits, q2_logits)
+        policy_loss = (probs * (self._entropy_alpha * log_probs - q_logits)).sum(dim=1).mean()
+        self.policy_optim.zero_grad()
+        policy_loss.backward()
+        self.policy_optim.step()
+        return policy_loss.item()
+
+    def sync_target_networks(self, tau=None):
+        tau = tau or self._tau_target
+        for target_param, param in zip(self.target_critic_net1.parameters(), self.critic_net1.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+        for target_param, param in zip(self.target_critic_net2.parameters(), self.critic_net2.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
