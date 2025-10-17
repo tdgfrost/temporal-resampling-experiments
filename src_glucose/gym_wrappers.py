@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 SAMPLE_TIME = 10.0  # minutes
-AGGREGATE_WINDOW_SIZE = 3  # 3 * 10 minutes = 30 minutes
+AGGREGATE_WINDOW_SIZE = 6  # 6 * 10 minutes = 60 minutes
 TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 10 minutes)
 
 # Scaling parameters
@@ -87,6 +87,11 @@ class T1DPatientEnv(Wrapper):
     def step(self, action):
         return self.env.step(action)
 
+    def get_time(self):
+        time = self.unwrapped.env.env.time
+        hour_float = (time.day - 1) * 24 + time.hour + time.minute / 60.0
+        return hour_float
+
 
 class FixedScaler(ObservationWrapper):
 
@@ -113,17 +118,17 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     def __init__(self, env: gym.Env, forced_interval: int = 0) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
-        self.last_action = None
+        self.last_action = 0
         self.steps_until_action_available = 0
         self.next_waiting_period = 0
+        self.hour_float = None
         assert 0 <= forced_interval <= 1, "Forced interval must be 0 or 1"
         self.forced_interval = forced_interval
 
     def reset(self, *args, **kwargs) -> np.ndarray:
-        self.last_action = None
-        self.steps_until_action_available = 0
-        self.next_waiting_period = 0
+        self.last_action = 0
         obs, info = self.env.reset(*args, **kwargs)
+        self._apply_rules(obs)
         return obs, info
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -131,7 +136,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             # Do the action
             obs, reward, term, trunc, info = self.env.step(action)
             # flip the steps, calculate steps remaining
-            self._flip_step_modes(action)
+            self._flip_step_modes(action, obs)
         else:
             # Repeat the last action
             obs, reward, term, trunc, info = self.env.step(self.last_action)
@@ -141,12 +146,39 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
         return obs, reward, term, trunc, info
 
-    def _flip_step_modes(self, action: Any):
-        self.steps_until_action_available = self.next_waiting_period
-        # self.next_waiting_period = np.random.randint(TOTAL_SIZE)  # 1 to TOTAL_SIZE steps
-        # Sample from lognormal distribution mostly centered on 1 but extending up to TOTAL_SIZE.
-        self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.0, 1.0)), 1, TOTAL_SIZE)) - 1
+    def _flip_step_modes(self, action: Any, obs):
+        self._apply_rules(obs)
         self.last_action = action
+
+    def _apply_rules(self, obs):
+        """
+        Let's establish rules:
+        - if blood glucose goes <70, wake up and do something about it - check every 10 minutes
+        - if blood glucose goes >300, wake up and do something about it - check every 10 minutes
+        Otherwise:
+        - 2200 - 0600 - repeat last action throughout
+        - 0600 - 2200 - Lognormal sampling
+        """
+        current_bg = self._get_current_bg(obs)
+        if current_bg < 70 or current_bg > 300:
+            self.steps_until_action_available = 0
+            self.next_waiting_period = 0
+            return
+
+        self.steps_until_action_available = self.next_waiting_period
+        hour_float = self.env.get_wrapper_attr('get_time')()
+
+        # Deep night
+        if hour_float % 24 < 6 or hour_float % 24 >= 22:
+            hours_until_6am = (6 - hour_float) % 24
+            steps_until_6am = int(hours_until_6am * 60 // SAMPLE_TIME)
+            self.steps_until_action_available = steps_until_6am
+        else:
+            self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.5, 0.5)), 1, TOTAL_SIZE)) - 1
+
+    @staticmethod
+    def _get_current_bg(obs):
+        return obs[0] * 590 + 10
 
 
 class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
@@ -161,9 +193,9 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
 
         assert isinstance(env.observation_space, spaces.Box)
         low, high = env.observation_space.low, env.observation_space.high
-        self.state_dim = (low.shape[0] + 2,)
+        self.state_dim = (low.shape[0] + 3,)
         self.dtype = low.dtype
-        low, high = np.concatenate([[0, 0], low]), np.concatenate([[1, 2], high])
+        low, high = np.concatenate([[0, 0, 0], low]), np.concatenate([[48, 1, 2], high])
         self.observation_space = spaces.Box(
             low=low, high=high, shape=self.state_dim, dtype=self.dtype
         )
@@ -172,14 +204,14 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     def observation(self, obs):
         # Concat flag (0/1) to the start of the channels
         # - always set to 0 if use_flag = False
-        steps_left = self.env.get_wrapper_attr("steps_until_action_available") if self.use_flag else 0
-        waiting_period = self.env.get_wrapper_attr("next_waiting_period") if self.use_flag else 0
-        return np.concatenate([[steps_left, waiting_period], obs], axis=-1)
+        steps_left = self.env.get_wrapper_attr("steps_until_action_available") / TOTAL_SIZE if self.use_flag else 0
+        waiting_period = self.env.get_wrapper_attr("next_waiting_period") / TOTAL_SIZE if self.use_flag and steps_left == 0 else 0
+        hour_float = self.env.get_wrapper_attr('get_time')() / 48
+        return np.concatenate([[hour_float, steps_left, waiting_period], obs], axis=-1)
 
 
 def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
-                     forced_interval: int = 0,
-                     use_flag: bool = True, use_scaling: bool = False, **kwargs):
+                     forced_interval: int = 0, use_flag: bool = True, use_scaling: bool = False, **kwargs):
     env = T1DPatientEnv(use_test_ids, **kwargs)
     env = SampleTimeWrapper(env)
     if use_scaling:
