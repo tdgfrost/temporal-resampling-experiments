@@ -51,29 +51,64 @@ class CallableRecurrentPPO(RecurrentPPO):
 
 
 class MiniGridEncoder(nn.Module):
-    def __init__(self, observation_shape, feature_size: int = 128, dropout_p: float = 0.0):
+    """
+    A feature extractor that uses self-attention on the input features.
+
+    This network treats the input features as a sequence and uses a
+    Multi-Head Attention block to learn the relationships between them.
+
+    :param observation_shape: The shape of the input observation.
+    :param feature_size: The final output dimension of the extractor.
+    :param embed_dim: The dimension to embed each input feature into.
+    :param num_heads: The number of attention heads. Must be a divisor of embed_dim.
+    """
+
+    def __init__(
+            self,
+            observation_shape,
+            feature_size: int = 128,
+            embed_dim: int = 64,
+            num_heads: int = 4,
+    ):
         super().__init__()
 
+        # Ensure that embed_dim is divisible by num_heads
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+
+        num_inputs = observation_shape[0]  # Should be 6
+
+        # 1. Input Embedding Layer
+        # This layer projects each of the 6 input features into a richer,
+        # higher-dimensional space (the embed_dim).
+        self.embed_layer = nn.Linear(num_inputs, embed_dim)
+
+        # We will treat the 6 embedded features as a sequence of length 6
+
+        # 2. Multi-Head Self-Attention Layer
+        # This layer allows the 6 embedded features to interact and weigh their
+        # importance relative to each other.
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+        # 3. Final Feed-Forward Network (MLP)
+        # This processes the context-aware output from the attention layer
+        # to produce the final feature vector.
         self.fc = nn.Sequential(
-            # Scale inputs
-            nn.Linear(observation_shape[0], feature_size),
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, feature_size),
             nn.LayerNorm(feature_size),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_p)
+            nn.LeakyReLU(),
         )
 
+        # Use your original weight initialization method
         self.init_weights()
 
     def init_weights(self):
-        """
-        Initialize weights for Conv2d/Linear with Kaiming normal,
-        biases with zeros, Norm layers with weight=1, bias=0.
-        The final Linear layer in the decoder is zero-initialized.
-        """
+        """Initializes weights for the network."""
 
         def _init_fn(m: nn.Module):
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
@@ -82,12 +117,33 @@ class MiniGridEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # apply to all submodules
         self.apply(_init_fn)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shrink_x = self.shrink_obs(x)
-        return self.fc(shrink_x)
+        # Assuming x has shape (batch_size, 6)
+
+        # 1. Embed the input
+        # Input: (batch, 6) -> Output: (batch, embed_dim)
+        embedded = self.embed_layer(x)
+
+        # 2. Prepare for attention by creating a "sequence" of length 1
+        # The attention layer expects a sequence. We can treat our single
+        # embedded vector as a sequence with one item.
+        # Shape: (batch, 1, embed_dim)
+        seq = embedded.unsqueeze(1)
+
+        # 3. Apply self-attention
+        # Query, Key, and Value are all the same for self-attention.
+        # attn_output shape: (batch, 1, embed_dim)
+        attn_output, _ = self.attention(query=seq, key=seq, value=seq)
+
+        # 4. Remove the sequence dimension
+        # Shape: (batch, embed_dim)
+        processed_features = attn_output.squeeze(1)
+
+        # 5. Pass through the final MLP
+        # Shape: (batch, feature_size)
+        return self.fc(processed_features)
 
 
 class PPOMiniGridEncoder(MiniGridEncoder):
@@ -151,7 +207,6 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
         mean, log_std = torch.chunk(params, 2, dim=-1)
         log_std = torch.clamp(log_std, -20.0, 2.0)
         self.mean_actions = mean
-        self.log_std = log_std
         std = log_std.exp()
         self.distribution = Normal(mean, std)  # pre-tanh
         return self
@@ -168,7 +223,7 @@ class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
 
     def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
         # map actions back to [-1,1]
-        u = (actions - self.bias) / (self.scale + 1e-6)
+        u = (actions - self.bias) / (self.scale + self.epsilon)
         u = torch.clamp(u, -1 + self.epsilon, 1 - self.epsilon)
 
         if gaussian_actions is None:
@@ -203,7 +258,7 @@ class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
         self._build(FloatSchedule(ConstantSchedule(val=0.001)))
 
         # self.action_dist = BetaScaledDistribution()
-        nn.init.constant_(self.action_net.bias[0], 0)  # Mean to a low value
+        nn.init.constant_(self.action_net.bias[0], -1)  # Mean to a low value
         nn.init.constant_(self.action_net.bias[1], -1)  # Small initial stddev
 
 
