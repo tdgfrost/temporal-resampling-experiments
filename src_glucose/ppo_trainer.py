@@ -9,6 +9,37 @@ from gymnasium.vector import SyncVectorEnv
 from torch.distributions import Normal
 from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, sum_independent_dims
 from functools import partial
+import random
+
+
+def set_seed(seed: int):
+    """
+    Sets the random seed for reproducibility across torch, numpy, and random.
+    """
+    # Set seed for Python's built-in random module
+    random.seed(seed)
+
+    # Set seed for NumPy
+    np.random.seed(seed)
+
+    # Set seed for PyTorch
+    torch.manual_seed(seed)
+
+    # Set seed for PyTorch on CUDA (if available)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # for multi-GPU
+
+    # Set deterministic algorithms for PyTorch (can impact performance)
+    # This is crucial for full reproducibility with CUDA
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # You might also want to set this for newer PyTorch versions
+    # torch.use_deterministic_algorithms(True)
+
+    # Set environment variable for CUDA (if needed)
+    # os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
 class CustomSquashedNormal(SquashedDiagGaussianDistribution):
@@ -110,8 +141,8 @@ class ActorCriticLSTM(nn.Module):
 
 class RecurrentPPO:
     def __init__(self, env, env_name=None, hidden_dim=128, learning_rate=3e-4, gamma=0.99, gae_lambda=0.95,
-                 entropy_coef=0.01, vf_coef=0.5, clip_range=0.2,
-                 batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000,
+                 entropy_coef=0.01, vf_coef=0.5, clip_range=0.2, seed=None,
+                 batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000, eval_episodes=500,
                  log_dir="../logs_glucose/ppo_logs", env_creator_fn=None):
         assert isinstance(env.action_space, gym.spaces.Box), "Continuous action spaces only."
 
@@ -121,6 +152,10 @@ class RecurrentPPO:
         self.input_dim = env.observation_space.shape[-1]
         self.action_dim = env.action_space.shape[0]
         self.hidden_dim = hidden_dim
+
+        self.seed = seed
+        if seed is not None:
+            self.set_random_seed(seed)
 
         self.action_scale = torch.FloatTensor((env.action_space.high - env.action_space.low) / 2.)
         self.action_bias = torch.FloatTensor((env.action_space.high + env.action_space.low) / 2.)
@@ -135,6 +170,7 @@ class RecurrentPPO:
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.eval_freq = eval_freq
+        self.eval_episodes = eval_episodes
         self.log_dir = log_dir
         self.last_obs = None
         self.last_hidden_state = None
@@ -148,6 +184,11 @@ class RecurrentPPO:
 
         self.ac_network = ActorCriticLSTM(self.input_dim, self.hidden_dim, self.action_dim, env.action_space)
         self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
+
+    def set_random_seed(self, seed):
+        """Sets the random seed for reproducibility."""
+        self.seed = seed
+        set_seed(seed)
 
     def save_checkpoint(self, path):
         """Saves the model and optimizer state."""
@@ -220,11 +261,19 @@ class RecurrentPPO:
         returns = advantages + values
         return advantages, returns
 
-    def _evaluate_policy(self, n_eval_envs=4, n_eval_episodes=10):
+    def _evaluate_policy(self, n_eval_envs=4, n_eval_episodes=None):
+        n_eval_episodes = n_eval_episodes or self.eval_episodes
         eval_env = SyncVectorEnv([lambda: self.env_creator_fn() for _ in range(n_eval_envs)])
         all_episode_rewards = []
         episode_rewards = np.zeros(n_eval_envs)
-        obs, _ = eval_env.reset()
+
+        # Seed each parallel environment with a unique, deterministic seed
+        if self.seed is not None:
+            eval_seeds = [self.seed + i for i in range(n_eval_envs)]
+            obs, _ = eval_env.reset(seed=eval_seeds)
+        else:
+            obs, _ = eval_env.reset()
+
         hidden_state = self.ac_network.init_hidden_state(batch_size=n_eval_envs)
 
         while len(all_episode_rewards) < n_eval_episodes:
@@ -244,7 +293,11 @@ class RecurrentPPO:
         return np.mean(all_episode_rewards[:n_eval_episodes])
 
     def fit(self, total_timesteps):
-        obs, _ = self.env.reset()
+        if self.seed is not None:
+            obs, _ = self.env.reset(seed=self.seed)
+        else:
+            obs, _ = self.env.reset()
+
         hidden_state = self.ac_network.init_hidden_state()
 
         start_timesteps = self._num_timesteps
@@ -477,4 +530,3 @@ if __name__ == '__main__':
 
         print(f"Total reward during test: {total_reward}")
         test_env.close()
-

@@ -76,8 +76,10 @@ if __name__ == "__main__":
                              gae_lambda=0.95,
                              n_epochs=10,  # Fewer epochs
                              hidden_dim=128,
+                             seed=123,
                              learning_rate=1e-3,  # Standard learning rate
-                             eval_freq=100_000)
+                             eval_freq=100_000,
+                             eval_episodes=500,)
         agent.fit(total_timesteps=10_000_000)
 
     if train_iql:
