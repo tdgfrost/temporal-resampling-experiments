@@ -113,7 +113,7 @@ class ActorCriticLSTM(nn.Module):
         self.log_std_min = -5
         self.log_std_max = 2
 
-    def forward(self, x, hidden_state, deterministic=False):
+    def forward(self, x, hidden_state=None, deterministic=False):
         is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
         lstm_out, new_hidden = self.lstm(x, hidden_state)
 
@@ -185,6 +185,10 @@ class RecurrentPPO:
         self.ac_network = ActorCriticLSTM(self.input_dim, self.hidden_dim, self.action_dim, env.action_space)
         self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
 
+    def __call__(self, obs, deterministic=True, *args, **kwargs):
+        action, lstm_states = self.predict(obs, deterministic=deterministic, *args, **kwargs)
+        return action, lstm_states
+
     def set_random_seed(self, seed):
         """Sets the random seed for reproducibility."""
         self.seed = seed
@@ -201,21 +205,28 @@ class RecurrentPPO:
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, path):
+    @classmethod
+    def load_checkpoint(cls, path, env, *args, **kwargs):
         """Loads the model and optimizer state."""
         if not os.path.exists(path):
             print(f"No checkpoint found at {path}. Starting from scratch.")
             return
 
-        checkpoint = torch.load(path)
-        self.ac_network.load_state_dict(checkpoint['ac_network_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self._num_timesteps = checkpoint.get('num_timesteps', 0)
-        self.best_mean_reward = checkpoint.get('best_mean_reward', -np.inf)
-        print(
-            f"Checkpoint loaded from {path}. Resuming at timestep {self._num_timesteps} with best reward {self.best_mean_reward:.2f}.")
+        # Get the class instance
+        new_agent = cls(env, *args, **kwargs)
 
-    def predict(self, obs, hidden_state, deterministic=True):
+        # Update the state
+        checkpoint = torch.load(path, weights_only=False)
+        new_agent.ac_network.load_state_dict(checkpoint['ac_network_state_dict'])
+        new_agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        new_agent._num_timesteps = checkpoint.get('num_timesteps', 0)
+        new_agent.best_mean_reward = checkpoint.get('best_mean_reward', -np.inf)
+        print(
+            f"Checkpoint loaded from {path}. Resuming at timestep {new_agent._num_timesteps} with best reward {new_agent.best_mean_reward:.2f}.")
+
+        return new_agent
+
+    def predict(self, obs, hidden_state=None, deterministic=True):
         """
         Get the model's action for a given observation.
 
@@ -431,7 +442,8 @@ class RecurrentPPO:
                 if avg_eval_reward > self.best_mean_reward:
                     self.best_mean_reward = avg_eval_reward
                     if self.log_dir:
-                        save_path = os.path.join(self.log_dir, f"best_model{model_save_num:02d}_{avg_eval_reward:.2f}.pth")
+                        save_path = os.path.join(self.log_dir,
+                                                 f"best_model{model_save_num:02d}_{avg_eval_reward:.2f}.pth")
                         self.save_checkpoint(save_path)
                         print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} ***\n")
 

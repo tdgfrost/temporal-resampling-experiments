@@ -63,7 +63,7 @@ if __name__ == "__main__":
     if train_ppo:
         GAMMA = 0.9
 
-        base_env = make_glucose_env(use_test_ids=False)
+        base_env = make_glucose_env()
         env = EnforcePPOWrapper(base_env, gamma=GAMMA)
         env_creator_fn = partial(make_glucose_env, use_test_ids=True)
 
@@ -95,7 +95,7 @@ if __name__ == "__main__":
         dataset_size = 100_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
-            model = RecurrentPPO.load_checkpoint(ppo_agent)
+            model = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
             model_loaded = True
             replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')

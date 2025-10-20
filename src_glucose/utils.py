@@ -150,16 +150,14 @@ class ReplayBufferEnv:
 
             obs, info, ep_buffer = self.reset(seed=seed)
             model.set_random_seed(seed)
-            lstm_states = None
             total_rewards = []
 
             while frame_count < n_frames:
                 done = False
-                episode_starts = np.ones((1,), dtype=bool)
+                lstm_states = None
                 total_reward = 0
                 while not done:
-                    action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts,
-                                                        deterministic=True)
+                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=True)
                     # If desired, could add randomness here, either by setting deterministic=False,
                     # or by selecting random actions:
                     # if with_random and np.random.random() < rand_p:
@@ -167,9 +165,8 @@ class ReplayBufferEnv:
                     #       action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
                     obs, reward, term, trunc, info = self.env.step(action)
                     # Get the real action delivered
-                    real_action = obs[3] * INSULIN_SCALE
+                    real_action = obs[-2] * INSULIN_SCALE
                     done = term or trunc
-                    episode_starts[0] = done
                     total_reward += reward
 
                     self.update_episode_buffer(obs, real_action, reward, done, info, ep_buffer)
@@ -231,7 +228,7 @@ class ReplayBufferEnv:
         ep_buffer['all_action'] += [action]
         ep_buffer['all_reward'] += [reward]
         ep_buffer['all_done'] += [done]
-        ep_buffer['visible_state'] += [obs[0] == 0]
+        ep_buffer['visible_state'] += [obs[1] == 0]
 
     def update_permanent_buffer(self, ep_buffer: dict):
         visible_idxs = ep_buffer['visible_state']
@@ -241,9 +238,9 @@ class ReplayBufferEnv:
             ]:
                 # if i == 1 and key == 'obs':
                 if key == 'obs':
-                    ep_buffer[f'all_{key}'] = np.stack(ep_buffer[f'all_{key}'])
-                    ep_buffer[f'all_{key}'][:, :2] = 0  # Set the flags to 0 for the non-decoy buffer
-                    ep_buffer[f'all_{key}'] = ep_buffer[f'all_{key}'].tolist()
+                    ep_buffer['all_obs'] = np.stack(ep_buffer['all_obs'])
+                    ep_buffer['all_obs'][:, 1:3] = 0  # Set the flags to 0 for the non-decoy buffer
+                    ep_buffer['all_obs'] = ep_buffer['all_obs'].tolist()
                 arr[i] += ep_buffer[f'all_{key}']
 
             self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
@@ -280,7 +277,7 @@ class ReplayBufferEnv:
 
         # Manually calculate reward
         bg_levels = np.array([
-            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[2]
+            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[-3]
             for idx in range(agg_window, len(ep_buffer['all_obs']), agg_window)
         ]) * (600 - 10) + 10  # Scale back to real bg levels
 
