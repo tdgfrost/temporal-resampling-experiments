@@ -24,9 +24,9 @@ parser.add_argument('--record_video', default=False, type=parse_bool,
                     help='Whether to record video of performance rendering')
 
 parser.add_argument('--alpha', default=1.0, type=float, help='Alpha parameter for CQL (1.0 is default)')
-parser.add_argument('--expectile', default=0.7, type=float, help='Expectile value for IQL training (0.5 is BC)')
+parser.add_argument('--expectile', default=0.8, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
-parser.add_argument('--beta', default=2.0, type=float, help='Beta parameter for IQL agent')
+parser.add_argument('--beta', default=10.0, type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
@@ -103,8 +103,11 @@ if __name__ == "__main__":
 
     train_ppo = args.train_ppo
     train_offline = args.train_offline
-    offline_model = CustomIQL if args.offline_model == 'iql' else (
-        CustomCQLSAC if args.offline_model == 'cql' else None)
+    is_iql = args.offline_model == 'iql'
+    is_cql = args.offline_model == 'cql'
+    assert not train_offline or is_iql or is_cql, (
+        "Please choose a valid offline model: 'iql' or 'cql'.")
+    offline_model = CustomIQL if is_iql else (CustomCQLSAC if is_cql else None)
     render_performance = args.render_performance
     record_video = args.record_video
 
@@ -118,6 +121,7 @@ if __name__ == "__main__":
 
     assert not (train_ppo and train_offline), "Please choose to train either PPO or IQL, not both."
 
+    ALPHA = args.alpha
     EXPECTILE = args.expectile
     DECOY_INTERVAL = args.decoy_interval
 
@@ -147,8 +151,12 @@ if __name__ == "__main__":
         model_loaded = True
 
     if train_offline:
-        print(
-            f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
+        if is_iql:
+            print(
+                f"DECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {args.beta}")
+        elif is_cql:
+            print(
+                f"DECOY_INTERVAL: {DECOY_INTERVAL}, ALPHA: {ALPHA}")
 
         logs = defaultdict(list)
 
@@ -189,9 +197,12 @@ if __name__ == "__main__":
                                                    n_trials=500)
 
         for n_trial in range(10):
-            logs['expectile'].append(EXPECTILE)
             logs['decoy_interval'].append(DECOY_INTERVAL)
             logs['dataset_reward'].append(dataset_rewards.mean())
+            if is_iql:
+                logs['expectile'].append(EXPECTILE)
+            elif is_cql:
+                logs['cql_alpha'].append(ALPHA)
 
             # Alternately collect and training
             algo = offline_model(observation_shape=base_env.observation_space.shape,
@@ -203,6 +214,9 @@ if __name__ == "__main__":
                                  dropout_p=args.dropout_p,
                                  beta=args.beta,
                                  cql_alpha=args.alpha,
+                                 critic_lr=1e-3,
+                                 value_lr=1e-3,
+                                 actor_lr=1e-3,
                                  device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
@@ -219,8 +233,12 @@ if __name__ == "__main__":
 
         # Save logs
         os.makedirs('../logs/iql_minigrid_logs', exist_ok=True)
-        pl.DataFrame(logs).write_csv(f'../logs/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}'
-                                     f'_dropout={args.dropout_p}_beta={args.beta}.csv')
+        if is_iql:
+            csv_path = (f'../logs/iql_minigrid_logs/decoy={DECOY_INTERVAL}_expectile={EXPECTILE}'
+                        f'_beta={args.beta}.csv')
+        elif is_cql:
+            csv_path = f'../logs/iql_minigrid_logs/decoy={DECOY_INTERVAL}_alpha={ALPHA}.csv'
+        pl.DataFrame(logs).write_csv(csv_path)
 
     if render_performance:
         eval_env = gym.make(video_env_name if record_video else env_name,
