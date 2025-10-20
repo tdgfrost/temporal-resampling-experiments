@@ -4,50 +4,12 @@ import numpy as np
 
 import gymnasium as gym
 from gymnasium import spaces
-from stable_baselines3 import PPO
-from sb3_contrib import RecurrentPPO
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.distributions import TanhBijector
-from torch.distributions import Categorical, Beta, constraints, TransformedDistribution, AffineTransform, Normal
-from stable_baselines3.common.distributions import Distribution, sum_independent_dims
-from stable_baselines3.common.utils import FloatSchedule, ConstantSchedule
 from tqdm import tqdm
 from collections import deque
-from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
-from stable_baselines3.common.distributions import DiagGaussianDistribution, SquashedDiagGaussianDistribution
-from typing import TypeVar
-
-SelfSquashedDiagGaussianDistribution = TypeVar("SelfSquashedDiagGaussianDistribution",
-                                               bound="SquashedDiagGaussianDistribution")
-
-
-class CallablePPO(PPO):
-    """
-    A version of PPO that can be called like a function to get actions.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def __call__(self, obs):
-        action, _ = self.predict(obs, deterministic=True)
-        return action
-
-
-class CallableRecurrentPPO(RecurrentPPO):
-    """
-    A version of PPO that can be called like a function to get actions.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def __call__(self, obs, *args, **kwargs):
-        action, lstm_states = self.predict(obs, deterministic=True, *args, **kwargs)
-        return action, lstm_states
 
 
 class MiniGridEncoder(nn.Module):
@@ -172,94 +134,6 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.net(observations)
-
-
-class CustomSquashedDiagGaussianDistribution(DiagGaussianDistribution):
-    """
-    Gaussian distribution with diagonal covariance matrix, followed by a squashing function (tanh) to ensure bounds.
-
-    :param action_dim: Dimension of the action space.
-    :param epsilon: small value to avoid NaN due to numerical imprecision.
-    """
-
-    def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
-        super().__init__(action_dim)
-        self.scale = float(high - low) / 2.0
-        self.bias = float(high + low) / 2.0
-        self.param_head = None
-        self.dummy_log_std = None
-        self.gaussian_actions = None
-        self.epsilon = 1e-6
-
-    def proba_distribution_net(self, latent_dim: int, log_std_init: float = 0.0):
-        # one linear head -> 2*action_dim
-        self.param_head = nn.Linear(latent_dim, 2 * self.action_dim)
-        # init: small std
-        with torch.no_grad():
-            nn.init.zeros_(self.param_head.weight)
-            self.param_head.bias[: self.action_dim].zero_()  # mean ~ 0 pre-tanh
-            self.param_head.bias[self.action_dim:].fill_(log_std_init)  # log_std init
-        # return dummy nn.Parameter to satisfy SB3 signature
-        self.dummy_log_std = nn.Parameter(torch.zeros(self.action_dim), requires_grad=False)
-        return self.param_head, self.dummy_log_std
-
-    def proba_distribution(self, params: torch.Tensor, _dummy: torch.Tensor):
-        mean, log_std = torch.chunk(params, 2, dim=-1)
-        log_std = torch.clamp(log_std, -20.0, 2.0)
-        self.mean_actions = mean
-        std = log_std.exp()
-        self.distribution = Normal(mean, std)  # pre-tanh
-        return self
-
-    def sample(self) -> torch.Tensor:
-        self.gaussian_actions = self.distribution.rsample()  # pre-tanh
-        u = torch.tanh(self.gaussian_actions)  # in [-1,1]
-        return self.scale * u + self.bias
-
-    def mode(self) -> torch.Tensor:
-        self.gaussian_actions = self.distribution.mean
-        u = torch.tanh(self.gaussian_actions)
-        return self.scale * u + self.bias
-
-    def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
-        # map actions back to [-1,1]
-        u = (actions - self.bias) / (self.scale + self.epsilon)
-        u = torch.clamp(u, -1 + self.epsilon, 1 - self.epsilon)
-
-        if gaussian_actions is None:
-            gaussian_actions = TanhBijector.inverse(u)
-
-        # base Normal log-prob in pre-tanh space
-        log_prob = self.distribution.log_prob(gaussian_actions)
-        log_prob = sum_independent_dims(log_prob)
-
-        # tanh Jacobian
-        log_prob -= torch.sum(torch.log(torch.clamp(1 - u ** 2, self.epsilon, 1 - self.epsilon)), dim=1)
-
-        # affine scaling Jacobian
-        if self.scale != 1.0:
-            log_prob -= u.shape[-1] * torch.log(
-                torch.clamp(torch.tensor(self.scale, device=u.device, dtype=u.dtype), self.epsilon, 1 - self.epsilon)
-            )
-        return log_prob
-
-
-class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
-    """
-    A custom recurrent policy that applies a transformation to the action logits.
-    Transformation: (tanh(logits) + 1) * 15
-    This maps the output of the action network to the range [0, 30].
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self.action_dist = CustomSquashedDiagGaussianDistribution(action_dim=1)
-        self._build(FloatSchedule(ConstantSchedule(val=0.001)))
-
-        # self.action_dist = BetaScaledDistribution()
-        nn.init.constant_(self.action_net.bias[0], -1)  # Mean to a low value
-        nn.init.constant_(self.action_net.bias[1], -1)  # Small initial stddev
 
 
 class ScaleAction(nn.Module):

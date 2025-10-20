@@ -210,6 +210,46 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         return np.concatenate([[hour_float, steps_left, waiting_period], obs], axis=-1)
 
 
+class EnforcePPOWrapper(Wrapper):
+    """
+    A wrapper that may perform additional
+    'bonus' steps using the same action.
+    """
+
+    def __init__(self, env: gym.Env, gamma: float = 0.99) -> None:
+        Wrapper.__init__(self, env)
+        self._gamma = gamma
+        self.observation_space = gym.spaces.Box(
+            low=env.observation_space.low[np.newaxis],
+            high=env.observation_space.high[np.newaxis],
+            shape=(1,) + env.observation_space.shape,
+            dtype=env.observation_space.dtype
+        )
+
+    def reset(self, *args, **kwargs) -> np.ndarray:
+        obs, info = self.env.reset(*args, **kwargs)
+        info['steps_taken'] = 1
+        return np.expand_dims(obs, 0), info
+
+    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        obs, reward, term, trunc, info = self.env.step(action)
+        obs_lst = [obs]
+        done = term or trunc
+        steps_taken = 1
+        while self.env.get_wrapper_attr("steps_until_action_available") != 0 and not done:
+            obs, reward_step, term, trunc, info = self.env.step(action)
+            obs_lst.append(obs)
+            reward += reward_step * self._gamma ** steps_taken
+            done = term or trunc
+            steps_taken += 1
+
+        info['steps_taken'] = steps_taken
+
+        obs = np.stack(obs_lst, axis=0)
+
+        return obs, reward, term, trunc, info
+
+
 def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
                      forced_interval: int = 0, use_flag: bool = True, use_scaling: bool = False, **kwargs):
     env = T1DPatientEnv(use_test_ids, **kwargs)

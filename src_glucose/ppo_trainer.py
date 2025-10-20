@@ -1,0 +1,480 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import gymnasium as gym
+import numpy as np
+import os
+from gymnasium.vector import SyncVectorEnv
+from torch.distributions import Normal
+from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, sum_independent_dims
+from functools import partial
+
+
+class CustomSquashedNormal(SquashedDiagGaussianDistribution):
+    def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
+        super().__init__(action_dim)
+        self.scale = float(high - low) / 2.0
+        self.bias = float(high + low) / 2.0
+        self.gaussian_actions = None
+        self.epsilon = 1e-6
+        self.log_scale = torch.log(torch.tensor(self.scale + self.epsilon))
+
+    def proba_distribution(self, params: torch.Tensor, _=None):
+        mean, log_std = torch.chunk(params, 2, dim=-1)
+        log_std = torch.clamp(log_std, -20.0, 2.0)
+        self.mean_actions = mean
+        std = log_std.exp()
+        self.distribution = Normal(mean, std)  # pre-tanh
+        return self
+
+    def entropy(self) -> torch.Tensor:
+        actions = self.sample()
+        log_prob = self.log_prob(actions, gaussian_actions=self.gaussian_actions)
+        return -log_prob
+
+    def sample(self) -> torch.Tensor:
+        self.gaussian_actions = self.distribution.rsample()  # pre-tanh
+        u = torch.tanh(self.gaussian_actions)  # in [-1,1]
+        return self.scale * u + self.bias
+
+    def mode(self) -> torch.Tensor:
+        self.gaussian_actions = self.distribution.mean
+        u = torch.tanh(self.gaussian_actions)
+        return self.scale * u + self.bias
+
+    def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
+        # map actions back to [-1,1]
+        u = (actions - self.bias) / (self.scale + self.epsilon)
+        u = torch.clamp(u, -1 + self.epsilon, 1 - self.epsilon)
+
+        # base Normal log-prob in pre-tanh space
+        if gaussian_actions is None:
+            # If not provided (i.e., called from policy_loss),
+            # compute them from the actions using the inverse-tanh (atanh).
+            # atanh(x) = 0.5 * log((1+x)/(1-x))
+            gaussian_actions = 0.5 * torch.log((1 + u) / ((1 - u) + 1e-6))
+
+        log_prob = self.distribution.log_prob(gaussian_actions)
+        log_prob = sum_independent_dims(log_prob)
+
+        # tanh Jacobian
+        log_prob -= torch.sum(torch.log(torch.clamp(1 - u ** 2, self.epsilon, 1 - self.epsilon)), dim=1)
+
+        # affine scaling Jacobian
+        if self.scale != 1.0:
+            log_prob -= u.shape[-1] * self.log_scale
+        return log_prob
+
+
+class ActorCriticLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, action_dim, action_space):
+        super(ActorCriticLSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
+        self.critic_head = nn.Linear(hidden_dim, 1)
+
+        self.dist = CustomSquashedNormal(action_dim * 2, low=action_space.low.item(), high=action_space.high.item())
+
+        self.log_std_min = -5
+        self.log_std_max = 2
+
+    def forward(self, x, hidden_state, deterministic=False):
+        is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
+        lstm_out, new_hidden = self.lstm(x, hidden_state)
+
+        if is_packed:
+            lstm_out, lengths = torch.nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+            batch_size = lstm_out.size(0)
+            last_step_indices = lengths.long() - 1
+            last_outputs = lstm_out[torch.arange(batch_size), last_step_indices, :]
+        else:
+            last_outputs = lstm_out[:, -1, :]
+
+        value = self.critic_head(last_outputs)
+        actor_out = self.actor_head(last_outputs)
+
+        dist = self.dist.proba_distribution(actor_out)
+
+        if deterministic:
+            action = dist.mode()
+            return action, value, new_hidden
+        return dist, value, new_hidden
+
+    def init_hidden_state(self, batch_size=1):
+        return (torch.zeros(1, batch_size, self.hidden_dim), torch.zeros(1, batch_size, self.hidden_dim))
+
+
+class RecurrentPPO:
+    def __init__(self, env, env_name=None, hidden_dim=128, learning_rate=3e-4, gamma=0.99, gae_lambda=0.95,
+                 entropy_coef=0.01, vf_coef=0.5, clip_range=0.2,
+                 batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000,
+                 log_dir="../logs_glucose/ppo_logs", env_creator_fn=None):
+        assert isinstance(env.action_space, gym.spaces.Box), "Continuous action spaces only."
+
+        self.env = env
+        self.env_name = env_name
+        self.env_creator_fn = env_creator_fn if env_creator_fn is not None else partial(gym.make, env_name)
+        self.input_dim = env.observation_space.shape[-1]
+        self.action_dim = env.action_space.shape[0]
+        self.hidden_dim = hidden_dim
+
+        self.action_scale = torch.FloatTensor((env.action_space.high - env.action_space.low) / 2.)
+        self.action_bias = torch.FloatTensor((env.action_space.high + env.action_space.low) / 2.)
+
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.entropy_coef = entropy_coef
+        self.vf_coef = vf_coef
+        self.clip_range = clip_range
+        self.n_steps = n_steps
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+        self.eval_freq = eval_freq
+        self.log_dir = log_dir
+        self.last_obs = None
+        self.last_hidden_state = None
+
+        self._num_timesteps = 0
+        self.best_mean_reward = -np.inf
+
+        # Create log directory if it doesn't exist
+        if self.log_dir:
+            os.makedirs(self.log_dir, exist_ok=True)
+
+        self.ac_network = ActorCriticLSTM(self.input_dim, self.hidden_dim, self.action_dim, env.action_space)
+        self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
+
+    def save_checkpoint(self, path):
+        """Saves the model and optimizer state."""
+        checkpoint = {
+            'ac_network_state_dict': self.ac_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'num_timesteps': self._num_timesteps,
+            'best_mean_reward': self.best_mean_reward,
+        }
+        torch.save(checkpoint, path)
+        print(f"Checkpoint saved to {path}")
+
+    def load_checkpoint(self, path):
+        """Loads the model and optimizer state."""
+        if not os.path.exists(path):
+            print(f"No checkpoint found at {path}. Starting from scratch.")
+            return
+
+        checkpoint = torch.load(path)
+        self.ac_network.load_state_dict(checkpoint['ac_network_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self._num_timesteps = checkpoint.get('num_timesteps', 0)
+        self.best_mean_reward = checkpoint.get('best_mean_reward', -np.inf)
+        print(
+            f"Checkpoint loaded from {path}. Resuming at timestep {self._num_timesteps} with best reward {self.best_mean_reward:.2f}.")
+
+    def predict(self, obs, hidden_state, deterministic=True):
+        """
+        Get the model's action for a given observation.
+
+        :param obs: The current observation (should be a sequence)
+        :param hidden_state: The last hidden state of the LSTM
+        :param deterministic: Whether to return a deterministic or stochastic action
+        :return: the model's action and the next hidden state
+        """
+        # obs is expected to be of shape (seq_len, features)
+        # Add a batch dimension -> (1, seq_len, features)
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+
+        with torch.no_grad():
+            if deterministic:
+                # Use the mode for deterministic prediction
+                action, _, new_hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=True)
+            else:
+                # Sample for stochastic action
+                dist, _, new_hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
+                action = dist.sample()
+
+        # The environment expects a flattened numpy array
+        action = action.cpu().numpy().flatten()
+        return action, new_hidden_state
+
+    def _compute_advantages_and_returns(self, rewards, values, dones, steps_taken):
+        n_steps = len(rewards)
+        advantages = np.zeros(n_steps, dtype=np.float32)
+        last_advantage = 0
+        with torch.no_grad():
+            last_obs_tensor = torch.FloatTensor(self.last_obs).unsqueeze(0)
+            _, last_value, _ = self.ac_network(last_obs_tensor, self.last_hidden_state)
+            last_value = last_value.item()
+
+        for t in reversed(range(n_steps)):
+            mask = 1.0 - dones[t]
+            effective_gamma = self.gamma ** steps_taken[t]
+            delta = rewards[t] + effective_gamma * last_value * mask - values[t]
+            last_advantage = delta + effective_gamma * self.gae_lambda * last_advantage * mask
+            advantages[t] = last_advantage
+            last_value = values[t]
+
+        returns = advantages + values
+        return advantages, returns
+
+    def _evaluate_policy(self, n_eval_envs=4, n_eval_episodes=10):
+        eval_env = SyncVectorEnv([lambda: self.env_creator_fn() for _ in range(n_eval_envs)])
+        all_episode_rewards = []
+        episode_rewards = np.zeros(n_eval_envs)
+        obs, _ = eval_env.reset()
+        hidden_state = self.ac_network.init_hidden_state(batch_size=n_eval_envs)
+
+        while len(all_episode_rewards) < n_eval_episodes:
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(1)
+            with torch.no_grad():
+                action_env, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=True)
+            obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
+            dones = term | trunc
+            episode_rewards += reward
+            for i, done in enumerate(dones):
+                if done:
+                    all_episode_rewards.append(episode_rewards[i])
+                    episode_rewards[i] = 0
+                    hidden_state[0][:, i, :] = 0
+                    hidden_state[1][:, i, :] = 0
+        eval_env.close()
+        return np.mean(all_episode_rewards[:n_eval_episodes])
+
+    def fit(self, total_timesteps):
+        obs, _ = self.env.reset()
+        hidden_state = self.ac_network.init_hidden_state()
+
+        start_timesteps = self._num_timesteps
+        target_timesteps = start_timesteps + total_timesteps
+
+        updates = 0
+        model_save_num = 1
+        next_eval = (start_timesteps // self.eval_freq + 1) * self.eval_freq
+
+        while self._num_timesteps < target_timesteps:
+            updates += 1
+            rollout_obs, rollout_rewards, rollout_dones = [], [], []
+            rollout_actions, rollout_log_probs, rollout_values = [], [], []
+            rollout_h_states, rollout_c_states = [], []
+            rollout_steps_taken = []
+
+            current_episode_reward = 0
+            current_episode_length = 0
+            ep_rewards_this_rollout = []
+            ep_lengths_this_rollout = []
+
+            for _ in range(self.n_steps):
+                obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+                h_x, c_x = hidden_state
+                rollout_h_states.append(h_x.detach().squeeze())
+                rollout_c_states.append(c_x.detach().squeeze())
+                with torch.no_grad():
+                    dist, value, hidden_state = self.ac_network(obs_tensor, hidden_state)
+                action_env = dist.sample()
+                log_prob = dist.log_prob(action_env, gaussian_actions=dist.gaussian_actions).sum(axis=-1)
+                new_obs, reward, term, trunc, info = self.env.step(action_env.numpy().flatten())
+                done = term or trunc
+                steps_taken = info.get('steps_taken', 1)
+                self._num_timesteps += steps_taken
+                current_episode_reward += reward
+                current_episode_length += steps_taken
+                rollout_obs.append(obs)
+                rollout_actions.append(action_env.numpy().flatten())
+                rollout_rewards.append(reward)
+                rollout_dones.append(done)
+                rollout_log_probs.append(log_prob.item())
+                rollout_values.append(value.item())
+                rollout_steps_taken.append(steps_taken)
+                obs = new_obs
+                if done:
+                    ep_rewards_this_rollout.append(current_episode_reward)
+                    ep_lengths_this_rollout.append(current_episode_length)
+                    current_episode_reward = 0
+                    current_episode_length = 0
+                    obs, _ = self.env.reset()
+                    hidden_state = self.ac_network.init_hidden_state()
+
+            self.last_obs = obs
+            self.last_hidden_state = hidden_state
+
+            advantages, returns = self._compute_advantages_and_returns(rollout_rewards, rollout_values, rollout_dones,
+                                                                       rollout_steps_taken)
+
+            # *** KEY CHANGE: NORMALIZE ADVANTAGES ***
+            advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
+
+            flat_advantages = torch.FloatTensor(advantages)
+            flat_returns = torch.FloatTensor(returns)
+            flat_actions = torch.FloatTensor(np.array(rollout_actions))
+            flat_log_probs = torch.FloatTensor(np.array(rollout_log_probs))
+            flat_h_states = torch.stack(rollout_h_states)
+            flat_c_states = torch.stack(rollout_c_states)
+            total_transitions = self.n_steps
+
+            policy_losses, value_losses, entropy_losses, approx_kls = [], [], [], []
+            for _ in range(self.n_epochs):
+                indices = np.arange(total_transitions)
+                np.random.shuffle(indices)
+                for start in range(0, total_transitions, self.batch_size):
+                    end = start + self.batch_size
+                    batch_indices = indices[start:end]
+                    batch_obs_seqs = [rollout_obs[i] for i in batch_indices]
+                    batch_actions = flat_actions[batch_indices]
+                    batch_log_probs = flat_log_probs[batch_indices]
+                    batch_advantages = flat_advantages[batch_indices]
+                    batch_returns = flat_returns[batch_indices]
+                    batch_h_state = flat_h_states[batch_indices].unsqueeze(0)
+                    batch_c_state = flat_c_states[batch_indices].unsqueeze(0)
+                    lengths = torch.LongTensor([len(o) for o in batch_obs_seqs])
+                    sorted_lengths, sorted_idx = lengths.sort(descending=True)
+                    padded_obs = torch.nn.utils.rnn.pad_sequence(
+                        [torch.FloatTensor(batch_obs_seqs[i]) for i in sorted_idx], batch_first=True)
+                    packed_obs = torch.nn.utils.rnn.pack_padded_sequence(padded_obs, sorted_lengths, batch_first=True,
+                                                                         enforce_sorted=True)
+                    sorted_actions = batch_actions[sorted_idx]
+                    sorted_log_probs = batch_log_probs[sorted_idx]
+                    sorted_advantages = batch_advantages[sorted_idx]
+                    sorted_returns = batch_returns[sorted_idx]
+                    sorted_h_state = batch_h_state[:, sorted_idx, :]
+                    sorted_c_state = batch_c_state[:, sorted_idx, :]
+                    new_dist, new_values, _ = self.ac_network(packed_obs, (sorted_h_state, sorted_c_state))
+                    new_values = new_values.squeeze()
+                    new_log_probs = new_dist.log_prob(sorted_actions)
+                    ratio = (new_log_probs - sorted_log_probs).exp()
+                    surr1 = ratio * sorted_advantages
+                    surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * sorted_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    value_loss = F.mse_loss(new_values, sorted_returns)
+                    entropy_loss = -new_dist.entropy().mean()
+                    loss = policy_loss + self.vf_coef * value_loss + self.entropy_coef * entropy_loss
+
+                    with torch.no_grad():
+                        log_ratio = new_log_probs - sorted_log_probs
+                        approx_kl = ((ratio - 1) - log_ratio).mean().item()
+
+                    policy_losses.append(policy_loss.item())
+                    value_losses.append(value_loss.item())
+                    entropy_losses.append(entropy_loss.item())
+                    approx_kls.append(approx_kl)
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 0.5)
+                    self.optimizer.step()
+
+            mean_reward = np.mean(ep_rewards_this_rollout) if ep_rewards_this_rollout else np.nan
+            mean_ep_length = np.mean(ep_lengths_this_rollout) if ep_lengths_this_rollout else np.nan
+            print(
+                f"Timestep: {self._num_timesteps}/{target_timesteps} | Mean Ep. Length {mean_ep_length:.2f} | Mean Reward: {mean_reward:.2f} | Entropy: {np.mean(entropy_losses):.3f} | Value Loss: {np.mean(value_losses):.3f} | Policy Loss: {np.mean(policy_losses):.3f} | Approx. KL {np.mean(approx_kls):.5f}")
+
+            if self._num_timesteps >= next_eval:
+                avg_eval_reward = self._evaluate_policy()
+                print(f"--- EVALUATION at Timestep: {self._num_timesteps}/{target_timesteps} ---")
+                print(f"Average deterministic reward: {avg_eval_reward:.2f} | Best reward: {self.best_mean_reward:.2f}")
+
+                if avg_eval_reward > self.best_mean_reward:
+                    self.best_mean_reward = avg_eval_reward
+                    if self.log_dir:
+                        save_path = os.path.join(self.log_dir, f"best_model{model_save_num:02d}_{avg_eval_reward:.2f}.pth")
+                        self.save_checkpoint(save_path)
+                        print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} ***\n")
+
+                next_eval += self.eval_freq
+
+        self.env.close()
+
+
+class ContinuousSemiMDPWrapper(gym.Wrapper):
+    def __init__(self, env, gamma):
+        super().__init__(env)
+        self._gamma = gamma
+        self.observation_space = gym.spaces.Box(
+            low=env.observation_space.low[np.newaxis],
+            high=env.observation_space.high[np.newaxis],
+            shape=(1,) + env.observation_space.shape,
+            dtype=env.observation_space.dtype
+        )
+
+    def reset(self, *args, **kwargs):
+        obs, info = self.env.reset(*args, **kwargs)
+        return np.expand_dims(obs, 0), info
+
+    def step(self, action):
+        steps_to_take = np.random.randint(1, 4)
+        obs_lst, total_reward, actual_steps_taken = [], 0, 0
+        term, trunc = False, False
+        for i in range(steps_to_take):
+            obs, reward, term, trunc, info = self.env.step(action)
+            done = term or trunc
+            obs_lst.append(obs)
+            total_reward += (self._gamma ** i) * reward
+            actual_steps_taken += 1
+            if done:
+                break
+        info['steps_taken'] = actual_steps_taken
+        return np.stack(obs_lst), total_reward, term, trunc, info
+
+
+if __name__ == '__main__':
+    env_name = 'Pendulum-v1'
+    GAMMA = 0.9
+    LOG_DIR = "../logs_glucose/ppo_logs"
+
+    # --- Control training and loading ---
+    DO_TRAINING = True
+    LOAD_CHECKPOINT = False
+    CHECKPOINT_TO_LOAD = os.path.join(LOG_DIR, "best_model.pth")
+    DO_TESTING = True
+
+    if DO_TRAINING:
+        print("--- STARTING TRAINING ---")
+        base_env = gym.make(env_name, max_episode_steps=200)
+        env = ContinuousSemiMDPWrapper(base_env, gamma=GAMMA)
+
+        agent = RecurrentPPO(env, env_name=env_name, gamma=GAMMA,
+                             n_steps=2048,
+                             entropy_coef=0.01,
+                             clip_range=0.2,
+                             batch_size=64,
+                             gae_lambda=0.95,
+                             n_epochs=10,
+                             learning_rate=1e-3,
+                             eval_freq=100_000,
+                             log_dir=LOG_DIR)
+
+        if LOAD_CHECKPOINT:
+            agent.load_checkpoint(CHECKPOINT_TO_LOAD)
+
+        agent.fit(total_timesteps=2_000_000)
+
+    if DO_TESTING:
+        print("\n--- TESTING TRAINED AGENT ---")
+        # Create a dummy env to initialize the agent
+        test_env_for_agent = ContinuousSemiMDPWrapper(gym.make(env_name, max_episode_steps=200), gamma=GAMMA)
+        trained_agent = RecurrentPPO(test_env_for_agent, env_name=env_name, gamma=GAMMA, log_dir=LOG_DIR)
+        model_path = os.path.join(LOG_DIR, "best_model.pth")
+        trained_agent.load_checkpoint(model_path)
+        test_env_for_agent.close()
+
+        # Create the actual environment for testing with rendering
+        test_env = ContinuousSemiMDPWrapper(gym.make(env_name, max_episode_steps=200, render_mode='human'), gamma=GAMMA)
+        obs, _ = test_env.reset()
+        hidden_state = trained_agent.ac_network.init_hidden_state()
+
+        total_reward = 0
+        terminated, truncated = False, False
+
+        for _ in range(200):  # Run for one episode
+            action, hidden_state = trained_agent.predict(obs, hidden_state, deterministic=True)
+            obs, reward, terminated, truncated, _ = test_env.step(action)
+            done = terminated or truncated
+            total_reward += reward
+            if done:
+                break
+
+        print(f"Total reward during test: {total_reward}")
+        test_env.close()
+

@@ -1,16 +1,12 @@
-import os
-
-from gymnasium.envs.registration import register, WrapperSpec
-from stable_baselines3.common.callbacks import EvalCallback, CallbackList
-import pickle
-import argparse
 from math import ceil
 from collections import defaultdict
 import polars as pl
+from functools import partial
 
 from utils import *
 from gym_wrappers import *
 from models import *
+from ppo_trainer import RecurrentPPO
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
@@ -49,11 +45,11 @@ if __name__ == "__main__":
     train_iql = args.train_iql
 
     if train_iql and not os.path.exists('./replay_buffer/COMPLETE'):
-        ppo_agent = f'../logs_glucose/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
+        ppo_agent = f'../logs_glucose/ppo_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
         assert ppo_agent is not None, (
-            "Please provide a pre-trained PPO agent from the logs_glucose/ppo_minigrid_logs folder "
+            "Please provide a pre-trained PPO agent from the logs_glucose/ppo_logs folder "
             "for IQL training.")
         assert os.path.exists(ppo_agent), "Provided PPO agent path does not exist."
 
@@ -64,30 +60,25 @@ if __name__ == "__main__":
 
     model_loaded = False
 
-    policy_kwargs = dict(
-        features_extractor_class=PPOMiniGridFeaturesExtractor,
-        features_extractor_kwargs=dict(features_dim=128),
-        activation_fn=nn.ReLU,
-        net_arch=[128, 128],
-    )
-
     if train_ppo:
-        # Create eval callback
-        save_each_best = SaveEachBestCallback(save_dir="../logs_glucose/ppo_minigrid_logs/historic_bests", verbose=1)
+        GAMMA = 0.9
 
-        eval_callback = EvalCallback(make_glucose_env(use_test_ids=True),
-                                     n_eval_episodes=50,
-                                     callback_on_new_best=CallbackList([save_each_best]),
-                                     verbose=1,
-                                     eval_freq=2000,
-                                     deterministic=True,
-                                     best_model_save_path="../logs_glucose/ppo_minigrid_logs")
+        base_env = make_glucose_env(use_test_ids=False)
+        env = EnforcePPOWrapper(base_env, gamma=GAMMA)
+        env_creator_fn = partial(make_glucose_env, use_test_ids=True)
 
-        model = RecurrentPPO(CustomRecurrentPolicy, env=make_glucose_env(),
-                             learning_rate=0.00001, ent_coef=0.1, clip_range=0.1, batch_size=32, n_steps=64,
-                             policy_kwargs=policy_kwargs, gamma=0.99, verbose=1, device='cpu')
-        model.learn(1e6, callback=eval_callback)  # Train for 500,000 step with early stopping
-        model_loaded = True
+        # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
+        agent = RecurrentPPO(env, env_creator_fn=env_creator_fn, gamma=GAMMA,
+                             n_steps=1028, # More data per update
+                             entropy_coef=0.01,  # Can be slightly higher now
+                             clip_range=0.2,  # Relax the clip range
+                             batch_size=64,
+                             gae_lambda=0.95,
+                             n_epochs=10,  # Fewer epochs
+                             hidden_dim=128,
+                             learning_rate=1e-3,  # Standard learning rate
+                             eval_freq=100_000)
+        agent.fit(total_timesteps=10_000_000)
 
     if train_iql:
         print(
@@ -102,7 +93,7 @@ if __name__ == "__main__":
         dataset_size = 100_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
-            model = CallableRecurrentPPO.load(ppo_agent, env=base_env, device="cpu")
+            model = RecurrentPPO.load_checkpoint(ppo_agent)
             model_loaded = True
             replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')
