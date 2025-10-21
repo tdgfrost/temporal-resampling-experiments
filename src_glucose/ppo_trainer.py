@@ -42,6 +42,64 @@ def set_seed(seed: int):
     # os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
+class MiniGridEncoder(nn.Module):
+    """
+    A feature extractor that uses self-attention on the input features.
+
+    This network treats the input features as a sequence and uses a
+    Multi-Head Attention block to learn the relationships between them.
+
+    :param input_dim: The input dimension.
+    :param hidden_dim: The final output dimension of the extractor.
+    :param embed_dim: The dimension to embed each input feature into.
+    :param num_heads: The number of attention heads. Must be a divisor of embed_dim.
+    """
+
+    def __init__(
+            self,
+            input_dim,
+            hidden_dim: int = 128,
+            embed_dim: int = 64,
+            num_heads: int = 4,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+
+        self.embed_layer = nn.Linear(input_dim, embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(),
+        )
+        self.init_weights()
+
+    def init_weights(self):
+        """Initializes weights for the network."""
+        def _init_fn(m: nn.Module):
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.apply(_init_fn)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Assuming x has shape (batch_size, num_inputs)
+        embedded = self.embed_layer(x)
+        seq = embedded.unsqueeze(1)
+        attn_output, _ = self.attention(query=seq, key=seq, value=seq)
+        processed_features = attn_output.squeeze(1)
+        return self.fc(processed_features)
+
+
 class CustomSquashedNormal(SquashedDiagGaussianDistribution):
     def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
         super().__init__(action_dim)
@@ -98,24 +156,45 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
         return log_prob
 
 
-class ActorCriticLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, action_dim, action_space):
-        super(ActorCriticLSTM, self).__init__()
+class EncoderActorCriticLSTM(nn.Module):
+    """
+    An Actor-Critic network that first encodes observations using a feature extractor
+    and then processes the sequence of encoded features with an LSTM.
+    """
+    def __init__(self, encoder: nn.Module, encoder_output_dim: int, hidden_dim: int, action_dim: int, action_space):
+        super(EncoderActorCriticLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
 
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        # The feature extractor
+        self.encoder = encoder
+
+        # The LSTM now takes the output of the encoder as its input
+        self.lstm = nn.LSTM(encoder_output_dim, hidden_dim, batch_first=True)
         self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
         self.dist = CustomSquashedNormal(action_dim * 2, low=action_space.low.item(), high=action_space.high.item())
 
-        self.log_std_min = -5
-        self.log_std_max = 2
-
     def forward(self, x, hidden_state=None, deterministic=False):
         is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
-        lstm_out, new_hidden = self.lstm(x, hidden_state)
+
+        if is_packed:
+            # If the input is a packed sequence, apply the encoder to the data part
+            encoded_data = self.encoder(x.data)
+            # Create a new packed sequence with the encoded data
+            lstm_input = torch.nn.utils.rnn.PackedSequence(encoded_data, x.batch_sizes, x.sorted_indices, x.unsorted_indices)
+        else:
+            # Handle non-packed sequences (e.g., during prediction/evaluation)
+            batch_size, seq_len, feature_dim = x.shape
+            # Reshape for the encoder: (batch * seq_len, features)
+            x_reshaped = x.reshape(batch_size * seq_len, feature_dim)
+            # Encode the features
+            encoded_x = self.encoder(x_reshaped)
+            # Reshape back for the LSTM: (batch, seq_len, encoder_output_dim)
+            lstm_input = encoded_x.reshape(batch_size, seq_len, -1)
+
+        lstm_out, new_hidden = self.lstm(lstm_input, hidden_state)
 
         if is_packed:
             lstm_out, lengths = torch.nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
@@ -182,7 +261,14 @@ class RecurrentPPO:
         if self.log_dir:
             os.makedirs(self.log_dir, exist_ok=True)
 
-        self.ac_network = ActorCriticLSTM(self.input_dim, self.hidden_dim, self.action_dim, env.action_space)
+        self.encoder = MiniGridEncoder(input_dim=self.input_dim, hidden_dim=self.hidden_dim)
+        self.ac_network = EncoderActorCriticLSTM(
+            encoder=self.encoder,
+            encoder_output_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            action_dim=self.action_dim,
+            action_space=env.action_space
+        )
         self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
 
     def __call__(self, obs, deterministic=True, *args, **kwargs):
