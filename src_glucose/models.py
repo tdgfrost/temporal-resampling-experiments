@@ -307,7 +307,8 @@ class RecurrentNet(nn.Module):
     @torch.compile
     def forward(self, x: torch.Tensor, actions: torch.Tensor = None,
                 hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                padding_mask: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[
+                padding_mask: Optional[torch.Tensor] = None,
+                train_mask: Optional[torch.Tensor] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # x shape: (N, T, C, H, W), where T is sequence length
         batch_size, seq_len = x.shape[0], x.shape[1]
@@ -329,34 +330,27 @@ class RecurrentNet(nn.Module):
         # (N * T, lstm_input_size) -> (N, T, lstm_input_size)
         lstm_input = hidden.view(batch_size, seq_len, -1)
 
-        # --- NEW BURN-IN LOGIC ---
-        if 0 < self.burn_in_length < seq_len:
-            # Split input into burn-in and train
-            burn_in_input = lstm_input[:, :self.burn_in_length]
-            train_input = lstm_input[:, self.burn_in_length:]
-            if padding_mask is not None:
-                padding_mask = padding_mask[:, self.burn_in_length:]
+        if train_mask is not None and torch.any(~(train_mask == padding_mask)):
+            # --- Burn-in Logic with per-sequence length ---
+            burn_in_lengths = self._get_burn_in_lengths(train_mask)  # shape: [B]
 
-            # Run burn-in with no grad
-            with torch.no_grad():
-                _, (h_n, c_n) = self.lstm(burn_in_input, hidden_state)
+            # Create a mask of shape (B, T) to identify training steps.
+            timesteps = torch.arange(seq_len, device=lstm_input.device).expand(len(burn_in_lengths), seq_len)
+            is_training_mask = timesteps >= burn_in_lengths.unsqueeze(1)
 
-            # Run train part with grad, using burn-in state
-            train_input = self._pack_sequence_maybe(train_input, padding_mask)
-            lstm_out_train, next_hidden_state = self.lstm(train_input, (h_n, c_n))
-            lstm_out_train = self._unpack_sequence_maybe(lstm_out_train, seq_len)
+            # Use torch.where to create a new input tensor.
+            # For training steps, use the original input to preserve the computation graph.
+            # For burn-in steps, use a detached version to cut the graph.
+            lstm_input = torch.where(
+                is_training_mask.unsqueeze(-1),  # expand to [B, T, 1] to broadcast
+                lstm_input,
+                lstm_input.detach()
+            )
 
-            # Pad the output to match original seq_len (with zeros)
-            lstm_out_burn_in = torch.zeros(
-                (batch_size, self.burn_in_length, self.recurrent_hidden_size),
-                device=self._device, dtype=lstm_out_train.dtype)
-            lstm_out = torch.cat([lstm_out_burn_in, lstm_out_train], dim=1)
-
-        else:
-            # Original behavior (e.g., for deployment or if no burn-in)
-            lstm_input = self._pack_sequence_maybe(lstm_input, padding_mask)
-            lstm_out, next_hidden_state = self.lstm(lstm_input, hidden_state)
-            lstm_out = self._unpack_sequence_maybe(lstm_out, seq_len)
+        # Now, proceed with the masked input as if it were the original.
+        packed_input = self._pack_sequence_maybe(lstm_input, padding_mask)
+        lstm_out, next_hidden_state = self.lstm(packed_input, hidden_state)
+        lstm_out = self._unpack_sequence_maybe(lstm_out, seq_len)
 
         # Reshape for the decoder
         # (N, T, recurrent_hidden_size) -> (N * T, recurrent_hidden_size)
@@ -372,9 +366,36 @@ class RecurrentNet(nn.Module):
         return output, next_hidden_state
 
     @staticmethod
+    def _get_burn_in_lengths(train_mask):
+        """
+        Calculates the length of the burn-in period for each sequence in the batch.
+        A burn-in period is the sequence of leading False values in the train_mask.
+
+        Args:
+            train_mask (Tensor): A boolean tensor of shape [B, T, 1].
+
+        Returns:
+            Tensor: A 1D tensor of shape [B] with the burn-in length for each sequence.
+        """
+        # Squeeze to shape [B, T]
+        mask = train_mask.squeeze(-1)
+
+        # `argmax` finds the index of the first `True`. This index is the number of
+        # leading `False` values, which is our burn-in length.
+        # To handle sequences that are all `False` (all burn-in), we add a `True`
+        # sentinel value at the end. `argmax` will then return `seq_len`.
+        sentinel = torch.ones(mask.shape[0], 1, dtype=torch.bool, device=mask.device)
+        mask_with_sentinel = torch.cat([mask, sentinel], dim=1)
+
+        # Cast to int for argmax
+        burn_in_lengths = torch.argmax(mask_with_sentinel.to(torch.int), dim=1)
+        return burn_in_lengths
+
+    @staticmethod
     def _pack_sequence_maybe(lstm_input, padding_mask):
         if padding_mask is not None:
             lengths = padding_mask.sum(dim=1).squeeze(-1).cpu().to(torch.int64)
+            lengths = torch.clamp(lengths, min=1)  # Ensure no zero lengths
             lstm_input = pack_padded_sequence(
                 lstm_input,
                 lengths,
@@ -386,7 +407,7 @@ class RecurrentNet(nn.Module):
     @staticmethod
     def _unpack_sequence_maybe(lstm_out, seq_len):
         if isinstance(lstm_out, PackedSequence):
-            lstm_out, output_lengths = pad_packed_sequence(
+            lstm_out, _ = pad_packed_sequence(
                 lstm_out,
                 batch_first=True,
                 total_length=seq_len
@@ -415,7 +436,7 @@ class _RecurrentBase(nn.Module):
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
-        self._eps = 1e-6
+        self._eps = 1e-5
 
         # Does this need to be removed post-burnin?
         if self.decoy_interval == 0:
@@ -721,11 +742,12 @@ class RecurrentIQL(_RecurrentBase):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
 
     @torch.compile
-    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
+    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
+                       train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # We only need the network output, not the final hidden state for training
-            q1, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
-            q2, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
+            q1, _ = self.critic_net1(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
+            q2, _ = self.critic_net2(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
 
             with torch.no_grad():
                 v_next, _ = self.target_value_net(next_obs, padding_mask=next_padding_mask)
@@ -754,7 +776,7 @@ class RecurrentIQL(_RecurrentBase):
     @torch.compile
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            v, _ = self.value_net(obs, padding_mask=padding_mask)
+            v, _ = self.value_net(obs, padding_mask=padding_mask, train_mask=train_mask)
             with torch.no_grad():
                 q1, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
                 q2, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
@@ -778,7 +800,7 @@ class RecurrentIQL(_RecurrentBase):
 
             # Calculate the mean loss ONLY over the valid, masked timesteps
             # Add a small epsilon to prevent division by zero
-            value_loss = masked_loss.sum() / (final_mask.sum() + 1e-8)
+            value_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
             # --- END OF CORRECTION ---
 
         # The rest of the function remains the same
@@ -796,7 +818,7 @@ class RecurrentIQL(_RecurrentBase):
     @torch.compile
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            params, _ = self.policy_net(obs, padding_mask=padding_mask)
+            params, _ = self.policy_net(obs, padding_mask=padding_mask, train_mask=train_mask)
             mean, log_std = torch.chunk(params, 2, dim=-1)
             # 2. Clamp log_std for numerical stability
             log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -830,7 +852,7 @@ class RecurrentIQL(_RecurrentBase):
                 final_mask = final_mask & visible.squeeze(-1)
 
             masked_loss = policy_loss_unmasked * weights * final_mask.float()
-            policy_loss = masked_loss.sum() / (final_mask.sum() + 1e-8)
+            policy_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
         # The rest of the function remains the same
         self.policy_optim.zero_grad()
@@ -841,7 +863,6 @@ class RecurrentIQL(_RecurrentBase):
         else:
             policy_loss.backward()
             self.policy_optim.step()
-
         return policy_loss
 
 
@@ -934,8 +955,8 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # We only need the network output, not the final hidden state for training
-            q1_pred, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
-            q2_pred, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
+            q1_pred, _ = self.critic_net1(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
+            q2_pred, _ = self.critic_net2(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
 
             with torch.no_grad():
                 params, _ = self.policy_net(next_obs, padding_mask=next_padding_mask)
@@ -950,9 +971,8 @@ class RecurrentCQLSAC(_RecurrentBase):
                 next_actions = torch.tanh(next_actions_pre_tanh)
 
                 # Calculate log_prob, correcting for the tanh squash
-                epsilon = 1e-6
                 next_log_probs = normal_dist.log_prob(next_actions_pre_tanh) - torch.log(
-                    1 - next_actions.pow(2) + epsilon
+                    1 - next_actions.pow(2) + self._eps
                 )
                 next_log_probs = next_log_probs.sum(dim=-1, keepdim=True)
 
@@ -1009,10 +1029,10 @@ class RecurrentCQLSAC(_RecurrentBase):
             cql_uniform_log_probs = -torch.log(torch.tensor(2.0, device=obs.device))
 
             # --- Get Q-values for all sampled actions ---
-            cql_q1_policy, _ = self.critic_net1(cql_obs, cql_policy_actions, padding_mask=padding_mask)
-            cql_q2_policy, _ = self.critic_net2(cql_obs, cql_policy_actions, padding_mask=padding_mask)
-            cql_q1_uniform, _ = self.critic_net1(cql_obs, cql_uniform_actions, padding_mask=padding_mask)
-            cql_q2_uniform, _ = self.critic_net2(cql_obs, cql_uniform_actions, padding_mask=padding_mask)
+            cql_q1_policy, _ = self.critic_net1(cql_obs, cql_policy_actions, padding_mask=padding_mask, train_mask=train_mask)
+            cql_q2_policy, _ = self.critic_net2(cql_obs, cql_policy_actions, padding_mask=padding_mask, train_mask=train_mask)
+            cql_q1_uniform, _ = self.critic_net1(cql_obs, cql_uniform_actions, padding_mask=padding_mask, train_mask=train_mask)
+            cql_q2_uniform, _ = self.critic_net2(cql_obs, cql_uniform_actions, padding_mask=padding_mask, train_mask=train_mask)
 
             # --- Apply log-prob correction (log Q - log pi) ---
             cql_q1_policy = cql_q1_policy - cql_policy_log_probs
@@ -1044,7 +1064,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                 final_mask = final_mask & visible.squeeze(-1)
 
             masked_loss = (total_loss_unmasked.squeeze(-1) * final_mask.float())
-            total_loss = masked_loss.sum() / (final_mask.sum() + 1e-8)
+            total_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
         self.critic_optim.zero_grad()
         if self.scaler:
@@ -1058,7 +1078,7 @@ class RecurrentCQLSAC(_RecurrentBase):
 
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            (action_mean, log_std), _ = self.policy_net(obs, padding_mask=padding_mask)
+            (action_mean, log_std), _ = self.policy_net(obs, padding_mask=padding_mask, train_mask=train_mask)
 
             # Convert to Normal distribution
             std = log_std.exp()
@@ -1081,9 +1101,10 @@ class RecurrentCQLSAC(_RecurrentBase):
             policy_loss_unmasked = -log_probs
 
             # Get the Q-values
-            q1_values, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
-            q2_values, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
-            q_values = torch.min(q1_values, q2_values)
+            with torch.no_grad():
+                q1_values, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
+                q2_values, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
+                q_values = torch.min(q1_values, q2_values)
 
             policy_loss_unmasked = (self._entropy_alpha * policy_loss_unmasked - q_values)
 
@@ -1096,7 +1117,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                 final_mask = final_mask & visible.squeeze(-1)
 
             masked_loss = (policy_loss_unmasked.squeeze(-1) * final_mask.float())
-            policy_loss = masked_loss.sum() / (final_mask.sum() + 1e-8)
+            policy_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
         self.policy_optim.zero_grad()
         if self.scaler:

@@ -18,7 +18,7 @@ parser.add_argument('--ppo_agent', default="best_model01_38.70.pth", type=str, h
 parser.add_argument('--alpha', default=1.0, type=float, help='Alpha parameter for CQL (1.0 is default)')
 parser.add_argument('--expectile', default=0.7, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
-parser.add_argument('--beta', default=2., type=float, help='Beta parameter for IQL agent')
+parser.add_argument('--beta', default=3., type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
@@ -116,7 +116,7 @@ if __name__ == "__main__":
                                                                     forced_interval=interval,
                                                                     no_interim_rewards=True,
                                                                     use_test_ids=True),
-                                                   n_trials=20,
+                                                   n_trials=50,
                                                    min_scale_rewards=replay_buffer_env.min_rewards_scale,
                                                    max_scale_rewards=replay_buffer_env.max_rewards_scale,
                                                    )
@@ -126,7 +126,7 @@ if __name__ == "__main__":
                                                                                                forced_interval=interval,
                                                                                                no_interim_rewards=True,
                                                                                                use_test_ids=True),
-                                                                              n_trials=20,
+                                                                              n_trials=50,
                                                                               running_average_obs=True,
                                                                               min_scale_rewards=replay_buffer_env.min_rewards_scale,
                                                                               max_scale_rewards=replay_buffer_env.max_rewards_scale,
@@ -146,15 +146,22 @@ if __name__ == "__main__":
                                  gamma=GAMMA,
                                  decoy_interval=DECOY_INTERVAL,
                                  dropout_p=args.dropout_p,
+                                 value_lr=1e-3,
+                                 policy_lr=1e-3,
+                                 critic_lr=1e-3,
                                  beta=args.beta,
                                  device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
 
+            n_train_epochs = 500 if EXPECTILE == 0.5 else 50
+            if DECOY_INTERVAL == 1:
+                n_train_epochs = int(n_train_epochs // 10)
+
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
-                n_epochs_train=500 if EXPECTILE == 0.5 else 200,
-                n_epochs_per_eval=1,
+                n_epochs_train=n_train_epochs,
+                n_epochs_per_eval=n_train_epochs,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
                 dataset_kwargs={'decoy_interval': DECOY_INTERVAL, 'batch_size': 32},
