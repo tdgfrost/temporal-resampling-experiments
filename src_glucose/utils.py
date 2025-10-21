@@ -317,20 +317,22 @@ class ReplayBufferEnv:
 
 
 class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original class
-    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64):
+    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20):
         super().__init__(env, buffer_size)
         self.max_sequence_length = sequence_length
+        self.burn_in_length = burn_in_length
         # This will store the valid start indices for each decoy interval
         self.sequence_info = {i: [] for i in range(3)}
 
     def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None,
-                            max_sequence_length: int = None):
+                            max_sequence_length: int = None, burn_in_length: int = None):
         """
         Scans the buffer to identify all episodes and their lengths, preparing for sampling.
         """
         self.batch_size = batch_size if batch_size is not None else self.batch_size
         self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
         self.max_sequence_length = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
+        self.burn_in_length = burn_in_length if burn_in_length is not None else self.burn_in_length
 
         # --- CORE LOGIC CHANGE: Identify episodes instead of fixed-length sequences ---
         dones_data = self.dones[self.decoy_interval]
@@ -359,13 +361,15 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
             # --- Integrate sliding window logic into your loop ---
             for start_idx, length in zip(start_indices, lengths):
                 if length <= self.max_sequence_length:
-                    # Short episode: Add one sequence to be padded.
-                    self.sequence_info[self.decoy_interval].append((start_idx, length))
+                    # Short episode: Add one sequence.
+                    # (start_of_training, length_of_training, start_of_episode)
+                    self.sequence_info[self.decoy_interval].append((start_idx, length, start_idx))
                 else:
                     # Long episode: Use sliding window.
                     last_possible_start = start_idx + length - self.max_sequence_length
                     for seq_start in range(start_idx, last_possible_start + 1):
-                        self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length))
+                        # (start_of_training, length_of_training, start_of_episode)
+                        self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length, start_idx))
 
             # The next episode will start after the last 'done'
             last_ep_start_idx = done_indices[-1] + 1
@@ -373,16 +377,17 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         # --- ADDED: Handle the final, possibly unterminated episode ---
         final_buffer_len = len(dones_np)
         if last_ep_start_idx < final_buffer_len:
+            ep_start_idx = last_ep_start_idx
             final_ep_len = final_buffer_len - last_ep_start_idx
 
             if final_ep_len <= self.max_sequence_length:
                 # The final short episode.
-                self.sequence_info[self.decoy_interval].append((last_ep_start_idx, final_ep_len))
+                self.sequence_info[self.decoy_interval].append((ep_start_idx, final_ep_len, ep_start_idx))
             else:
                 # The final long episode.
                 last_possible_start = last_ep_start_idx + final_ep_len - self.max_sequence_length
                 for seq_start in range(last_ep_start_idx, last_possible_start + 1):
-                    self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length))
+                    self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length, ep_start_idx))
 
         # n_samples is now the number of sequences in the buffer
         self.n_samples = len(self.sequence_info[self.decoy_interval])
@@ -438,59 +443,76 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         assert self._tensors_set, "Replay buffer must be set to tensors first."
 
         batch_size = len(idxs)
-        max_len = self.max_sequence_length
+        # NEW: Total length is burn-in + max sequence length
+        max_train_len = self.max_sequence_length
+        burn_in_len = self.burn_in_length
+        max_fetch_len = burn_in_len + max_train_len
 
         obs_shape = self.observations[decoy_interval][0].shape
-        act_shape = self.actions[decoy_interval][0].shape if self.actions[decoy_interval].numel() > 0 else (1,)
 
-        obs_batch = torch.zeros((batch_size, max_len, *obs_shape), dtype=torch.float32, device=self._device)
+        # Create buffers with the new max_fetch_len
+        obs_batch = torch.zeros((batch_size, max_fetch_len, *obs_shape), dtype=torch.float32, device=self._device)
         next_obs_batch = torch.zeros_like(obs_batch)
-        action_batch = torch.zeros((batch_size, max_len, *act_shape), dtype=torch.float32, device=self._device)
-        reward_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.float32, device=self._device)
-        done_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
-        visible_batch = torch.zeros((batch_size, max_len, 1), dtype=torch.bool, device=self._device)
+        action_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.float32, device=self._device)
+        reward_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.float32, device=self._device)
+        done_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.bool, device=self._device)
+        visible_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.bool, device=self._device)
 
-        # This loop is vectorized for performance using advanced indexing
-        # 1. Get sequence start indices and lengths from the sampled indices
+        # 1. Get info from the sampled indices
         seq_info_batch = self.sequence_info[decoy_interval][idxs]
-        starts = seq_info_batch[:, 0]
-        actual_lens = seq_info_batch[:, 1]
+        train_starts = seq_info_batch[:, 0]
+        actual_train_lens = seq_info_batch[:, 1]
+        ep_starts = seq_info_batch[:, 2]
 
-        # 2. Create index grids for fetching all data in one go
-        # `arange` creates the sequence offsets (0, 1, ..., max_len-1)
-        # `starts.unsqueeze(1)` broadcasts the start indices for each sequence
-        # Shape of `indices`: (batch_size, max_len)
-        base_indices = torch.arange(max_len, device=self._device).unsqueeze(0)
-        indices = starts.unsqueeze(1) + base_indices
+        # 2. Calculate burn-in and fetch indices
+        # Find the real start of data to fetch (clipping at episode start)
+        fetch_starts = torch.max(ep_starts, train_starts - burn_in_len)
+        # Calculate how many burn-in steps we *actually* got
+        actual_burn_in_lens = (train_starts - fetch_starts).long()
+        # Calculate total length of data to fetch
+        total_fetch_lens = actual_burn_in_lens + actual_train_lens
+
+        # 3. Create index grids. We will right-align all sequences.
+        base_indices = torch.arange(max_fetch_len, device=self._device).unsqueeze(0)
+        # Mask for all valid data (burn-in + train)
+        # Data is valid from index 0 up to total_fetch_lens
+        padding_mask = base_indices < total_fetch_lens.unsqueeze(1)
+
+        # 4. Create index grids for fetching all data in one go
+        # This calculates the buffer index for each position in the output tensor
+        indices = (fetch_starts.unsqueeze(1) + base_indices)
         next_indices = indices + 1
 
-        # 3. Create a mask to select only the valid, non-padded indices
-        # Shape of `fetch_mask`: (batch_size, max_len)
-        fetch_mask = base_indices < actual_lens.unsqueeze(1)
+        # 5. Fetch all data using the masks and indices
+        obs_batch[padding_mask] = self.observations[decoy_interval][indices[padding_mask]]
+        action_batch[padding_mask] = self.actions[decoy_interval][indices[padding_mask]].unsqueeze(-1)
+        reward_batch[padding_mask] = self.rewards[decoy_interval][indices[padding_mask]].unsqueeze(-1)
+        done_batch[padding_mask] = self.dones[decoy_interval][indices[padding_mask]].unsqueeze(-1)
+        visible_batch[padding_mask] = self.visible_states[decoy_interval][indices[padding_mask]].unsqueeze(-1)
 
-        # 4. Fetch all data using the masks and indices
-        obs_batch[fetch_mask] = self.observations[decoy_interval][indices[fetch_mask]]
-        action_batch[fetch_mask] = self.actions[decoy_interval][indices[fetch_mask]]
-        reward_batch[fetch_mask] = self.rewards[decoy_interval][indices[fetch_mask]].unsqueeze(-1)
-        done_batch[fetch_mask] = self.dones[decoy_interval][indices[fetch_mask]].unsqueeze(-1)
-        visible_batch[fetch_mask] = self.visible_states[decoy_interval][indices[fetch_mask]].unsqueeze(-1)
+        # 6. --- CORRECTED NEXT_OBS LOGIC ---
+        next_obs_batch[padding_mask] = self.observations[decoy_interval][next_indices[padding_mask]]
 
-        # 5. --- CORRECTED NEXT_OBS LOGIC ---
-        # The next_obs sequence is the obs sequence shifted by one.
-        # We use `next_indices` and the same `fetch_mask`. This works because the buffer
-        # should have a terminal zero-pad, making the last `next_index` valid.
-        next_obs_batch[fetch_mask] = self.observations[decoy_interval][next_indices[fetch_mask]]
+        # 7. Create the TRAINING mask (excludes padding AND burn-in)
+        # Training data starts *after* the actual burn-in
+        train_mask_start_idx = actual_burn_in_lens.unsqueeze(1)
+        # Mask is True from the start index up to the end of valid data (handled by padding_mask)
+        train_mask_bool = (base_indices >= train_mask_start_idx) & padding_mask
 
-        # 6. The training mask is just the fetch_mask with an added dimension
-        mask_batch = fetch_mask.unsqueeze(-1)
+        # Add dimension to masks to match data [B, S, 1]
+        padding_mask = padding_mask.unsqueeze(-1)
+        train_mask = train_mask_bool.unsqueeze(-1)
+
+        # Get the next_padding_mask for next_obs
+        next_padding_mask = torch.roll(padding_mask, shifts=-1, dims=1)
+        next_padding_mask[:, -1, :] = False  # Last step has no defined next
 
         # This can be derived from the visible_batch after fetching
         next_visible_batch = torch.roll(visible_batch, shifts=-1, dims=1)
         next_visible_batch[:, -1] = False  # Last step has no defined next step
 
-        return (obs_batch, action_batch.unsqueeze(-1) if action_batch.dim() == 2 else action_batch,
-                reward_batch, next_obs_batch, done_batch,
-                visible_batch, next_visible_batch, mask_batch)
+        return (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch,
+                visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask)
 
 
 class SaveEachBestCallback(BaseCallback):

@@ -174,7 +174,8 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             steps_until_6am = int(hours_until_6am * 60 // SAMPLE_TIME)
             self.steps_until_action_available = steps_until_6am
         else:
-            self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.5, 0.5)), 1, TOTAL_SIZE)) - 1
+            # self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.5, 0.5)), 1, TOTAL_SIZE)) - 1
+            self.next_waiting_period = np.random.randint(0, TOTAL_SIZE)
 
     @staticmethod
     def _get_current_bg(obs):
