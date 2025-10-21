@@ -124,12 +124,12 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
 
     def sample(self) -> torch.Tensor:
         self.gaussian_actions = self.distribution.rsample()  # pre-tanh
-        u = torch.tanh(self.gaussian_actions)  # in [-1,1]
+        u = torch.tanh(self.gaussian_actions * 0.1 - 3)  # in [-1,1]
         return self.scale * u + self.bias
 
     def mode(self) -> torch.Tensor:
         self.gaussian_actions = self.distribution.mean
-        u = torch.tanh(self.gaussian_actions)
+        u = torch.tanh(self.gaussian_actions * 0.1 - 3)
         return self.scale * u + self.bias
 
     def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
@@ -143,6 +143,8 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
             # compute them from the actions using the inverse-tanh (atanh).
             # atanh(x) = 0.5 * log((1+x)/(1-x))
             gaussian_actions = 0.5 * torch.log((1 + u) / ((1 - u) + 1e-6))
+            # reverse the tanh scaling
+            gaussian_actions = (gaussian_actions + 3) / 0.1
 
         log_prob = self.distribution.log_prob(gaussian_actions)
         log_prob = sum_independent_dims(log_prob)
@@ -176,6 +178,7 @@ class EncoderActorCriticLSTM(nn.Module):
 
         self.dist = CustomSquashedNormal(action_dim * 2, low=action_space.low.item(), high=action_space.high.item())
 
+    @torch.compile
     def forward(self, x, hidden_state=None, deterministic=False):
         is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
 
