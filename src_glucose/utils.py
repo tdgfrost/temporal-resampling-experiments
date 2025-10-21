@@ -568,7 +568,7 @@ class EnvironmentEvaluator:
                         obs = np.mean(np.stack(running_average_obs), axis=0)
                     action, hidden_state = algo.predict(np.expand_dims(obs, 0),
                                                         hidden_state=hidden_state)
-                obs, reward, terminated, truncated, info = self.env.step(action)
+                obs, reward, terminated, truncated, info = self.env.step(action.item())
                 done = terminated or truncated
                 total_reward += reward
 

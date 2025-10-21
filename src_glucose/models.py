@@ -698,13 +698,19 @@ class RecurrentIQL(_RecurrentBase):
         obs_tensor = obs_tensor.unsqueeze(0)
 
         # Pass the current hidden_state to the policy network
-        action_unit, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
+        params, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
+        mean, log_std = torch.chunk(params, 2, dim=-1)
+        # 2. Clamp log_std for numerical stability
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = log_std.exp()
 
-        # Remove sequence dimension for scaling
-        action_unit = action_unit.squeeze(1)
+        base_dist = Normal(mean, std)
+        policy_dist = TransformedDistribution(base_dist, self._transforms)
 
-        # Scale up
-        action = action_unit * (self._action_high - self._action_low) + self._action_low
+        if deterministic:
+            action = torch.tanh(base_dist.mode) * self._scale + self._loc
+        else:
+            action = policy_dist.rsample()
 
         return action.squeeze(-1).cpu().numpy(), next_hidden_state
 
