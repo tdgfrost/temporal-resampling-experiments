@@ -415,6 +415,7 @@ class _RecurrentBase(nn.Module):
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
+        self._eps = 1e-6
 
         # Does this need to be removed post-burnin?
         if self.decoy_interval == 0:
@@ -803,11 +804,13 @@ class RecurrentIQL(_RecurrentBase):
 
             # 3. Create the Normal distribution using the policy's outputs
             base_dist = Normal(mean, std)
-            policy_dist = TransformedDistribution(base_dist, self._transforms)
 
-            # 4. Negative Log-likelihood
-            log_prob = policy_dist.log_prob(acts + 1e-6).sum(dim=-1)
-            policy_loss_unmasked = -log_prob
+            # 4. Calculate Negative Log-likelihood using unsquashed actions
+            action_clamped = torch.clamp(acts, 0.0 + self._eps, 30.0 - self._eps)
+            action_unsquashed = (action_clamped - self._loc) / self._scale
+            action_unsquashed = torch.atanh(action_unsquashed)
+            log_probs = base_dist.log_prob(action_unsquashed).sum(dim=-1)
+            policy_loss_unmasked = -log_probs
 
             # 5. Get the IQL weights
             weights = 1.0
@@ -1059,20 +1062,30 @@ class RecurrentCQLSAC(_RecurrentBase):
 
             # Convert to Normal distribution
             std = log_std.exp()
-            dist = Normal(action_mean, std)
+            base_dist = Normal(action_mean, std)
 
+            """
+            I think this might be incorrect?
             # Sample and get the log-probs
             actions_pre_tanh = dist.rsample()
             action_unit_preds = torch.tanh(actions_pre_tanh)
             eps = 1e-6
             log_probs = dist.log_prob(actions_pre_tanh) - torch.log(1 - action_unit_preds.pow(2) + eps)
+            """
+
+            # 4. Calculate Negative Log-likelihood using unsquashed actions
+            action_clamped = torch.clamp(acts, 0.0 + self._eps, 30.0 - self._eps)
+            action_unsquashed = (action_clamped - self._loc) / self._scale
+            action_unsquashed = torch.atanh(action_unsquashed)
+            log_probs = base_dist.log_prob(action_unsquashed).sum(dim=-1)
+            policy_loss_unmasked = -log_probs
 
             # Get the Q-values
             q1_values, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
             q2_values, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
             q_values = torch.min(q1_values, q2_values)
 
-            policy_loss_unmasked = (self._entropy_alpha * log_probs - q_values)
+            policy_loss_unmasked = (self._entropy_alpha * policy_loss_unmasked - q_values)
 
             # --- Apply Mask ---
             final_mask = train_mask.squeeze(-1)  # Shape (N, T)
