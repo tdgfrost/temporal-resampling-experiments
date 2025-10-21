@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from simglucose.simulation.scenario import CustomScenario
 
 SAMPLE_TIME = 10.0  # minutes
-AGGREGATE_WINDOW_SIZE = 6  # 6 * 10 minutes = 60 minutes
+AGGREGATE_WINDOW_SIZE = 24  # 24 * 10 minutes = 240 minutes
 TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 10 minutes)
 
 # Scaling parameters
@@ -73,7 +73,7 @@ class T1DPatientEnv(Wrapper):
         self._id_choices = [1, 2, 3, 4, 5, 6, 7, 8] if not use_test_ids else [9, 10]
         id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
-        env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
+        env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
 
     def reset(self, **kwargs):
@@ -81,7 +81,7 @@ class T1DPatientEnv(Wrapper):
         self.env.close()  # cleanup
         id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
-        self.env = gym.make(identity, max_episode_steps=(24 * 60) // SAMPLE_TIME, **self.kwargs)
+        self.env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -166,16 +166,10 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             return
 
         self.steps_until_action_available = self.next_waiting_period
-        hour_float = self.env.get_wrapper_attr('get_time')()
 
-        # Deep night
-        if hour_float % 24 < 6 or hour_float % 24 >= 22:
-            hours_until_6am = (6 - hour_float) % 24
-            steps_until_6am = int(hours_until_6am * 60 // SAMPLE_TIME)
-            self.steps_until_action_available = steps_until_6am
-        else:
-            self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.0, 1.0)), 1, TOTAL_SIZE)) - 1
-            # self.next_waiting_period = np.random.randint(0, TOTAL_SIZE)
+        # self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.0, 1.0)), 1, TOTAL_SIZE)) - 1
+        self.next_waiting_period = int(np.clip(np.rint(np.random.normal(6.0, 1.5)), 1, TOTAL_SIZE)) - 1
+        # self.next_waiting_period = np.random.randint(0, TOTAL_SIZE)
 
     @staticmethod
     def _get_current_bg(obs):
