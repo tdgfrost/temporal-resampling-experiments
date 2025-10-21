@@ -55,7 +55,7 @@ if __name__ == "__main__":
     model_loaded = False
 
     if train_ppo:
-        GAMMA = 0.9
+        GAMMA = 0.99
 
         base_env = make_glucose_env()
         env = EnforcePPOWrapper(base_env, gamma=GAMMA)
@@ -71,7 +71,7 @@ if __name__ == "__main__":
                              n_epochs=10,  # Fewer epochs
                              hidden_dim=128,
                              seed=123,
-                             learning_rate=1e-3,  # Standard learning rate
+                             learning_rate=3e-4,  # Standard learning rate
                              eval_freq=100_000,
                              eval_episodes=500)
         agent.fit(total_timesteps=10_000_000)
