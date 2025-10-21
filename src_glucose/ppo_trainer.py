@@ -446,6 +446,7 @@ class RecurrentPPO:
                                                  f"best_model{model_save_num:02d}_{avg_eval_reward:.2f}.pth")
                         self.save_checkpoint(save_path)
                         print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} ***\n")
+                        model_save_num += 1
 
                 next_eval += self.eval_freq
 
