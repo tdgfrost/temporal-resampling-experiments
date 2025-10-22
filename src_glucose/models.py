@@ -144,126 +144,18 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
         return self.net(observations)
 
 
-class ScaleAction(nn.Module):
-    def __init__(self, low: float, high: float):
-        super().__init__()
-        self.register_buffer('low', torch.tensor(low, dtype=torch.float32))
-        self.register_buffer('high', torch.tensor(high, dtype=torch.float32))
-        self.device = None
+class SharedRecurrentEncoder(nn.Module):
+    """
+    This module encapsulates the shared parts of the network:
+    1. The observation encoder (e.g., MiniGridEncoder)
+    2. The LSTM layer
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Scale from [0, 1] to [low, high]
-        if self.device is None or self.device != x.device:
-            self.device = x.device
-            self.register_buffer('low', self.low.to(self.device))
-            self.register_buffer('high', self.high.to(self.device))
-        return x * (self.high - self.low) + self.low
+    It takes raw observations and outputs the
+    sequence of LSTM hidden states (history-aware state features).
+    """
 
-
-class CustomNet(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], output_size: int, hidden_dim: int = 128,
-                 device: str = 'cpu', action_encoder=None, feature_extractor=None, dropout_p: float = 0.0,
-                 *args, **kwargs) -> None:
-        super().__init__()
-        self._device = device
-        if feature_extractor is None:
-            self.encoder = OfflineMiniGridEncoder(observation_shape=observation_shape,
-                                                  hidden_dim=hidden_dim,
-                                                  dropout_p=dropout_p).to(device)
-        else:
-            self.encoder = feature_extractor
-
-        self.action_encoder = action_encoder
-        self._has_actions = action_encoder is not None
-
-        decoder_input_size = hidden_dim * (1 + int(self._has_actions))
-
-        self.decoder = nn.Sequential(
-            nn.Linear(decoder_input_size, decoder_input_size // 2),
-            nn.LayerNorm(decoder_input_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_p),
-
-            nn.Linear(decoder_input_size // 2, decoder_input_size // 2),
-            nn.LayerNorm(decoder_input_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_p),
-
-            nn.Linear(decoder_input_size // 2, output_size)
-        ).to(device)
-
-        self.init_weights()
-
-    def init_weights(self):
-        """
-        Initialize weights for Conv2d/Linear with Kaiming normal,
-        biases with zeros, Norm layers with weight=1, bias=0.
-        The final Linear layer in the decoder is zero-initialized.
-        """
-
-        def _init_fn(m: nn.Module):
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
-                if m.weight is not None:
-                    nn.init.ones_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # apply to all submodules
-        self.apply(_init_fn)
-
-        # special-case: zero-init the very last decoder layer
-        if isinstance(self.decoder[-1], nn.Linear):
-            nn.init.zeros_(self.decoder[-1].weight)
-            nn.init.zeros_(self.decoder[-1].bias)
-
-    def forward(self, x: torch.Tensor, actions: torch.Tensor = None, flags: torch.Tensor = None) -> torch.Tensor:
-        x, actions, flags = self._ndarray_to_tensor(x, actions, flags)
-        x = x.to(dtype=torch.float32)
-
-        # (N, C, H, W) -> (N, hidden_dim)
-        hidden = self.encoder(x)
-        if self._has_actions:
-            hidden = torch.concatenate([hidden,
-                                        self.action_encoder(actions.view(-1, 1).to(dtype=torch.float32))], dim=-1)
-
-        # (N, hidden_dim) -> (N, output_size)
-        output = self.decoder(hidden)
-
-        if flags is not None:
-            output = output.view(x.size(0), 2, -1)
-            output = torch.take_along_dim(output, flags.long().unsqueeze(-1), 1).squeeze(1)
-
-        return output
-
-    def _ndarray_to_tensor(self, *arrays):
-        new_tensors = []
-        for array in arrays:
-            if array is None:
-                new_tensors.append(None)
-                continue
-            if not isinstance(array, torch.Tensor):
-                array = torch.tensor(array)
-            new_tensors.append(array.to(self._device))
-
-        return new_tensors
-
-    def enable_mc_dropout(self):
-        """Enable MC Dropout during inference."""
-
-        def apply_mc_dropout(m):
-            if isinstance(m, nn.Dropout):
-                m.train()
-
-        self.apply(apply_mc_dropout)
-
-
-class RecurrentNet(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], output_size: int, hidden_dim: int = 128,
-                 recurrent_hidden_size: int = 128, device: str = 'cpu', action_encoder=None,
+    def __init__(self, observation_shape: Tuple[int, int, int], hidden_dim: int = 128,
+                 recurrent_hidden_size: int = 128, device: str = 'cpu',
                  feature_extractor=None, dropout_p: float = 0.0, burn_in_length: int = 0, *args, **kwargs) -> None:
         super().__init__()
         self._device = device
@@ -276,55 +168,51 @@ class RecurrentNet(nn.Module):
         else:
             self.encoder = feature_extractor
 
-        self.action_encoder = action_encoder
-        self._has_actions = action_encoder is not None
         self.burn_in_length = burn_in_length
 
-        # Input to LSTM is the feature vector (plus action embedding if present)
-        lstm_input_size = hidden_dim * (1 + int(self._has_actions))
-
         # --- Recurrent Layer ---
+        # The LSTM input is now *only* the feature dimension from the encoder
         self.lstm = nn.LSTM(
-            input_size=lstm_input_size,
+            input_size=hidden_dim,
             hidden_size=recurrent_hidden_size,
             num_layers=1,
             batch_first=True  # Crucial for easier tensor manipulation
         ).to(device)
 
-        # Decoder now takes the output of the LSTM
-        decoder_input_size = recurrent_hidden_size
-        self.decoder = nn.Sequential(
-            nn.Linear(decoder_input_size, decoder_input_size // 2),
-            nn.LayerNorm(decoder_input_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_p),
-            nn.Linear(decoder_input_size // 2, output_size)
-        ).to(device)
-
-        # Note: Weight initialization is omitted for brevity but should be the same as in your original code.
-        # self.init_weights()
-
-    @torch.compile
-    def forward(self, x: torch.Tensor, actions: torch.Tensor = None,
+    # @torch.compile
+    def forward(self, x: Optional[torch.Tensor] = None,
+                obs_features: Optional[torch.Tensor] = None,
                 hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 padding_mask: Optional[torch.Tensor] = None,
                 train_mask: Optional[torch.Tensor] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # x shape: (N, T, C, H, W), where T is sequence length
-        batch_size, seq_len = x.shape[0], x.shape[1]
+        """
+        Processes observations through the encoder and LSTM.
 
-        # Reshape to process each frame through the encoder
-        # (N, T, C, H, W) -> (N * T, C, H, W)
-        x_reshaped = x.reshape(-1, *x.shape[2:])
+        Returns:
+            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            - lstm_out: The sequence of LSTM hidden states, shape (N, T, recurrent_hidden_size)
+            - next_hidden_state: The final hidden state (h_n, c_n) for the *next* step.
+        """
 
-        # (N * T, C, H, W) -> (N * T, hidden_dim)
-        hidden = self.encoder(x_reshaped.to(dtype=torch.float32))
+        # Get our features shape
+        if obs_features is not None:
+            # features shape: (N, T, feature_dim)
+            batch_size, seq_len = obs_features.shape[0], obs_features.shape[1]
+            # (N, T, feature_dim) -> (N * T, feature_dim)
+            hidden = obs_features.reshape(-1, obs_features.shape[2])
+        elif x is not None:
+            # x shape: (N, T, C, H, W)
+            batch_size, seq_len = x.shape[0], x.shape[1]
+            # (N, T, C, H, W) -> (N * T, C, H, W)
+            x_reshaped = x.reshape(-1, *x.shape[2:])
+            # (N * T, C, H, W) -> (N * T, hidden_dim)
+            hidden = self.encoder(x_reshaped.to(dtype=torch.float32))
+        else:
+            raise ValueError("Either 'x' (observations) or 'obs_features' (pre-computed) must be provided.")
 
-        if self._has_actions:
-            # actions shape: (N, T, 1) -> (N * T, 1)
-            actions_reshaped = actions.reshape(-1, 1).to(dtype=torch.float32)
-            action_embedding = self.action_encoder(actions_reshaped)
-            hidden = torch.cat([hidden, action_embedding], dim=-1)
+        # --- Action logic has been removed ---
+        # Actions will be fused by the critic *after* this module
 
         # Reshape back to sequence format for LSTM
         # (N * T, lstm_input_size) -> (N, T, lstm_input_size)
@@ -352,18 +240,7 @@ class RecurrentNet(nn.Module):
         lstm_out, next_hidden_state = self.lstm(packed_input, hidden_state)
         lstm_out = self._unpack_sequence_maybe(lstm_out, seq_len)
 
-        # Reshape for the decoder
-        # (N, T, recurrent_hidden_size) -> (N * T, recurrent_hidden_size)
-        decoder_input = lstm_out.reshape(-1, self.recurrent_hidden_size)
-
-        # (N * T, recurrent_hidden_size) -> (N * T, output_size)
-        output = self.decoder(decoder_input)
-
-        # Reshape final output back to sequence format
-        # (N * T, output_size) -> (N, T, output_size)
-        output = output.view(batch_size, seq_len, -1)
-
-        return output, next_hidden_state
+        return lstm_out, next_hidden_state
 
     @staticmethod
     def _get_burn_in_lengths(train_mask):
@@ -415,6 +292,99 @@ class RecurrentNet(nn.Module):
         return lstm_out
 
 
+class RecurrentNet(nn.Module):
+    """
+    This module is now just a decoder.
+    It takes a sequence of features and passes them through
+    a final MLP to produce the desired output.
+
+    For Value/Policy nets, input_features = lstm_state_features
+    For Critic nets, input_features = torch.cat([lstm_state_features, action_features], dim=-1)
+    """
+
+    def __init__(self, input_feature_size: int, output_size: int, has_action_encoder: bool = False,
+                 device: str = 'cpu', dropout_p: float = 0.0, *args, **kwargs) -> None:
+        super().__init__()
+        self._device = device
+        self.input_feature_size = input_feature_size
+        self._has_action_encoder = has_action_encoder
+
+        if self._has_action_encoder:
+            self.action_encoder = nn.Sequential(
+                nn.Linear(1, input_feature_size // 2),
+                nn.LayerNorm(input_feature_size // 2),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p),
+                nn.Linear(input_feature_size // 2, input_feature_size)
+            )
+        else:
+            self.action_encoder = None
+
+        self.decoder = nn.Sequential(
+            nn.Linear(input_feature_size, input_feature_size // 2),
+            nn.LayerNorm(input_feature_size // 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(input_feature_size // 2, output_size)
+        ).to(device)
+
+        # Note: Weight initialization is omitted for brevity but should be the same as in your original code.
+        self.init_weights()
+
+    def init_weights(self):
+        """Initializes weights for the network."""
+
+        def _init_fn(m: nn.Module):
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.apply(_init_fn)
+
+    # @torch.compile
+    def forward(self, input_features: torch.Tensor,
+                actions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Processes a sequence of input features through the decoder.
+
+        Args:
+            input_features (torch.Tensor): Input features,
+                                           shape (N, T, input_feature_size)
+            actions (torch.Tensor, optional): Actions to be concatenated,
+                                              shape (N, T, action_feature_size)
+
+        Returns:
+            torch.Tensor: The final decoded output, shape (N, T, output_size)
+        """
+        assert actions is None or self._has_action_encoder, \
+            "Action encoder must be provided if actions are used."
+
+        if actions is not None:
+            encoded_actions = self.action_encoder(actions)
+            input_features = input_features + encoded_actions
+
+        batch_size, seq_len = input_features.shape[0], input_features.shape[1]
+
+        # Reshape for the decoder
+        # (N, T, input_feature_size) -> (N * T, input_feature_size)
+        decoder_input = input_features.reshape(-1, self.input_feature_size)
+
+        # (N * T, input_feature_size) -> (N * T, output_size)
+        output = self.decoder(decoder_input)
+
+        # Reshape final output back to sequence format
+        # (N * T, output_size) -> (N, T, output_size)
+        output = output.view(batch_size, seq_len, -1)
+
+        return output
+
+
 class _RecurrentBase(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], action_space: spaces.Box,
                  hidden_dim: int = 128, gamma: float = 0.99, recurrent_hidden_size: int = None, batch_size: int = 128,
@@ -439,7 +409,11 @@ class _RecurrentBase(nn.Module):
         self._eps = 1e-5
         self._tanh_scale = 1.0
 
-        # Does this need to be removed post-burnin?
+        # --- PLACEHOLDERS: These must be set by the child class ---
+        self.shared_encoder: SharedRecurrentEncoder = None
+        self.policy_net: RecurrentNet = None
+        # ---
+
         if self.decoy_interval == 0:
             sequence_length *= int((1 + TOTAL_SIZE) / 2)
         self._sequence_length = sequence_length
@@ -535,11 +509,21 @@ class _RecurrentBase(nn.Module):
         Returns the action and the next hidden state.
         """
         obs_tensor = self._to_tensors(obs)[0]
-        # Add batch and sequence dimensions: (L,W) -> (N, L,W)
+        # Add batch dimension
         obs_tensor = obs_tensor.unsqueeze(0)
 
         # Pass the current hidden_state to the policy network
-        params, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
+        # 1. Call the shared encoder
+        #    Input: (1, 1, H, W, C), Output: (1, 1, hidden_size)
+        lstm_out, next_hidden_state = self.shared_encoder(obs_tensor, hidden_state=hidden_state)
+
+        # 2. Call the policy decoder
+        #    Input: (1, 1, hidden_size), Output: (1, 1, 2)
+        params = self.policy_net(lstm_out)
+
+        # Squeeze the sequence dimension
+        params = params.squeeze(1)  # params shape (1, 2)
+
         mean, log_std = torch.chunk(params, 2, dim=-1)
         # 2. Clamp log_std for numerical stability
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -639,6 +623,12 @@ class _RecurrentBase(nn.Module):
             new_tensors.append(arr.to(self._device))
         return new_tensors
 
+    def get_initial_states(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns a zero-initialized hidden state tuple for the LSTM."""
+        h_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
+        c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
+        return h_0, c_0
+
     def _log_progress(self, epoch: int, loss_dict: dict, experiment_name: str,
                       evaluators: dict = None):
 
@@ -685,7 +675,7 @@ class RecurrentIQL(_RecurrentBase):
         self._has_dropout = dropout_p > 0.0
         self._beta = beta
         self._scale = torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
-        self._log_scale = torch.tensor(self._scale, device=self._device).log()
+        self._log_scale = self._scale.log()
         self._loc = torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
         self._tanh_scale = 0.2  # Scale before applying tanh
         self._log_tanh_scale = torch.tensor(self._tanh_scale, device=self._device).log()
@@ -695,7 +685,8 @@ class RecurrentIQL(_RecurrentBase):
             AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)
         ]
 
-        net_kwargs = dict(
+        # Kwargs for encoders and decoders
+        encoder_kwargs = dict(
             observation_shape=self._observation_shape,
             hidden_dim=self._hidden_dim,
             recurrent_hidden_size=self._recurrent_hidden_size,
@@ -703,49 +694,71 @@ class RecurrentIQL(_RecurrentBase):
             device=self._device
         )
 
-        self.feature_extractor = OfflineMiniGridEncoder(**net_kwargs).to(self._device)
-        self.action_encoder = nn.Sequential(
-            ScaleAction(low=self._action_low, high=self._action_high),
-            nn.Linear(1, self._hidden_dim),
-            nn.LayerNorm(self._hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_p)
+        decoder_kwargs = dict(
+            input_feature_size=self._recurrent_hidden_size,
+            dropout_p=dropout_p,
+            device=self._device
+        )
+
+        # --- Create Shared Encoders ---
+        self.feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
+        self.target_feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
+
+        self.shared_encoder = SharedRecurrentEncoder(
+            feature_extractor=self.feature_extractor,
+            **encoder_kwargs
+        ).to(self._device)
+        self.target_shared_encoder = SharedRecurrentEncoder(
+            feature_extractor=self.target_feature_extractor,
+            **encoder_kwargs
         ).to(self._device)
 
-        self.critic_net1 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
-                                        feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
-                                        feature_extractor=self.feature_extractor, **net_kwargs)
-        self.value_net = RecurrentNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_value_net = RecurrentNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.policy_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        # --- Create Decoders ---
+        self.critic_net1 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.critic_net2 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.value_net = RecurrentNet(output_size=1, **decoder_kwargs).to(self._device)
+        self.target_value_net = RecurrentNet(output_size=1, **decoder_kwargs).to(self._device)
+        self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
 
-        # Give both critic nets to the critic optimizer
-        self.critic_optim = torch.optim.AdamW(list(self.critic_net1.parameters()) +
-                                              list(self.critic_net2.parameters()), lr=self._critic_lr)
-        self.value_optim = torch.optim.AdamW(self.value_net.parameters(), lr=self._value_lr)
-        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=self._actor_lr)
+        # --- Setup Optimizers ---
+        # Shared parameters will be optimized by all three optimizers
+        shared_params = list(self.shared_encoder.parameters())
+
+        self.critic_optim = torch.optim.AdamW(
+            shared_params + list(self.critic_net1.parameters()) + list(self.critic_net2.parameters()),
+            lr=self._critic_lr
+        )
+        self.value_optim = torch.optim.AdamW(
+            shared_params + list(self.value_net.parameters()),
+            lr=self._value_lr
+        )
+        self.policy_optim = torch.optim.AdamW(
+            shared_params + list(self.policy_net.parameters()),
+            lr=self._actor_lr
+        )
 
         # clone the value net to a target network
         self.sync_target_networks(tau=1.0)
 
-    def get_initial_states(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns a zero-initialized hidden state tuple for the LSTM."""
-        h_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
-        c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
-        return h_0, c_0
-
     def forward(self, obs, acts):
         # Note that this returns both the output and the hidden states
-        q1 = self.critic_net1(obs, acts)
-        q2 = self.critic_net2(obs, acts)
-        v = self.value_net(obs)
-        logits = self.policy_net(obs)
+        lstm_out, _ = self.shared_encoder(obs)
+        q1 = self.critic_net1(lstm_out, actions=acts)
+        q2 = self.critic_net2(lstm_out, actions=acts)
+
+        v = self.value_net(lstm_out)
+        logits = self.policy_net(lstm_out)
+
         return (q1, q2), v, logits
 
     def sync_target_networks(self, tau=None):
         tau = tau or self._tau_target
+        # Sync the target value decoder
         for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+        # Sync the target shared encoder
+        for target_param, param in zip(self.target_shared_encoder.parameters(), self.shared_encoder.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
 
     @torch.compile
@@ -753,11 +766,14 @@ class RecurrentIQL(_RecurrentBase):
                        train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # We only need the network output, not the final hidden state for training
-            q1, _ = self.critic_net1(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
-            q2, _ = self.critic_net2(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
+            lstm_out, hidden_state = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
+            q1 = self.critic_net1(lstm_out, actions=acts)
+            q2 = self.critic_net2(lstm_out, actions=acts)
 
             with torch.no_grad():
-                v_next, _ = self.target_value_net(next_obs, padding_mask=next_padding_mask)
+                # Use target shared encoder and target value decoder
+                next_lstm_out, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask)
+                v_next = self.target_value_net(next_lstm_out)
                 r = rews.float()
 
             if self.decoy_interval == 0:
@@ -781,12 +797,18 @@ class RecurrentIQL(_RecurrentBase):
         return critic_loss
 
     @torch.compile
-    def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
+    def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
+                      train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            v, _ = self.value_net(obs, padding_mask=padding_mask, train_mask=train_mask)
+            # Value function doesn't depend on actions
+            lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
+            v = self.value_net(lstm_out)
+
             with torch.no_grad():
-                q1, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
-                q2, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
+                # Q-values *do* depend on actions
+                # lstm_out_q, _ = self.shared_encoder(obs, actions=acts, padding_mask=padding_mask)
+                q1 = self.critic_net1(lstm_out, actions=acts)
+                q2 = self.critic_net2(lstm_out, actions=acts)
                 q = torch.min(q1, q2)
 
             diff = q - v
@@ -823,9 +845,13 @@ class RecurrentIQL(_RecurrentBase):
         return value_loss
 
     @torch.compile
-    def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
+    def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
+                      train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            params, _ = self.policy_net(obs, padding_mask=padding_mask, train_mask=train_mask)
+            # Policy doesn't depend on actions
+            lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
+            params = self.policy_net(lstm_out)
+
             mean, log_std = torch.chunk(params, 2, dim=-1)
             # 2. Clamp log_std for numerical stability
             log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -905,7 +931,8 @@ class RecurrentCQLSAC(_RecurrentBase):
             AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)
         ]
 
-        net_kwargs = dict(
+        # Kwargs for encoders and decoders
+        encoder_kwargs = dict(
             observation_shape=self._observation_shape,
             hidden_dim=self._hidden_dim,
             recurrent_hidden_size=self._recurrent_hidden_size,
@@ -913,58 +940,79 @@ class RecurrentCQLSAC(_RecurrentBase):
             device=self._device
         )
 
-        self.feature_extractor = OfflineMiniGridEncoder(**net_kwargs).to(self._device)
-        self.action_encoder = nn.Sequential(
-            ScaleAction(low=self._action_low, high=self._action_high),
-            nn.Linear(1, self._hidden_dim),
-            nn.LayerNorm(self._hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_p)
+        decoder_kwargs = dict(
+            input_feature_size=self._recurrent_hidden_size,
+            dropout_p=dropout_p,
+            device=self._device
+        )
+
+        self.feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
+        self.target_feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
+
+        # --- Create Shared Encoders ---
+        self.shared_encoder = SharedRecurrentEncoder(
+            feature_extractor=self.feature_extractor,
+            **encoder_kwargs
+        ).to(self._device)
+        self.target_shared_encoder = SharedRecurrentEncoder(
+            feature_extractor=self.target_feature_extractor,
+            **encoder_kwargs
         ).to(self._device)
 
-        self.critic_net1 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
-                                        feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
-                                        feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_critic_net1 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
-                                               feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_critic_net2 = RecurrentNet(output_size=1, action_encoder=self.action_encoder,
-                                               feature_extractor=self.feature_extractor, **net_kwargs)
-        self.policy_net = RecurrentNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        # --- Create Decoders ---
+        self.critic_net1 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.critic_net2 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.target_critic_net1 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.target_critic_net2 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
+
+        # --- Setup Optimizers ---
+        shared_params = list(self.shared_encoder.parameters())
 
         self.critic_optim = torch.optim.AdamW(
-            list(self.critic_net1.parameters()) + list(self.critic_net2.parameters()), lr=self._critic_lr
+            shared_params + list(self.critic_net1.parameters()) + list(self.critic_net2.parameters()),
+            lr=self._critic_lr
         )
-        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=self._actor_lr)
+        self.policy_optim = torch.optim.AdamW(
+            shared_params + list(self.policy_net.parameters()),
+            lr=self._actor_lr
+        )
 
         # Initialize target networks
         self.sync_target_networks(tau=1.0)
 
-    def forward(self, obs):
+    def forward(self, obs, acts):
         # Note that this returns both the output and the hidden states
-        q1_logits = self.critic_net1(obs)
-        q2_logits = self.critic_net2(obs)
-        policy_logits = self.policy_net(obs)
+        lstm_out, _ = self.shared_encoder(obs)
+
+        q1_logits = self.critic_net1(lstm_out, actions=acts)
+        q2_logits = self.critic_net2(lstm_out, actions=acts)
+        policy_logits = self.policy_net(lstm_out)
+
         return q1_logits, q2_logits, policy_logits
 
-    #@torch.compile
-    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
+    @torch.compile
+    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
+                       train_mask):
         def reshape_cql(tensor):
             return tensor.view(batch_size, cql_n_samples, seq_len, 1).permute(0, 2, 1, 3).squeeze(-1)
 
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # Inverse-map dataset actions to [-1, 1] range
-            u_data = (acts - self._loc) / (self._scale + self._eps)
-            u_data = torch.clamp(u_data, -1.0 + self._eps, 1.0 - self._eps)
+            u_acts = (acts - self._loc) / (self._scale + self._eps)
+            u_acts = torch.clamp(u_acts, -1.0 + self._eps, 1.0 - self._eps)
 
             # --- Get Q-values for actions in the dataset ---
-            # These are the full-sequence [N, T, 1] predictions
-            q1_pred, _ = self.critic_net1(obs, u_data, padding_mask=padding_mask, train_mask=train_mask)
-            q2_pred, _ = self.critic_net2(obs, u_data, padding_mask=padding_mask, train_mask=train_mask)
+            lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
+            q1_pred = self.critic_net1(lstm_out, actions=u_acts)
+            q2_pred = self.critic_net2(lstm_out, actions=u_acts)
 
             # --- Calculate Bellman Target Components ---
             with torch.no_grad():
-                params, _ = self.policy_net(next_obs, padding_mask=next_padding_mask)
+                # Get policy params from *online* policy net and *online* encoder
+                next_lstm_out, _ = self.shared_encoder(next_obs, padding_mask=next_padding_mask)
+                params = self.policy_net(next_lstm_out)
+
                 mean, log_std = torch.chunk(params, 2, dim=-1)
                 # Clamp log_std for numerical stability
                 log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -986,9 +1034,10 @@ class RecurrentCQLSAC(_RecurrentBase):
                 next_log_probs = normal_dist.log_prob(next_actions_pre_tanh) - log_jacobian
                 next_log_probs = next_log_probs.sum(dim=-1, keepdim=True)
 
-                # Get Q-values for the *next* state and *sampled next* action
-                next_q1, _ = self.target_critic_net1(next_obs, next_actions_persistent, padding_mask=next_padding_mask)
-                next_q2, _ = self.target_critic_net2(next_obs, next_actions_persistent, padding_mask=next_padding_mask)
+                # Get Q-values from *target* critic decoders and *target* shared encoder
+                next_lstm_out_target, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask)
+                next_q1 = self.target_critic_net1(next_lstm_out_target, actions=next_actions_persistent)
+                next_q2 = self.target_critic_net2(next_lstm_out_target, actions=next_actions_persistent)
                 next_q = torch.min(next_q1, next_q2)
 
                 # Target V-value (logit) = Q - alpha * log_prob
@@ -1007,8 +1056,14 @@ class RecurrentCQLSAC(_RecurrentBase):
             cql_train_mask = train_mask.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples,
                                                                                          seq_len, 1)
 
+            # Get policy params from *online* policy net and *online* encoder
+            cql_lstm_out_policy, _ = self.shared_encoder(cql_obs,
+                                                         padding_mask=cql_padding_mask,
+                                                         train_mask=cql_train_mask)
+
             with torch.no_grad():
-                params, _ = self.policy_net(cql_obs, padding_mask=cql_padding_mask)
+                params = self.policy_net(cql_lstm_out_policy)
+
                 mean, log_std = torch.chunk(params, 2, dim=-1)
                 # 2. Clamp log_std for numerical stability
                 log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -1042,15 +1097,12 @@ class RecurrentCQLSAC(_RecurrentBase):
                 cql_policy_actions_persistent = cql_policy_actions
                 cql_uniform_actions_persistent = cql_uniform_actions
 
-            # --- Get Q-values for all sampled actions ---
-            cql_q1_policy, _ = self.critic_net1(cql_obs, cql_policy_actions_persistent, padding_mask=cql_padding_mask,
-                                                train_mask=cql_train_mask)
-            cql_q2_policy, _ = self.critic_net2(cql_obs, cql_policy_actions_persistent, padding_mask=cql_padding_mask,
-                                                train_mask=cql_train_mask)
-            cql_q1_uniform, _ = self.critic_net1(cql_obs, cql_uniform_actions_persistent, padding_mask=cql_padding_mask,
-                                                 train_mask=cql_train_mask)
-            cql_q2_uniform, _ = self.critic_net2(cql_obs, cql_uniform_actions_persistent, padding_mask=cql_padding_mask,
-                                                 train_mask=cql_train_mask)
+            # --- Get Q-values for all sampled actions (using online encoder/decoders) ---
+            cql_q1_policy = self.critic_net1(cql_lstm_out_policy, actions=cql_policy_actions_persistent)
+            cql_q2_policy = self.critic_net2(cql_lstm_out_policy, actions=cql_policy_actions_persistent)
+
+            cql_q1_uniform = self.critic_net1(cql_lstm_out_policy, actions=cql_uniform_actions_persistent)
+            cql_q2_uniform = self.critic_net2(cql_lstm_out_policy, actions=cql_uniform_actions_persistent)
 
             # --- Apply log-prob correction (log Q - log pi) ---
             cql_q1_policy = cql_q1_policy - cql_policy_log_probs
@@ -1134,9 +1186,13 @@ class RecurrentCQLSAC(_RecurrentBase):
             self.critic_optim.step()
         return total_loss
 
+    @torch.compile
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            (action_mean, log_std), _ = self.policy_net(obs, padding_mask=padding_mask, train_mask=train_mask)
+            # 1. Get policy params (action-independent)
+            lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
+            params = self.policy_net(lstm_out)
+            action_mean, log_std = torch.chunk(params, 2, dim=-1)
 
             # Convert to Normal distribution
             std = log_std.exp()
@@ -1155,15 +1211,15 @@ class RecurrentCQLSAC(_RecurrentBase):
                 u_sampled_persistent = u_sampled
 
             # Calculate log_prob of the action u_sampled
-            log_jacob = torch.log(1 - u_sampled.pow(2) + self._eps) + self.log_a
+            log_jacob = torch.log(1 - u_sampled.pow(2) + self._eps) + self._log_tanh_scale
             log_pi_sampled = base_dist.log_prob(x_sampled) - log_jacob
             log_pi_sampled = log_pi_sampled.sum(dim=-1, keepdim=True)
 
             # Get Q-values for these new actions
             # We pass u_sampled (normalized action) to the critics, as they expect.
             # We do *not* detach gradients here, as we need them to flow through Q into u_sampled
-            q1_values, _ = self.critic_net1(obs, u_sampled_persistent, padding_mask=padding_mask, train_mask=train_mask)
-            q2_values, _ = self.critic_net2(obs, u_sampled_persistent, padding_mask=padding_mask, train_mask=train_mask)
+            q1_values = self.critic_net1(lstm_out, actions=u_sampled_persistent)
+            q2_values = self.critic_net2(lstm_out, actions=u_sampled_persistent)
             q_values = torch.min(q1_values, q2_values)
 
             # Calculate SAC Actor Loss
@@ -1190,9 +1246,14 @@ class RecurrentCQLSAC(_RecurrentBase):
 
     def sync_target_networks(self, tau=None):
         tau = tau or self._tau_target
+        # Sync target critic decoders
         for target_param, param in zip(self.target_critic_net1.parameters(), self.critic_net1.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
         for target_param, param in zip(self.target_critic_net2.parameters(), self.critic_net2.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+        # Sync target shared encoder
+        for target_param, param in zip(self.target_shared_encoder.parameters(), self.shared_encoder.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
 
 
