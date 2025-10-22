@@ -147,7 +147,7 @@ if __name__ == "__main__":
 
             algo.compile()
 
-            n_train_epochs = 500 if EXPECTILE == 0.5 else 50
+            n_train_epochs = 200 if EXPECTILE == 0.5 else 50
             epoch_frac = 1.0
             if DECOY_INTERVAL == 1:
                 # n_train_epochs = int(n_train_epochs // 10)
