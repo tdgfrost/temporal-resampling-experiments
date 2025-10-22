@@ -105,9 +105,11 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
         super().__init__(action_dim)
         self.scale = float(high - low) / 2.0
         self.bias = float(high + low) / 2.0
+        self._tanh_scale = 0.2  # Scale before applying tanh
+        self._log_tanh_scale = torch.tensor(self._tanh_scale).log()
         self.gaussian_actions = None
         self.epsilon = 1e-6
-        self.log_scale = torch.log(torch.tensor(self.scale + self.epsilon))
+        self.log_scale = torch.tensor(self.scale + self.epsilon).log()
 
     def proba_distribution(self, params: torch.Tensor, _=None):
         mean, log_std = torch.chunk(params, 2, dim=-1)
@@ -124,12 +126,12 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
 
     def sample(self) -> torch.Tensor:
         self.gaussian_actions = self.distribution.rsample()  # pre-tanh
-        u = torch.tanh(self.gaussian_actions)  # in [-1,1]
+        u = torch.tanh(self._tanh_scale * self.gaussian_actions)  # in [-1,1]
         return self.scale * u + self.bias
 
     def mode(self) -> torch.Tensor:
         self.gaussian_actions = self.distribution.mean
-        u = torch.tanh(self.gaussian_actions)
+        u = torch.tanh(self._tanh_scale * self.gaussian_actions)
         return self.scale * u + self.bias
 
     def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
@@ -143,12 +145,15 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
             # compute them from the actions using the inverse-tanh (atanh).
             # atanh(x) = 0.5 * log((1+x)/(1-x))
             gaussian_actions = 0.5 * torch.log((1 + u) / ((1 - u) + 1e-6))
+            gaussian_actions /= self._tanh_scale
 
         log_prob = self.distribution.log_prob(gaussian_actions)
         log_prob = sum_independent_dims(log_prob)
 
         # tanh Jacobian
         log_prob -= torch.sum(torch.log(torch.clamp(1 - u ** 2, self.epsilon, 1 - self.epsilon)), dim=1)
+
+        log_prob -= u.shape[-1] * self._log_tanh_scale
 
         # affine scaling Jacobian
         if self.scale != 1.0:

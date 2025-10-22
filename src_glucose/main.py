@@ -64,7 +64,7 @@ if __name__ == "__main__":
         # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
         agent = RecurrentPPO(env, env_creator_fn=env_creator_fn, gamma=GAMMA,
                              n_steps=1028,  # More data per update
-                             entropy_coef=0.01,  # Can be slightly higher now
+                             entropy_coef=0.001,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
                              batch_size=64,
                              gae_lambda=0.95,
