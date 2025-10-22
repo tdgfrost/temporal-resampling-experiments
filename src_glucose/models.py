@@ -432,11 +432,12 @@ class _RecurrentBase(nn.Module):
         self._actor_lr = actor_lr
         self._observation_shape = observation_shape
         self._action_low = action_space.low[0]
-        self._action_high = action_space.high[0]
+        self._action_high = 2.0 #action_space.high[0]
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
         self._eps = 1e-5
+        self._tanh_scale = 1.0
 
         # Does this need to be removed post-burnin?
         if self.decoy_interval == 0:
@@ -548,7 +549,7 @@ class _RecurrentBase(nn.Module):
         policy_dist = TransformedDistribution(base_dist, self._transforms)
 
         if deterministic:
-            action = torch.tanh(base_dist.mode) * self._scale + self._loc
+            action = torch.tanh(base_dist.mode * self._tanh_scale) * self._scale + self._loc
         else:
             action = policy_dist.rsample()
 
@@ -683,9 +684,9 @@ class RecurrentIQL(_RecurrentBase):
         self._tau_target = tau_target
         self._has_dropout = dropout_p > 0.0
         self._beta = beta
-        self._scale = 1.0  # torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
+        self._scale = torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
         self._log_scale = torch.tensor(self._scale, device=self._device).log()
-        self._loc = 1.0  # torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
+        self._loc = torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
         self._tanh_scale = 0.2  # Scale before applying tanh
         self._log_tanh_scale = torch.tensor(self._tanh_scale, device=self._device).log()
         self._transforms = [
@@ -834,9 +835,8 @@ class RecurrentIQL(_RecurrentBase):
             base_dist = Normal(mean, std)
 
             # 4. Calculate Negative Log-likelihood using unsquashed actions
-            acts_clamped = torch.clamp(acts, 0.0 + self._eps, 30.0 - self._eps)
             # - get the 'u' expert action in the [-1, 1] range
-            u_expert = (acts_clamped - self._loc) / self._scale
+            u_expert = (acts - self._loc) / self._scale
             u_expert = torch.clamp(u_expert, -1 + self._eps, 1 - self._eps)
             pre_tanh_action_expert = torch.atanh(u_expert) / self._tanh_scale
             nll = -base_dist.log_prob(pre_tanh_action_expert).sum(dim=-1)
