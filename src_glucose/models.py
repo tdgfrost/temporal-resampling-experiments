@@ -179,7 +179,7 @@ class SharedRecurrentEncoder(nn.Module):
             batch_first=True  # Crucial for easier tensor manipulation
         ).to(device)
 
-    # @torch.compile
+    @torch.compile
     def forward(self, x: Optional[torch.Tensor] = None,
                 obs_features: Optional[torch.Tensor] = None,
                 hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -347,7 +347,7 @@ class RecurrentNet(nn.Module):
 
         self.apply(_init_fn)
 
-    # @torch.compile
+    @torch.compile
     def forward(self, input_features: torch.Tensor,
                 actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -515,11 +515,14 @@ class _RecurrentBase(nn.Module):
         # Pass the current hidden_state to the policy network
         # 1. Call the shared encoder
         #    Input: (1, 1, H, W, C), Output: (1, 1, hidden_size)
-        lstm_out, next_hidden_state = self.shared_encoder(obs_tensor, hidden_state=hidden_state)
+        lstm_out, next_hidden_state = self.shared_encoder(obs_tensor,
+                                                          hidden_state=hidden_state,
+                                                          padding_mask=None,
+                                                          train_mask=None)
 
         # 2. Call the policy decoder
         #    Input: (1, 1, hidden_size), Output: (1, 1, 2)
-        params = self.policy_net(lstm_out)
+        params = self.policy_net(lstm_out, actions=None)
 
         # Squeeze the sequence dimension
         params = params.squeeze(1)  # params shape (1, 2)
@@ -772,8 +775,8 @@ class RecurrentIQL(_RecurrentBase):
 
             with torch.no_grad():
                 # Use target shared encoder and target value decoder
-                next_lstm_out, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask)
-                v_next = self.target_value_net(next_lstm_out)
+                next_lstm_out, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
+                v_next = self.target_value_net(next_lstm_out, actions=None)
                 r = rews.float()
 
             if self.decoy_interval == 0:
@@ -802,7 +805,7 @@ class RecurrentIQL(_RecurrentBase):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # Value function doesn't depend on actions
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
-            v = self.value_net(lstm_out)
+            v = self.value_net(lstm_out, actions=None)
 
             with torch.no_grad():
                 # Q-values *do* depend on actions
@@ -850,7 +853,7 @@ class RecurrentIQL(_RecurrentBase):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # Policy doesn't depend on actions
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
-            params = self.policy_net(lstm_out)
+            params = self.policy_net(lstm_out, actions=None)
 
             mean, log_std = torch.chunk(params, 2, dim=-1)
             # 2. Clamp log_std for numerical stability
@@ -1010,8 +1013,8 @@ class RecurrentCQLSAC(_RecurrentBase):
             # --- Calculate Bellman Target Components ---
             with torch.no_grad():
                 # Get policy params from *online* policy net and *online* encoder
-                next_lstm_out, _ = self.shared_encoder(next_obs, padding_mask=next_padding_mask)
-                params = self.policy_net(next_lstm_out)
+                next_lstm_out, _ = self.shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
+                params = self.policy_net(next_lstm_out, actions=None)
 
                 mean, log_std = torch.chunk(params, 2, dim=-1)
                 # Clamp log_std for numerical stability
@@ -1035,7 +1038,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                 next_log_probs = next_log_probs.sum(dim=-1, keepdim=True)
 
                 # Get Q-values from *target* critic decoders and *target* shared encoder
-                next_lstm_out_target, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask)
+                next_lstm_out_target, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
                 next_q1 = self.target_critic_net1(next_lstm_out_target, actions=next_actions_persistent)
                 next_q2 = self.target_critic_net2(next_lstm_out_target, actions=next_actions_persistent)
                 next_q = torch.min(next_q1, next_q2)
@@ -1062,7 +1065,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                                                          train_mask=cql_train_mask)
 
             with torch.no_grad():
-                params = self.policy_net(cql_lstm_out_policy)
+                params = self.policy_net(cql_lstm_out_policy, actions=None)
 
                 mean, log_std = torch.chunk(params, 2, dim=-1)
                 # 2. Clamp log_std for numerical stability
@@ -1191,7 +1194,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
             # 1. Get policy params (action-independent)
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
-            params = self.policy_net(lstm_out)
+            params = self.policy_net(lstm_out, actions=None)
             action_mean, log_std = torch.chunk(params, 2, dim=-1)
 
             # Convert to Normal distribution
