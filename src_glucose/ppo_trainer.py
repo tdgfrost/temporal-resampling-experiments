@@ -6,10 +6,13 @@ import gymnasium as gym
 import numpy as np
 import os
 from gymnasium.vector import SyncVectorEnv
-from torch.distributions import Normal
-from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, sum_independent_dims
+from torch.distributions import Beta
+from stable_baselines3.common.distributions import sum_independent_dims
 from functools import partial
 import random
+
+INSULIN_ACTION_LOW = 0.0
+INSULIN_ACTION_HIGH = 2.0
 
 
 def set_seed(seed: int):
@@ -59,20 +62,15 @@ class MiniGridEncoder(nn.Module):
             self,
             input_dim,
             hidden_dim: int = 128,
-            embed_dim: int = 64,
-            num_heads: int = 4,
     ):
         super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
 
-        self.embed_layer = nn.Linear(input_dim, embed_dim)
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.fc = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
         )
         self.init_weights()
 
@@ -93,71 +91,108 @@ class MiniGridEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Assuming x has shape (batch_size, num_inputs)
-        embedded = self.embed_layer(x)
-        seq = embedded.unsqueeze(1)
-        attn_output, _ = self.attention(query=seq, key=seq, value=seq)
-        processed_features = attn_output.squeeze(1)
-        return self.fc(processed_features)
+        return self.fc(x)
 
 
-class CustomSquashedNormal(SquashedDiagGaussianDistribution):
+class CustomBetaDistribution(nn.Module):
+    """
+    Beta distribution, scaled to an arbitrary range [low, high].
+
+    This distribution is naturally bounded, making it a good fit for
+    action spaces with hard constraints.
+
+    :param action_dim: Dimension of the action space.
+    :param low: The lower bound of the action space.
+    :param high: The upper bound of the action space.
+    """
+
     def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
-        super().__init__(action_dim)
-        self.scale = float(high - low) / 2.0
-        self.bias = float(high + low) / 2.0
-        self._tanh_scale = 0.2  # Scale before applying tanh
-        self._log_tanh_scale = torch.tensor(self._tanh_scale).log()
-        self.gaussian_actions = None
+        super().__init__()
+        self.action_dim = action_dim
+        self.scale = float(high - low)
+        self.bias = float(low)
         self.epsilon = 1e-6
-        self.log_scale = torch.tensor(self.scale + self.epsilon).log()
+        self.distribution = None
+
+        # Pre-compute log_scale for log_prob calculation
+        self.log_scale = torch.tensor(self.scale).log()
 
     def proba_distribution(self, params: torch.Tensor, _=None):
-        mean, log_std = torch.chunk(params, 2, dim=-1)
-        log_std = torch.clamp(log_std, -20.0, 2.0)
-        self.mean_actions = mean
-        std = log_std.exp()
-        self.distribution = Normal(mean, std)  # pre-tanh
+        """
+        Creates the distribution from the actor network's output.
+
+        :param params: Raw output from the actor head (batch_size, action_dim * 2)
+        """
+        # Split the output into alpha and beta parameters
+        # We add 1.0 + softplus(x) to ensure alpha and beta are > 1,
+        # which makes the distribution more stable and uni-modal to start.
+        # F.softplus(x) = log(1 + exp(x))
+        alpha, beta = torch.chunk(params, 2, dim=-1)
+        self.alpha = F.softplus(alpha) + 1.0
+        self.beta = F.softplus(beta) + 1.0
+
+        # Create the underlying Beta distribution
+        self.distribution = Beta(self.alpha, self.beta)
         return self
 
     def entropy(self) -> torch.Tensor:
-        actions = self.sample()
-        log_prob = self.log_prob(actions, gaussian_actions=self.gaussian_actions)
-        return -log_prob
+        """
+        Get the entropy of the distribution.
+        Entropy of a scaled distribution H(aX + b) = H(X) + log|a|
+        """
+        # Get entropy from the base Beta distribution
+        entropy = self.distribution.entropy()
+
+        # Sum entropy across action dimensions
+        entropy = sum_independent_dims(entropy)
+
+        # Add the scaling factor's log-determinant
+        # (we add log_scale for each dimension)
+        entropy += self.log_scale * self.action_dim
+        return entropy
 
     def sample(self) -> torch.Tensor:
-        self.gaussian_actions = self.distribution.rsample()  # pre-tanh
-        u = torch.tanh(self._tanh_scale * self.gaussian_actions)  # in [-1,1]
+        """
+        Sample an action, using the reparameterization trick (rsample).
+        """
+        # Sample from Beta(alpha, beta) -> range [0, 1]
+        u = self.distribution.rsample()
+
+        # Scale and shift to [low, high]
         return self.scale * u + self.bias
 
     def mode(self) -> torch.Tensor:
-        self.gaussian_actions = self.distribution.mean
-        u = torch.tanh(self._tanh_scale * self.gaussian_actions)
+        """
+        Return the mode of the distribution (most likely action).
+        For Beta(a,b) with a,b > 1, mode is (a-1)/(a+b-2).
+        We use the mean as a stable approximation.
+        Mean is a / (a + b)
+        """
+        u = self.distribution.mean  # range [0, 1]
+
+        # Scale and shift to [low, high]
         return self.scale * u + self.bias
 
     def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
-        # map actions back to [-1,1]
-        u = (actions - self.bias) / (self.scale + self.epsilon)
-        u = torch.clamp(u, -1 + self.epsilon, 1 - self.epsilon)
+        """
+        Get the log-probability of taking a specific action.
 
-        # base Normal log-prob in pre-tanh space
-        if gaussian_actions is None:
-            # If not provided (i.e., called from policy_loss),
-            # compute them from the actions using the inverse-tanh (atanh).
-            # atanh(x) = 0.5 * log((1+x)/(1-x))
-            gaussian_actions = 0.5 * torch.log((1 + u) / ((1 - u) + 1e-6))
-            gaussian_actions /= self._tanh_scale
+        :param actions: The actions taken (in range [low, high])
+        :param gaussian_actions: Ignored (kept for API compatibility)
+        """
+        # Un-scale the actions from [low, high] back to [0, 1]
+        u = (actions - self.bias) / self.scale
 
-        log_prob = self.distribution.log_prob(gaussian_actions)
+        # Clamp actions to be slightly inside (0, 1) for numerical stability
+        u = torch.clamp(u, self.epsilon, 1.0 - self.epsilon)
+
+        # Get log-prob from the base Beta distribution
+        log_prob = self.distribution.log_prob(u)
         log_prob = sum_independent_dims(log_prob)
 
-        # tanh Jacobian
-        log_prob -= torch.sum(torch.log(torch.clamp(1 - u ** 2, self.epsilon, 1 - self.epsilon)), dim=1)
-
-        log_prob -= u.shape[-1] * self._log_tanh_scale
-
-        # affine scaling Jacobian
-        if self.scale != 1.0:
-            log_prob -= u.shape[-1] * self.log_scale
+        # Account for the scaling transformation
+        # log_prob(action) = log_prob(u) - log(scale)
+        log_prob -= self.log_scale * self.action_dim
         return log_prob
 
 
@@ -179,9 +214,12 @@ class EncoderActorCriticLSTM(nn.Module):
         self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
-        self.dist = CustomSquashedNormal(action_dim * 2)#, low=action_space.low.item(), high=action_space.high.item())
+        self.dist = CustomBetaDistribution(
+            action_dim,
+            low=INSULIN_ACTION_LOW,
+            high=INSULIN_ACTION_HIGH,
+        )
 
-    @torch.compile
     def forward(self, x, hidden_state=None, deterministic=False):
         is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
 
@@ -218,6 +256,11 @@ class EncoderActorCriticLSTM(nn.Module):
         if deterministic:
             action = dist.mode()
             return action, value, new_hidden
+
+        sampled_action = dist.sample()
+        # Store the action so the training loop can get it
+        self.dist.last_sampled_action = sampled_action
+
         return dist, value, new_hidden
 
     def init_hidden_state(self, batch_size=1):
@@ -438,8 +481,12 @@ class RecurrentPPO:
                 rollout_c_states.append(c_x.detach().squeeze())
                 with torch.no_grad():
                     dist, value, hidden_state = self.ac_network(obs_tensor, hidden_state)
-                action_env = dist.sample()
-                log_prob = dist.log_prob(action_env, gaussian_actions=dist.gaussian_actions).sum(axis=-1)
+
+                action_env = dist.last_sampled_action
+                log_prob = dist.log_prob(action_env).sum(axis=-1)
+
+                # action_env = dist.sample()
+                # log_prob = dist.log_prob(action_env, gaussian_actions=dist.gaussian_actions).sum(axis=-1)
                 new_obs, reward, term, trunc, info = self.env.step(action_env.numpy().flatten())
                 done = term or trunc
                 steps_taken = info.get('steps_taken', 1)
