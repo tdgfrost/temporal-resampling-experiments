@@ -517,13 +517,13 @@ class _RecurrentBase(nn.Module):
         return log_dict
 
     def _update_critic(self, *args):
-        return np.nan
+        return torch.tensor(torch.nan)
 
     def _update_value(self, *args):
-        return np.nan
+        return torch.tensor(torch.nan)
 
     def _update_actor(self, *args):
-        return np.nan
+        return torch.tensor(torch.nan)
 
     def sync_target_networks(self):
         pass
