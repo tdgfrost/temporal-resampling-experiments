@@ -527,6 +527,33 @@ class _RecurrentBase(nn.Module):
     def sync_target_networks(self):
         pass
 
+    def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                deterministic: bool = False) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Predicts an action for a single observation and manages the recurrent state.
+        Returns the action and the next hidden state.
+        """
+        obs_tensor = self._to_tensors(obs)[0]
+        # Add batch and sequence dimensions: (L,W) -> (N, L,W)
+        obs_tensor = obs_tensor.unsqueeze(0)
+
+        # Pass the current hidden_state to the policy network
+        params, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
+        mean, log_std = torch.chunk(params, 2, dim=-1)
+        # 2. Clamp log_std for numerical stability
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = log_std.exp()
+
+        base_dist = Normal(mean, std)
+        policy_dist = TransformedDistribution(base_dist, self._transforms)
+
+        if deterministic:
+            action = torch.tanh(base_dist.mode) * self._scale + self._loc
+        else:
+            action = policy_dist.rsample()
+
+        return action.squeeze(-1).cpu().numpy(), next_hidden_state
+
     @torch.compile
     def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
@@ -601,7 +628,7 @@ class _RecurrentBase(nn.Module):
 
         q_target_sel = R_i_j.unsqueeze(-1) + (expo * (1 - done_j) * vnext_j).unsqueeze(-1)
 
-        return q1_sel, q2_sel, q_target_sel
+        return q1_sel, q2_sel, q_target_sel, valid
 
     def _to_tensors(self, *arrays):
         new_tensors = []
@@ -656,10 +683,16 @@ class RecurrentIQL(_RecurrentBase):
         self._tau_target = tau_target
         self._has_dropout = dropout_p > 0.0
         self._beta = beta
-        self._scale = torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
-        self._loc = torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
+        self._scale = 1.0  # torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
+        self._log_scale = torch.tensor(self._scale, device=self._device).log()
+        self._loc = 1.0  # torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
+        self._tanh_scale = 0.2  # Scale before applying tanh
+        self._log_tanh_scale = torch.tensor(self._tanh_scale, device=self._device).log()
         self._transforms = [
-            TanhTransform(cache_size=1), AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)]
+            AffineTransform(loc=0.0, scale=self._tanh_scale, cache_size=1),
+            TanhTransform(cache_size=1),
+            AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)
+        ]
 
         net_kwargs = dict(
             observation_shape=self._observation_shape,
@@ -709,33 +742,6 @@ class RecurrentIQL(_RecurrentBase):
         logits = self.policy_net(obs)
         return (q1, q2), v, logits
 
-    def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                deterministic: bool = False) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Predicts an action for a single observation and manages the recurrent state.
-        Returns the action and the next hidden state.
-        """
-        obs_tensor = self._to_tensors(obs)[0]
-        # Add batch and sequence dimensions: (L,W) -> (N, L,W)
-        obs_tensor = obs_tensor.unsqueeze(0)
-
-        # Pass the current hidden_state to the policy network
-        params, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
-        mean, log_std = torch.chunk(params, 2, dim=-1)
-        # 2. Clamp log_std for numerical stability
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = log_std.exp()
-
-        base_dist = Normal(mean, std)
-        policy_dist = TransformedDistribution(base_dist, self._transforms)
-
-        if deterministic:
-            action = torch.tanh(base_dist.mode) * self._scale + self._loc
-        else:
-            action = policy_dist.rsample()
-
-        return action.squeeze(-1).cpu().numpy(), next_hidden_state
-
     def sync_target_networks(self, tau=None):
         tau = tau or self._tau_target
         for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
@@ -754,7 +760,7 @@ class RecurrentIQL(_RecurrentBase):
                 r = rews.float()
 
             if self.decoy_interval == 0:
-                q1, q2, q_target = self._filter_to_correct_visibles(
+                q1, q2, q_target, _ = self._filter_to_correct_visibles(
                     q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask)
             else:
                 q_target = r + self._gamma * (1 - dones.float()) * v_next
@@ -828,11 +834,19 @@ class RecurrentIQL(_RecurrentBase):
             base_dist = Normal(mean, std)
 
             # 4. Calculate Negative Log-likelihood using unsquashed actions
-            action_clamped = torch.clamp(acts, 0.0 + self._eps, 30.0 - self._eps)
-            action_unsquashed = (action_clamped - self._loc) / self._scale
-            action_unsquashed = torch.atanh(action_unsquashed)
-            log_probs = base_dist.log_prob(action_unsquashed).sum(dim=-1)
-            policy_loss_unmasked = -log_probs
+            acts_clamped = torch.clamp(acts, 0.0 + self._eps, 30.0 - self._eps)
+            # - get the 'u' expert action in the [-1, 1] range
+            u_expert = (acts_clamped - self._loc) / self._scale
+            u_expert = torch.clamp(u_expert, -1 + self._eps, 1 - self._eps)
+            pre_tanh_action_expert = torch.atanh(u_expert) / self._tanh_scale
+            nll = -base_dist.log_prob(pre_tanh_action_expert).sum(dim=-1)
+
+            # Add the positive log-Jacobian term
+            log_det_jacobian = torch.sum(torch.log(torch.clamp(1 - u_expert ** 2, self._eps, 1.0)), dim=-1)
+            log_det_jacobian += u_expert.shape[-1] * self._log_tanh_scale
+            log_det_jacobian += u_expert.shape[-1] * self._log_scale
+
+            policy_loss_unmasked = nll - log_det_jacobian
 
             # 5. Get the IQL weights
             weights = 1.0
@@ -880,10 +894,16 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._tau_target = tau_target
         self._cql_alpha = cql_alpha
         self._entropy_alpha = entropy_alpha
-        self._scale = (self._action_high - self._action_low) / 2.0
-        self._loc = (self._action_high + self._action_low) / 2.0
+        self._scale = 1.0  # torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
+        self._log_scale = torch.tensor(self._scale, device=self._device).log()
+        self._loc = 1.0  # torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
+        self._tanh_scale = 0.2  # Scale before applying tanh
+        self._log_tanh_scale = torch.tensor(self._tanh_scale, device=self._device).log()
         self._transforms = [
-            TanhTransform(cache_size=1), AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)]
+            AffineTransform(loc=0.0, scale=self._tanh_scale, cache_size=1),
+            TanhTransform(cache_size=1),
+            AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)
+        ]
 
         net_kwargs = dict(
             observation_shape=self._observation_shape,
@@ -927,116 +947,116 @@ class RecurrentCQLSAC(_RecurrentBase):
         policy_logits = self.policy_net(obs)
         return q1_logits, q2_logits, policy_logits
 
-    def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                deterministic: bool = False) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Predicts an action for a single observation and manages the recurrent state.
-        Returns the action and the next hidden state.
-        """
-        obs_tensor = self._to_tensors(obs)[0]
-        # Add batch and sequence dimensions: (L,W) -> (N, L,W)
-        obs_tensor = obs_tensor.unsqueeze(0)
-
-        # Pass the current hidden_state to the policy network
-        action_unit, next_hidden_state = self.policy_net(obs_tensor, hidden_state=hidden_state)
-
-        # Remove sequence dimension for scaling
-        action_unit = action_unit.squeeze(1)
-
-        # Scale up
-        action = action_unit * (self._action_high - self._action_low) + self._action_low
-
-        return action.squeeze(-1).cpu().numpy(), next_hidden_state
-
-    @torch.compile
+    #@torch.compile
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask, train_mask):
         def reshape_cql(tensor):
-            return tensor.view(batch_size, seq_len, cql_n_samples)
+            return tensor.view(batch_size, cql_n_samples, seq_len, 1).permute(0, 2, 1, 3).squeeze(-1)
 
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            # We only need the network output, not the final hidden state for training
-            q1_pred, _ = self.critic_net1(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
-            q2_pred, _ = self.critic_net2(obs, acts, padding_mask=padding_mask, train_mask=train_mask)
+            # Inverse-map dataset actions to [-1, 1] range
+            u_data = (acts - self._loc) / (self._scale + self._eps)
+            u_data = torch.clamp(u_data, -1.0 + self._eps, 1.0 - self._eps)
 
+            # --- Get Q-values for actions in the dataset ---
+            # These are the full-sequence [N, T, 1] predictions
+            q1_pred, _ = self.critic_net1(obs, u_data, padding_mask=padding_mask, train_mask=train_mask)
+            q2_pred, _ = self.critic_net2(obs, u_data, padding_mask=padding_mask, train_mask=train_mask)
+
+            # --- Calculate Bellman Target Components ---
             with torch.no_grad():
                 params, _ = self.policy_net(next_obs, padding_mask=next_padding_mask)
                 mean, log_std = torch.chunk(params, 2, dim=-1)
-                # 2. Clamp log_std for numerical stability
+                # Clamp log_std for numerical stability
                 log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
                 std = log_std.exp()
                 normal_dist = Normal(mean, std)
 
                 # Sample next action using reparameterization trick
                 next_actions_pre_tanh = normal_dist.rsample()
-                next_actions = torch.tanh(next_actions_pre_tanh)
+                next_actions = torch.tanh(next_actions_pre_tanh * self._tanh_scale)
+
+                # If using decoy_interval == 0, persist actions over non-visible steps
+                if self.decoy_interval == 0:
+                    next_actions_persistent = _persist_actions(next_actions, next_visible)
+                else:
+                    next_actions_persistent = next_actions
 
                 # Calculate log_prob, correcting for the tanh squash
-                next_log_probs = normal_dist.log_prob(next_actions_pre_tanh) - torch.log(
-                    1 - next_actions.pow(2) + self._eps
-                )
+                log_jacobian = torch.log(1 - next_actions.pow(2) + self._eps) + self._log_tanh_scale
+                next_log_probs = normal_dist.log_prob(next_actions_pre_tanh) - log_jacobian
                 next_log_probs = next_log_probs.sum(dim=-1, keepdim=True)
 
                 # Get Q-values for the *next* state and *sampled next* action
-                next_q1, _ = self.target_critic_net1(next_obs, next_actions, padding_mask=next_padding_mask)
-                next_q2, _ = self.target_critic_net2(next_obs, next_actions, padding_mask=next_padding_mask)
+                next_q1, _ = self.target_critic_net1(next_obs, next_actions_persistent, padding_mask=next_padding_mask)
+                next_q2, _ = self.target_critic_net2(next_obs, next_actions_persistent, padding_mask=next_padding_mask)
                 next_q = torch.min(next_q1, next_q2)
 
                 # Target V-value (logit) = Q - alpha * log_prob
-                next_v = next_q - self._entropy_alpha * next_log_probs
+                next_v = next_q - self._entropy_alpha * next_log_probs  # Shape [N, T, 1]
 
                 r = rews.float()  # Shape [N, T, 1]
                 dones = dones.float()  # Shape [N, T, 1]
 
-            if self.decoy_interval == 0:
-                q1_pred, q2_pred, q_target = self._filter_to_correct_visibles(
-                    q1_pred, q2_pred, r, next_v, dones, visible, next_visible, padding_mask, train_mask)
-            else:
-                q_target = r + self._gamma * (1 - dones.float()) * next_v
-
-            # Calculate Bellman loss per-timestep
-            bellman_loss = F.mse_loss(q1_pred, q_target, reduction='none') + F.mse_loss(q2_pred, q_target,
-                                                                                        reduction='none')
-
-            # CQL loss
+            # ---- CQL loss terms (calculated on full [N, T] grid) ----
             cql_n_samples = 10
             batch_size, seq_len, obs_dim = obs.shape
-            action_dim = acts.shape[-1]
-            obs_flat = obs.reshape(batch_size * seq_len, obs_dim)
-            # Repeat obs for sampling: [N*T, obs_dim] -> [N*T*n_samples, obs_dim]
-            cql_obs = obs_flat.unsqueeze(1).repeat(1, cql_n_samples, 1).view(-1, obs_dim)
+
+            cql_obs = obs.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples, seq_len, obs_dim)
+            cql_padding_mask = padding_mask.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples,
+                                                                                             seq_len, 1)
+            cql_train_mask = train_mask.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples,
+                                                                                         seq_len, 1)
 
             with torch.no_grad():
-                params, _ = self.policy_net(cql_obs, padding_mask=padding_mask)
+                params, _ = self.policy_net(cql_obs, padding_mask=cql_padding_mask)
                 mean, log_std = torch.chunk(params, 2, dim=-1)
-                # Clamp log_std for numerical stability
+                # 2. Clamp log_std for numerical stability
                 log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
                 std = log_std.exp()
+                normal_dist = Normal(mean, std)
 
-                # Get the distribution
-                policy_dist = Normal(mean, std)
+                actions_pre_tanh = normal_dist.rsample()
+                cql_policy_actions = torch.tanh(actions_pre_tanh * self._tanh_scale)
 
-                actions_pre_tanh = policy_dist.rsample()
-                cql_policy_actions = torch.tanh(actions_pre_tanh)
-
-                cql_policy_log_probs = policy_dist.log_prob(actions_pre_tanh) - torch.log(
-                    1 - cql_policy_actions.pow(2) + epsilon
-                )
+                # Calculate log prob
+                cql_log_jacobian = torch.log(1 - cql_policy_actions.pow(2) + self._eps) + self._log_tanh_scale
+                cql_policy_log_probs = normal_dist.log_prob(actions_pre_tanh) - cql_log_jacobian
                 cql_policy_log_probs = cql_policy_log_probs.sum(dim=-1, keepdim=True)
 
             cql_uniform_actions = torch.empty(
-                batch_size * seq_len * cql_n_samples, action_dim, device=obs.device
+                batch_size * cql_n_samples, seq_len, 1, device=obs.device
             ).uniform_(-1.0, 1.0)
             cql_uniform_log_probs = -torch.log(torch.tensor(2.0, device=obs.device))
 
+            # If using decoy_interval == 0, persist actions over non-visible steps
+            if self.decoy_interval == 0:
+                # We need the 'visible' mask, expanded to [N*k, T, 1]
+                # 'visible' shape is [N, T, 1]
+                cql_visible_mask = visible.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(
+                    batch_size * cql_n_samples, seq_len, 1
+                )
+
+                cql_policy_actions_persistent = _persist_actions(cql_policy_actions, cql_visible_mask)
+                cql_uniform_actions_persistent = _persist_actions(cql_uniform_actions, cql_visible_mask)
+            else:
+                cql_policy_actions_persistent = cql_policy_actions
+                cql_uniform_actions_persistent = cql_uniform_actions
+
             # --- Get Q-values for all sampled actions ---
-            cql_q1_policy, _ = self.critic_net1(cql_obs, cql_policy_actions, padding_mask=padding_mask, train_mask=train_mask)
-            cql_q2_policy, _ = self.critic_net2(cql_obs, cql_policy_actions, padding_mask=padding_mask, train_mask=train_mask)
-            cql_q1_uniform, _ = self.critic_net1(cql_obs, cql_uniform_actions, padding_mask=padding_mask, train_mask=train_mask)
-            cql_q2_uniform, _ = self.critic_net2(cql_obs, cql_uniform_actions, padding_mask=padding_mask, train_mask=train_mask)
+            cql_q1_policy, _ = self.critic_net1(cql_obs, cql_policy_actions_persistent, padding_mask=cql_padding_mask,
+                                                train_mask=cql_train_mask)
+            cql_q2_policy, _ = self.critic_net2(cql_obs, cql_policy_actions_persistent, padding_mask=cql_padding_mask,
+                                                train_mask=cql_train_mask)
+            cql_q1_uniform, _ = self.critic_net1(cql_obs, cql_uniform_actions_persistent, padding_mask=cql_padding_mask,
+                                                 train_mask=cql_train_mask)
+            cql_q2_uniform, _ = self.critic_net2(cql_obs, cql_uniform_actions_persistent, padding_mask=cql_padding_mask,
+                                                 train_mask=cql_train_mask)
 
             # --- Apply log-prob correction (log Q - log pi) ---
             cql_q1_policy = cql_q1_policy - cql_policy_log_probs
             cql_q2_policy = cql_q2_policy - cql_policy_log_probs
+
+            # We need to broadcast the scalar log_prob to the tensor shape [N*k, T, 1]
             cql_q1_uniform = cql_q1_uniform - cql_uniform_log_probs
             cql_q2_uniform = cql_q2_uniform - cql_uniform_log_probs
 
@@ -1048,23 +1068,61 @@ class RecurrentCQLSAC(_RecurrentBase):
             logsumexp_q1 = torch.logsumexp(cql_q1_cat, dim=-1, keepdim=True)
             logsumexp_q2 = torch.logsumexp(cql_q2_cat, dim=-1, keepdim=True)
 
-            # Final CQL Loss
-            cql_loss1 = logsumexp_q1 - q1_pred
-            cql_loss2 = logsumexp_q2 - q2_pred
-            cql_loss = cql_loss1 + cql_loss2  # Shape [N, T, 1]
+            # --- 5. Combine Losses and Apply Visible/Next_Visible Mask ---
 
-            # --- 5. Combine Losses and Apply Mask ---
-            total_loss_unmasked = bellman_loss + self._cql_alpha * cql_loss
-
-            # Use train_mask (which is False for padding AND burn-in)
-            final_mask = train_mask.squeeze(-1)  # Shape (N, T)
-
-            # If the decoy_interval logic is active, also apply the 'visible' mask
             if self.decoy_interval == 0:
-                final_mask = final_mask & visible.squeeze(-1)
+                # --- N-Step Return Mode: Filter all loss components to [M, 1] ---
 
-            masked_loss = (total_loss_unmasked.squeeze(-1) * final_mask.float())
-            total_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
+                # Get selected Bellman terms (shape [M, 1]) and the mask (shape [N, T])
+                q1_pred_sel, q2_pred_sel, q_target_sel, valid_mask = self._filter_to_correct_visibles(
+                    q1_pred, q2_pred, r, next_v, dones, visible, next_visible, padding_mask, train_mask)
+
+                # Calculate Bellman loss on selected elements
+                bellman_loss = F.mse_loss(q1_pred_sel, q_target_sel, reduction='none') + \
+                               F.mse_loss(q2_pred_sel, q_target_sel, reduction='none')  # Shape [M, 1]
+
+                # --- Filter CQL components to match ---
+                # Use the mask returned by the filter function
+                valid_mask_expanded = valid_mask.unsqueeze(-1)  # Shape [N, T, 1]
+
+                # Select the logsumexp terms for the *same* M timesteps
+                logsumexp_q1_sel = logsumexp_q1[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
+                logsumexp_q2_sel = logsumexp_q2[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
+
+                # Calculate CQL loss on selected elements
+                cql_loss1 = logsumexp_q1_sel - q1_pred_sel
+                cql_loss2 = logsumexp_q2_sel - q2_pred_sel
+                cql_loss = cql_loss1 + cql_loss2  # Shape [M, 1]
+
+                # Combine losses
+                total_loss_unmasked = bellman_loss + self._cql_alpha * cql_loss  # Shape [M, 1]
+
+                # The loss is already filtered, just take the mean
+                total_loss = total_loss_unmasked.mean()
+
+            else:
+                # --- 1-Step Return Mode: Calculate on [N, T, 1] and mask at the end ---
+
+                # Calculate 1-step target for *all* timesteps
+                q_target = r + self._gamma * (1 - dones.float()) * next_v  # Shape [N, T, 1]
+
+                # Calculate Bellman loss for *all* timesteps
+                bellman_loss = F.mse_loss(q1_pred, q_target, reduction='none') + \
+                               F.mse_loss(q2_pred, q_target, reduction='none')  # Shape [N, T, 1]
+
+                # Calculate CQL Loss for *all* timesteps
+                cql_loss1 = logsumexp_q1 - q1_pred
+                cql_loss2 = logsumexp_q2 - q2_pred
+                cql_loss = cql_loss1 + cql_loss2  # Shape [N, T, 1]
+
+                # Combine losses
+                total_loss_unmasked = bellman_loss + self._cql_alpha * cql_loss  # Shape [N, T, 1]
+
+                # --- Apply Masking ---
+                # Use train_mask (which is False for padding AND burn-in)
+                final_mask = train_mask.squeeze(-1)  # Shape (N, T)
+                masked_loss = (total_loss_unmasked.squeeze(-1) * final_mask.float())
+                total_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
         self.critic_optim.zero_grad()
         if self.scaler:
@@ -1084,35 +1142,35 @@ class RecurrentCQLSAC(_RecurrentBase):
             std = log_std.exp()
             base_dist = Normal(action_mean, std)
 
-            """
-            I think this might be incorrect?
-            # Sample and get the log-probs
-            actions_pre_tanh = dist.rsample()
-            action_unit_preds = torch.tanh(actions_pre_tanh)
-            eps = 1e-6
-            log_probs = dist.log_prob(actions_pre_tanh) - torch.log(1 - action_unit_preds.pow(2) + eps)
-            """
+            # Sample x (pre-tanh) using the reparameterization trick
+            x_sampled = base_dist.rsample()
 
-            # 4. Calculate Negative Log-likelihood using unsquashed actions
-            action_clamped = torch.clamp(acts, 0.0 + self._eps, 30.0 - self._eps)
-            action_unsquashed = (action_clamped - self._loc) / self._scale
-            action_unsquashed = torch.atanh(action_unsquashed)
-            log_probs = base_dist.log_prob(action_unsquashed).sum(dim=-1)
-            policy_loss_unmasked = -log_probs
+            # Apply the tanh(a*x) squash
+            u_sampled = torch.tanh(x_sampled * self._tanh_scale)
 
-            # Get the Q-values
-            with torch.no_grad():
-                q1_values, _ = self.critic_net1(obs, acts, padding_mask=padding_mask)
-                q2_values, _ = self.critic_net2(obs, acts, padding_mask=padding_mask)
-                q_values = torch.min(q1_values, q2_values)
+            # If using decoy_interval == 0, persist actions over non-visible steps
+            if self.decoy_interval == 0:
+                u_sampled_persistent = _persist_actions(u_sampled, visible)
+            else:
+                u_sampled_persistent = u_sampled
 
-            policy_loss_unmasked = (self._entropy_alpha * policy_loss_unmasked - q_values)
+            # Calculate log_prob of the action u_sampled
+            log_jacob = torch.log(1 - u_sampled.pow(2) + self._eps) + self.log_a
+            log_pi_sampled = base_dist.log_prob(x_sampled) - log_jacob
+            log_pi_sampled = log_pi_sampled.sum(dim=-1, keepdim=True)
 
-            # --- Apply Mask ---
-            final_mask = train_mask.squeeze(-1)  # Shape (N, T)
+            # Get Q-values for these new actions
+            # We pass u_sampled (normalized action) to the critics, as they expect.
+            # We do *not* detach gradients here, as we need them to flow through Q into u_sampled
+            q1_values, _ = self.critic_net1(obs, u_sampled_persistent, padding_mask=padding_mask, train_mask=train_mask)
+            q2_values, _ = self.critic_net2(obs, u_sampled_persistent, padding_mask=padding_mask, train_mask=train_mask)
+            q_values = torch.min(q1_values, q2_values)
 
-            # If the decoy_interval logic is active, also apply the 'visible' mask
+            # Calculate SAC Actor Loss
+            # The loss is (alpha * log_prob) - Q_value
+            policy_loss_unmasked = (self._entropy_alpha * log_pi_sampled - q_values)
 
+            final_mask = train_mask.squeeze(-1)
             if self.decoy_interval == 0:
                 final_mask = final_mask & visible.squeeze(-1)
 
@@ -1136,3 +1194,37 @@ class RecurrentCQLSAC(_RecurrentBase):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
         for target_param, param in zip(self.target_critic_net2.parameters(), self.critic_net2.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+
+@torch.compile
+def _persist_actions(actions, visible_mask):
+    # We must clone to avoid modifying the original tensor
+    persisted_actions = actions.clone()
+
+    B, T, A_dim = persisted_actions.shape
+    device = persisted_actions.device
+
+    # 1. Create a tensor of indices [0, 1, 2, ..., T-1]
+    # Shape: [1, T, 1]
+    indices = torch.arange(T, device=device).view(1, T, 1)
+
+    # (Where not visible, set index to 0)
+    masked_indices = torch.where(
+        visible_mask,
+        indices,
+        0  # Set to 0 where not visible
+    )
+
+    # 3. Apply cummax to forward-fill the last valid index
+    # Shape: [B, T, 1]
+    filled_indices = torch.cummax(masked_indices, dim=1).values
+
+    # 4. Expand indices to match action dim and gather
+    # Shape: [B, T, A_dim]
+    filled_indices_expanded = filled_indices.expand(-1, -1, A_dim)
+
+    # Gather values from the actions
+    # This single operation replaces the entire loop
+    persisted_actions = torch.gather(persisted_actions, 1, filled_indices_expanded)
+
+    return persisted_actions
