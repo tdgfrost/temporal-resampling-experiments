@@ -9,7 +9,7 @@ import argparse
 import inquirer
 import os
 import shutil
-from simglucose.simulation.env import bg_in_range
+from simglucose.simulation.env import bg_in_range, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
 
 
@@ -137,6 +137,8 @@ class ReplayBufferEnv:
             'all_obs': [obs],
             'all_action': [],
             'all_reward': [],
+            'all_term': [],
+            'all_trunc': [],
             'all_done': [],
             'visible_state': [obs[0] == 0]
         }
@@ -169,7 +171,7 @@ class ReplayBufferEnv:
                     done = term or trunc
                     total_reward += reward
 
-                    self.update_episode_buffer(obs, real_action, reward, done, info, ep_buffer)
+                    self.update_episode_buffer(obs, real_action, reward, term, trunc, info, ep_buffer)
 
                     if done:
                         ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
@@ -222,12 +224,14 @@ class ReplayBufferEnv:
         self._device = device
 
     @staticmethod
-    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict,
+    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, term: bool, trunc: bool, info: dict,
                               ep_buffer: dict):
         ep_buffer['all_obs'] += [obs]
         ep_buffer['all_action'] += [action]
         ep_buffer['all_reward'] += [reward]
-        ep_buffer['all_done'] += [done]
+        ep_buffer['all_term'] += [term]
+        ep_buffer['all_trunc'] += [trunc]
+        ep_buffer['all_done'] += [term or trunc]
         ep_buffer['visible_state'] += [obs[1] == 0]
 
     def update_permanent_buffer(self, ep_buffer: dict):
@@ -275,6 +279,18 @@ class ReplayBufferEnv:
             for idx in range(agg_window, len(ep_buffer['all_done']), agg_window)
         ]
 
+        rewards = [
+            np.mean(ep_buffer['all_reward'][idx: idx + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_reward']), agg_window)
+        ]
+
+        """
+        # Calculate early terminations for the additional reward component
+        terms = [
+            np.any(ep_buffer['all_term'][idx: idx + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_term']), agg_window)
+        ]
+
         # Manually calculate reward
         bg_levels = np.array([
             np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[-3]
@@ -282,6 +298,8 @@ class ReplayBufferEnv:
         ]) * (600 - 10) + 10  # Scale back to real bg levels
 
         rewards = [bg_in_range([i]) * SAMPLE_TIME for i in bg_levels]
+        rewards[-1] += early_termination_reward(terms[-1])
+        """
 
         # if not dones[-1]:
         # rewards[-1] = ep_buffer['reward'][-1]
