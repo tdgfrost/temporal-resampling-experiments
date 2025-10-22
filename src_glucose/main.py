@@ -65,10 +65,10 @@ if __name__ == "__main__":
         agent = RecurrentPPO(env, env_creator_fn=env_creator_fn, gamma=GAMMA,
                              n_steps=1028,  # More data per update
                              entropy_coef=0.001,  # Too high = too unstable
-                             clip_range=0.2,  # Relax the clip range
+                             clip_range=0.1,  # Relax the clip range
                              batch_size=64,
                              gae_lambda=0.95,
-                             n_epochs=10,  # Fewer epochs
+                             n_epochs=20,  # Fewer epochs
                              hidden_dim=128,
                              seed=123,
                              learning_rate=1e-3,  # Standard learning rate
@@ -152,7 +152,9 @@ if __name__ == "__main__":
             if DECOY_INTERVAL == 1:
                 # n_train_epochs = int(n_train_epochs // 10)
                 n_train_epochs = 1
-                epoch_frac = 0.5
+                epoch_frac = 1.0
+            elif DECOY_INTERVAL == 2:
+                n_train_epochs = 200
 
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
