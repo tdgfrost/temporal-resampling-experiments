@@ -498,7 +498,7 @@ class _RecurrentBase(nn.Module):
                     # Soft update of target value network
                     self.sync_target_networks()
 
-                    pbar.update(dataset.batch_size)
+                    pbar.update(1)
                     pbar.set_postfix(epoch=epoch_str,
                                      policy_loss=f"{np.mean(loss_dict['policy_loss']):.5f}",
                                      critic_loss=f"{np.mean(loss_dict['critic_loss']):.5f}",

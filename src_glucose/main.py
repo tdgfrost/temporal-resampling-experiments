@@ -86,7 +86,7 @@ if __name__ == "__main__":
         base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 100_000
+        dataset_size = 500_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
             model = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
@@ -139,17 +139,20 @@ if __name__ == "__main__":
                                  gamma=GAMMA,
                                  decoy_interval=DECOY_INTERVAL,
                                  dropout_p=args.dropout_p,
-                                 value_lr=1e-3,
-                                 policy_lr=1e-3,
-                                 critic_lr=1e-3,
+                                 value_lr=1e-4,
+                                 policy_lr=1e-4,
+                                 critic_lr=1e-4,
                                  beta=args.beta,
                                  device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
 
             n_train_epochs = 500 if EXPECTILE == 0.5 else 50
+            epoch_frac = 1.0
             if DECOY_INTERVAL == 1:
-                n_train_epochs = int(n_train_epochs // 10)
+                # n_train_epochs = int(n_train_epochs // 10)
+                n_train_epochs = 1
+                epoch_frac = 0.5
 
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
@@ -157,7 +160,7 @@ if __name__ == "__main__":
                 n_epochs_per_eval=n_train_epochs,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
-                dataset_kwargs={'decoy_interval': DECOY_INTERVAL, 'batch_size': 32},
+                dataset_kwargs={'decoy_interval': DECOY_INTERVAL, 'batch_size': 32, 'epoch_fraction': epoch_frac},
             )
             for key in evaluators.keys():
                 logs[f'{key}_eval'].append(log_dict[key][0])

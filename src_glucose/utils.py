@@ -49,7 +49,7 @@ class ReplayBufferEnv:
         return iter(self.generate())
 
     def __len__(self):
-        return self.n_samples
+        return self.segments
 
     def set_generate_params(self, batch_size: int = None, decoy_interval: int = None):
         self.batch_size = batch_size if batch_size is not None else self.batch_size
@@ -327,7 +327,7 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         self.sequence_info = {i: [] for i in range(3)}
 
     def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None,
-                            max_sequence_length: int = None, burn_in_length: int = None):
+                            max_sequence_length: int = None, burn_in_length: int = None, epoch_fraction: float = 1.0):
         """
         Scans the buffer to identify all episodes and their lengths, preparing for sampling.
         """
@@ -335,6 +335,8 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
         self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
         self.max_sequence_length = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
         self.burn_in_length = burn_in_length if burn_in_length is not None else self.burn_in_length
+
+        assert 0.0 < epoch_fraction <= 1.0, "epoch_fraction must be in the range (0, 1]"
 
         # --- CORE LOGIC CHANGE: Identify episodes instead of fixed-length sequences ---
         dones_data = self.dones[self.decoy_interval]
@@ -393,7 +395,20 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
 
         # n_samples is now the number of sequences in the buffer
         self.n_samples = len(self.sequence_info[self.decoy_interval])
-        self.segments = self.n_samples // self.batch_size if self.n_samples > 0 else 0
+        # old code: self.segments = self.n_samples // self.batch_size if self.n_samples > 0 else 0
+        if self.n_samples == 0:
+            total_segments = 0
+            self.segments = 0
+        else:
+            total_segments = self.n_samples // self.batch_size
+            if total_segments == 0:
+                self.segments = 0
+            else:
+                # Calculate segments based on the fraction
+                self.segments = int(total_segments * epoch_fraction)
+                # Ensure we always have at least one segment if data is available
+                if self.segments == 0:
+                    self.segments = 1
 
         if self.segments == 0:
             print(f"Warning: Not enough episodes for sampling. "
