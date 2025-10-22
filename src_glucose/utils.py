@@ -194,7 +194,7 @@ class ReplayBufferEnv:
                 self.observations[i] += [np.zeros_like(self.observations[0][0])]
 
             # Normalise rewards from 0 to 1
-            min_r, max_r = min(total_rewards), 200  # max(total_rewards)
+            min_r, max_r = np.array(self.rewards[0]).mean(), 200 # min(total_rewards), 200  # max(total_rewards)
             for i in [0, 1, 2]:
                 rewards = np.array(self.rewards[i])
                 if max_r > min_r:
