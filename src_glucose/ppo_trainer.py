@@ -124,12 +124,12 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
 
     def sample(self) -> torch.Tensor:
         self.gaussian_actions = self.distribution.rsample()  # pre-tanh
-        u = torch.tanh(self.gaussian_actions * 0.1 - 3)  # in [-1,1]
+        u = torch.tanh(self.gaussian_actions)  # in [-1,1]
         return self.scale * u + self.bias
 
     def mode(self) -> torch.Tensor:
         self.gaussian_actions = self.distribution.mean
-        u = torch.tanh(self.gaussian_actions * 0.1 - 3)
+        u = torch.tanh(self.gaussian_actions)
         return self.scale * u + self.bias
 
     def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
@@ -143,8 +143,6 @@ class CustomSquashedNormal(SquashedDiagGaussianDistribution):
             # compute them from the actions using the inverse-tanh (atanh).
             # atanh(x) = 0.5 * log((1+x)/(1-x))
             gaussian_actions = 0.5 * torch.log((1 + u) / ((1 - u) + 1e-6))
-            # reverse the tanh scaling
-            gaussian_actions = (gaussian_actions + 3) / 0.1
 
         log_prob = self.distribution.log_prob(gaussian_actions)
         log_prob = sum_independent_dims(log_prob)
@@ -176,7 +174,7 @@ class EncoderActorCriticLSTM(nn.Module):
         self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
-        self.dist = CustomSquashedNormal(action_dim * 2, low=action_space.low.item(), high=action_space.high.item())
+        self.dist = CustomSquashedNormal(action_dim * 2)#, low=action_space.low.item(), high=action_space.high.item())
 
     @torch.compile
     def forward(self, x, hidden_state=None, deterministic=False):
@@ -259,6 +257,7 @@ class RecurrentPPO:
 
         self._num_timesteps = 0
         self.best_mean_reward = -np.inf
+        self.mean_ep_length = 0.0
 
         # Create log directory if it doesn't exist
         if self.log_dir:
@@ -290,6 +289,7 @@ class RecurrentPPO:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'num_timesteps': self._num_timesteps,
             'best_mean_reward': self.best_mean_reward,
+            'mean_ep_length': self.mean_ep_length,
         }
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
@@ -310,8 +310,9 @@ class RecurrentPPO:
         new_agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         new_agent._num_timesteps = checkpoint.get('num_timesteps', 0)
         new_agent.best_mean_reward = checkpoint.get('best_mean_reward', -np.inf)
+        new_agent.mean_ep_length = checkpoint.get('mean_ep_length', 0.0)
         print(
-            f"Checkpoint loaded from {path}. Resuming at timestep {new_agent._num_timesteps} with best reward {new_agent.best_mean_reward:.2f}.")
+            f"Checkpoint loaded from {path}. Resuming at timestep {new_agent._num_timesteps} with best reward {new_agent.best_mean_reward:.2f} and mean length {new_agent.mean_ep_length:.2f}.")
 
         return new_agent
 
@@ -365,7 +366,9 @@ class RecurrentPPO:
         n_eval_episodes = n_eval_episodes or self.eval_episodes
         eval_env = SyncVectorEnv([lambda: self.env_creator_fn() for _ in range(n_eval_envs)])
         all_episode_rewards = []
+        all_episode_steps = []
         episode_rewards = np.zeros(n_eval_envs)
+        episode_steps = np.zeros(n_eval_envs)
 
         # Seed each parallel environment with a unique, deterministic seed
         if self.seed is not None:
@@ -383,14 +386,18 @@ class RecurrentPPO:
             obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
             dones = term | trunc
             episode_rewards += reward
+            episode_steps += 1
             for i, done in enumerate(dones):
                 if done:
                     all_episode_rewards.append(episode_rewards[i])
+                    all_episode_steps.append(episode_steps[i])
                     episode_rewards[i] = 0
+                    episode_steps[i] = 0
                     hidden_state[0][:, i, :] = 0
                     hidden_state[1][:, i, :] = 0
         eval_env.close()
-        return np.mean(all_episode_rewards[:n_eval_episodes])
+        return (np.mean(all_episode_rewards[:n_eval_episodes]),
+                {'ep_length': np.mean(all_episode_steps[:n_eval_episodes])})
 
     def fit(self, total_timesteps):
         if self.seed is not None:
@@ -524,17 +531,18 @@ class RecurrentPPO:
                 f"Timestep: {self._num_timesteps}/{target_timesteps} | Mean Ep. Length {mean_ep_length:.2f} | Mean Reward: {mean_reward:.2f} | Entropy: {np.mean(entropy_losses):.3f} | Value Loss: {np.mean(value_losses):.3f} | Policy Loss: {np.mean(policy_losses):.3f} | Approx. KL {np.mean(approx_kls):.5f}")
 
             if self._num_timesteps >= next_eval:
-                avg_eval_reward = self._evaluate_policy()
+                avg_eval_reward, info = self._evaluate_policy()
                 print(f"--- EVALUATION at Timestep: {self._num_timesteps}/{target_timesteps} ---")
-                print(f"Average deterministic reward: {avg_eval_reward:.2f} | Best reward: {self.best_mean_reward:.2f}")
+                print(f"Average deterministic reward: {avg_eval_reward:.2f} | Best reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
 
                 if avg_eval_reward > self.best_mean_reward:
                     self.best_mean_reward = avg_eval_reward
+                    self.mean_ep_length = info['ep_length']
                     if self.log_dir:
                         save_path = os.path.join(self.log_dir,
                                                  f"best_model{model_save_num:02d}_{avg_eval_reward:.2f}.pth")
                         self.save_checkpoint(save_path)
-                        print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} ***\n")
+                        print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} and episode length {self.mean_ep_length:.2f} ***\n")
                         model_save_num += 1
 
                 next_eval += self.eval_freq
