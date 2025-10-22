@@ -98,12 +98,9 @@ if __name__ == "__main__":
             replay_buffer_env.load('./replay_buffer')
 
         dataset_rew_avg, dataset_rew_std = replay_buffer_env.dataset_avg, replay_buffer_env.dataset_std
-        dataset_rew_min, dataset_rew_max = replay_buffer_env.min_rewards_scale, replay_buffer_env.max_rewards_scale
-        dataset_rew_diff = dataset_rew_max - dataset_rew_min
-        dataset_rew_avg_raw = dataset_rew_avg * dataset_rew_diff + dataset_rew_min
         mean_ep_duration = np.array(replay_buffer_env.observations[0]).shape[0] / sum(replay_buffer_env.dones[0])
         print(f"\n=================\nBaseline reward of the dataset: "
-              f"{dataset_rew_avg:.2f} ({dataset_rew_avg_raw:.2f}) "
+              f"{dataset_rew_avg:.2f}"
               f"+/- {dataset_rew_std:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
         # Get our evaluators
@@ -117,8 +114,6 @@ if __name__ == "__main__":
                                                                     no_interim_rewards=True,
                                                                     use_test_ids=True),
                                                    n_trials=50,
-                                                   min_scale_rewards=replay_buffer_env.min_rewards_scale,
-                                                   max_scale_rewards=replay_buffer_env.max_rewards_scale,
                                                    )
 
         if DECOY_INTERVAL == 2:
@@ -128,8 +123,6 @@ if __name__ == "__main__":
                                                                                                use_test_ids=True),
                                                                               n_trials=50,
                                                                               running_average_obs=True,
-                                                                              min_scale_rewards=replay_buffer_env.min_rewards_scale,
-                                                                              max_scale_rewards=replay_buffer_env.max_rewards_scale,
                                                                               )
 
         for n_trial in range(10):
