@@ -10,9 +10,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from torch.distributions import Normal, TransformedDistribution, TanhTransform, AffineTransform
+from torch.distributions import Normal, Beta, TransformedDistribution, TanhTransform, AffineTransform
+from stable_baselines3.common.distributions import sum_independent_dims
 from tqdm import tqdm
 from gym_wrappers import TOTAL_SIZE
+from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
 
 
 LOG_STD_MIN = -20.0
@@ -142,6 +144,110 @@ class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.net(observations)
+
+
+class CustomBetaDistribution(nn.Module):
+    """
+    Beta distribution, scaled to an arbitrary range [low, high].
+
+    This distribution is naturally bounded, making it a good fit for
+    action spaces with hard constraints.
+
+    :param action_dim: Dimension of the action space.
+    :param low: The lower bound of the action space.
+    :param high: The upper bound of the action space.
+    """
+
+    def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
+        super().__init__()
+        self.action_dim = action_dim
+        self.scale = float(high - low)
+        self.bias = float(low)
+        self.epsilon = 1e-6
+        self.distribution = None
+        self.alpha = None
+        self.beta = None
+
+        # Pre-compute log_scale for log_prob calculation
+        self.log_scale = torch.tensor(self.scale).log()
+
+    def proba_distribution(self, params: torch.Tensor, _=None):
+        """
+        Creates the distribution from the actor network's output.
+
+        :param params: Raw output from the actor head (batch_size, action_dim * 2)
+        """
+        # Split the output into alpha and beta parameters
+        # We add 1.0 + softplus(x) to ensure alpha and beta are > 1,
+        # which makes the distribution more stable and uni-modal to start.
+        # F.softplus(x) = log(1 + exp(x))
+        alpha, beta = torch.chunk(params, 2, dim=-1)
+        self.alpha = F.softplus(alpha) + 1.0
+        self.beta = F.softplus(beta) + 1.0
+
+        # Create the underlying Beta distribution
+        self.distribution = Beta(self.alpha, self.beta)
+        return self
+
+    def entropy(self) -> torch.Tensor:
+        """
+        Get the entropy of the distribution.
+        Entropy of a scaled distribution H(aX + b) = H(X) + log|a|
+        """
+        # Get entropy from the base Beta distribution
+        entropy = self.distribution.entropy()
+
+        # Sum entropy across action dimensions
+        entropy = sum_independent_dims(entropy)
+
+        # Add the scaling factor's log-determinant
+        # (we add log_scale for each dimension)
+        entropy += self.log_scale * self.action_dim
+        return entropy
+
+    def sample(self) -> torch.Tensor:
+        """
+        Sample an action, using the reparameterization trick (rsample).
+        """
+        # Sample from Beta(alpha, beta) -> range [0, 1]
+        u = self.distribution.rsample()
+
+        # Scale and shift to [low, high]
+        return self.scale * u + self.bias
+
+    def mode(self) -> torch.Tensor:
+        """
+        Return the mode of the distribution (most likely action).
+        For Beta(a,b) with a,b > 1, mode is (a-1)/(a+b-2).
+        We use the mean as a stable approximation.
+        Mean is a / (a + b)
+        """
+        u = self.distribution.mean  # range [0, 1]
+
+        # Scale and shift to [low, high]
+        return self.scale * u + self.bias
+
+    def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Get the log-probability of taking a specific action.
+
+        :param actions: The actions taken (in range [low, high])
+        :param gaussian_actions: Ignored (kept for API compatibility)
+        """
+        # Un-scale the actions from [low, high] back to [0, 1]
+        u = (actions - self.bias) / self.scale
+
+        # Clamp actions to be slightly inside (0, 1) for numerical stability
+        u = torch.clamp(u, self.epsilon, 1.0 - self.epsilon)
+
+        # Get log-prob from the base Beta distribution
+        log_prob = self.distribution.log_prob(u)
+        log_prob = sum_independent_dims(log_prob)
+
+        # Account for the scaling transformation
+        # log_prob(action) = log_prob(u) - log(scale)
+        log_prob -= self.log_scale * self.action_dim
+        return log_prob
 
 
 class SharedRecurrentEncoder(nn.Module):
@@ -401,11 +507,10 @@ class _RecurrentBase(nn.Module):
         self._value_lr = value_lr
         self._actor_lr = actor_lr
         self._observation_shape = observation_shape
-        self._action_low = action_space.low[0]
-        self._action_high = 2.0 #action_space.high[0]
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
+        self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH)
         self._eps = 1e-5
         self._tanh_scale = 1.0
 
@@ -524,21 +629,12 @@ class _RecurrentBase(nn.Module):
         #    Input: (1, 1, hidden_size), Output: (1, 1, 2)
         params = self.policy_net(lstm_out, actions=None)
 
-        # Squeeze the sequence dimension
-        params = params.squeeze(1)  # params shape (1, 2)
-
-        mean, log_std = torch.chunk(params, 2, dim=-1)
-        # 2. Clamp log_std for numerical stability
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = log_std.exp()
-
-        base_dist = Normal(mean, std)
-        policy_dist = TransformedDistribution(base_dist, self._transforms)
+        dist = self.dist.proba_distribution(params)
 
         if deterministic:
-            action = torch.tanh(base_dist.mode * self._tanh_scale) * self._scale + self._loc
+            action = dist.mode()
         else:
-            action = policy_dist.rsample()
+            action = dist.sample()
 
         return action.squeeze(-1).cpu().numpy(), next_hidden_state
 
@@ -677,16 +773,6 @@ class RecurrentIQL(_RecurrentBase):
         self._tau_target = tau_target
         self._has_dropout = dropout_p > 0.0
         self._beta = beta
-        self._scale = torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
-        self._log_scale = self._scale.log()
-        self._loc = torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
-        self._tanh_scale = 0.2  # Scale before applying tanh
-        self._log_tanh_scale = torch.tensor(self._tanh_scale, device=self._device).log()
-        self._transforms = [
-            AffineTransform(loc=0.0, scale=self._tanh_scale, cache_size=1),
-            TanhTransform(cache_size=1),
-            AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)
-        ]
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
@@ -855,27 +941,15 @@ class RecurrentIQL(_RecurrentBase):
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
             params = self.policy_net(lstm_out, actions=None)
 
-            mean, log_std = torch.chunk(params, 2, dim=-1)
-            # 2. Clamp log_std for numerical stability
-            log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-            std = log_std.exp()
+            dist = self.dist.proba_distribution(params)
 
-            # 3. Create the Normal distribution using the policy's outputs
-            base_dist = Normal(mean, std)
+            # Calculate the log-probability of the expert actions `acts`
+            #    under the new Beta distribution.
+            #    The `dist.log_prob` method handles all transformations and scaling.
+            log_pi = dist.log_prob(acts)
 
-            # 4. Calculate Negative Log-likelihood using unsquashed actions
-            # - get the 'u' expert action in the [-1, 1] range
-            u_expert = (acts - self._loc) / self._scale
-            u_expert = torch.clamp(u_expert, -1 + self._eps, 1 - self._eps)
-            pre_tanh_action_expert = torch.atanh(u_expert) / self._tanh_scale
-            nll = -base_dist.log_prob(pre_tanh_action_expert).sum(dim=-1)
-
-            # Add the positive log-Jacobian term
-            log_det_jacobian = torch.sum(torch.log(torch.clamp(1 - u_expert ** 2, self._eps, 1.0)), dim=-1)
-            log_det_jacobian += u_expert.shape[-1] * self._log_tanh_scale
-            log_det_jacobian += u_expert.shape[-1] * self._log_scale
-
-            policy_loss_unmasked = nll - log_det_jacobian
+            # 2. The policy loss is the Negative Log-Likelihood (NLL)
+            policy_loss_unmasked = -log_pi
 
             # 5. Get the IQL weights
             weights = 1.0
@@ -923,16 +997,6 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._tau_target = tau_target
         self._cql_alpha = cql_alpha
         self._entropy_alpha = entropy_alpha
-        self._scale = 1.0  # torch.tensor((self._action_high - self._action_low) / 2.0, device=self._device)
-        self._log_scale = torch.tensor(self._scale, device=self._device).log()
-        self._loc = 1.0  # torch.tensor((self._action_high + self._action_low) / 2.0, device=self._device)
-        self._tanh_scale = 0.2  # Scale before applying tanh
-        self._log_tanh_scale = torch.tensor(self._tanh_scale, device=self._device).log()
-        self._transforms = [
-            AffineTransform(loc=0.0, scale=self._tanh_scale, cache_size=1),
-            TanhTransform(cache_size=1),
-            AffineTransform(loc=self._loc, scale=self._scale, cache_size=1)
-        ]
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
@@ -1001,14 +1065,10 @@ class RecurrentCQLSAC(_RecurrentBase):
             return tensor.view(batch_size, cql_n_samples, seq_len, 1).permute(0, 2, 1, 3).squeeze(-1)
 
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            # Inverse-map dataset actions to [-1, 1] range
-            u_acts = (acts - self._loc) / (self._scale + self._eps)
-            u_acts = torch.clamp(u_acts, -1.0 + self._eps, 1.0 - self._eps)
-
             # --- Get Q-values for actions in the dataset ---
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
-            q1_pred = self.critic_net1(lstm_out, actions=u_acts)
-            q2_pred = self.critic_net2(lstm_out, actions=u_acts)
+            q1_pred = self.critic_net1(lstm_out, actions=acts)
+            q2_pred = self.critic_net2(lstm_out, actions=acts)
 
             # --- Calculate Bellman Target Components ---
             with torch.no_grad():
@@ -1016,15 +1076,12 @@ class RecurrentCQLSAC(_RecurrentBase):
                 next_lstm_out, _ = self.shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
                 params = self.policy_net(next_lstm_out, actions=None)
 
-                mean, log_std = torch.chunk(params, 2, dim=-1)
-                # Clamp log_std for numerical stability
-                log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-                std = log_std.exp()
-                normal_dist = Normal(mean, std)
+                # Create the Beta distribution
+                dist = self.dist.proba_distribution(params)
 
                 # Sample next action using reparameterization trick
-                next_actions_pre_tanh = normal_dist.rsample()
-                next_actions = torch.tanh(next_actions_pre_tanh * self._tanh_scale)
+                # This action is already in the [low, high] range
+                next_actions = dist.sample()
 
                 # If using decoy_interval == 0, persist actions over non-visible steps
                 if self.decoy_interval == 0:
@@ -1032,10 +1089,10 @@ class RecurrentCQLSAC(_RecurrentBase):
                 else:
                     next_actions_persistent = next_actions
 
-                # Calculate log_prob, correcting for the tanh squash
-                log_jacobian = torch.log(1 - next_actions.pow(2) + self._eps) + self._log_tanh_scale
-                next_log_probs = normal_dist.log_prob(next_actions_pre_tanh) - log_jacobian
-                next_log_probs = next_log_probs.sum(dim=-1, keepdim=True)
+                # Calculate log_prob
+                # The dist.log_prob method handles all scaling and transformations.
+                # We unsqueeze to get shape [N, T, 1] as log_prob returns [N, T]
+                next_log_probs = dist.log_prob(next_actions).unsqueeze(-1)
 
                 # Get Q-values from *target* critic decoders and *target* shared encoder
                 next_lstm_out_target, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
@@ -1067,23 +1124,20 @@ class RecurrentCQLSAC(_RecurrentBase):
             with torch.no_grad():
                 params = self.policy_net(cql_lstm_out_policy, actions=None)
 
-                mean, log_std = torch.chunk(params, 2, dim=-1)
-                # 2. Clamp log_std for numerical stability
-                log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-                std = log_std.exp()
-                normal_dist = Normal(mean, std)
+                # Create the Beta distribution
+                dist = self.dist.proba_distribution(params)
 
-                actions_pre_tanh = normal_dist.rsample()
-                cql_policy_actions = torch.tanh(actions_pre_tanh * self._tanh_scale)
+                # Sample actions (already in [low, high] range)
+                cql_policy_actions = dist.sample()
 
                 # Calculate log prob
-                cql_log_jacobian = torch.log(1 - cql_policy_actions.pow(2) + self._eps) + self._log_tanh_scale
-                cql_policy_log_probs = normal_dist.log_prob(actions_pre_tanh) - cql_log_jacobian
-                cql_policy_log_probs = cql_policy_log_probs.sum(dim=-1, keepdim=True)
+                cql_policy_log_probs = dist.log_prob(cql_policy_actions).unsqueeze(-1)
 
-            cql_uniform_actions = torch.empty(
-                batch_size * cql_n_samples, seq_len, 1, device=obs.device
-            ).uniform_(-1.0, 1.0)
+            # Get the [low, high] bounds from the distribution instance
+            low = self.dist.bias
+            high = self.dist.bias + self.dist.scale
+
+            cql_uniform_actions = torch.empty(batch_size * cql_n_samples, seq_len, 1, device=obs.device).uniform_(low, high)
             cql_uniform_log_probs = -torch.log(torch.tensor(2.0, device=obs.device))
 
             # If using decoy_interval == 0, persist actions over non-visible steps
@@ -1195,34 +1249,29 @@ class RecurrentCQLSAC(_RecurrentBase):
             # 1. Get policy params (action-independent)
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
             params = self.policy_net(lstm_out, actions=None)
-            action_mean, log_std = torch.chunk(params, 2, dim=-1)
 
-            # Convert to Normal distribution
-            std = log_std.exp()
-            base_dist = Normal(action_mean, std)
+            # Create the Beta distribution
+            dist = self.dist.proba_distribution(params)
 
-            # Sample x (pre-tanh) using the reparameterization trick
-            x_sampled = base_dist.rsample()
-
-            # Apply the tanh(a*x) squash
-            u_sampled = torch.tanh(x_sampled * self._tanh_scale)
+            # Sample an action (rsample) in [low, high] range
+            # This is the new 'actions_sampled'
+            actions_sampled = dist.sample()
 
             # If using decoy_interval == 0, persist actions over non-visible steps
             if self.decoy_interval == 0:
-                u_sampled_persistent = _persist_actions(u_sampled, visible)
+                actions_sampled_persistent = _persist_actions(actions_sampled, visible)
             else:
-                u_sampled_persistent = u_sampled
+                actions_sampled_persistent = actions_sampled
 
-            # Calculate log_prob of the action u_sampled
-            log_jacob = torch.log(1 - u_sampled.pow(2) + self._eps) + self._log_tanh_scale
-            log_pi_sampled = base_dist.log_prob(x_sampled) - log_jacob
-            log_pi_sampled = log_pi_sampled.sum(dim=-1, keepdim=True)
+            # Calculate log_prob of the sampled action
+            # dist.log_prob() returns [N, T], so unsqueeze to [N, T, 1]
+            log_pi_sampled = dist.log_prob(actions_sampled).unsqueeze(-1)
 
             # Get Q-values for these new actions
             # We pass u_sampled (normalized action) to the critics, as they expect.
             # We do *not* detach gradients here, as we need them to flow through Q into u_sampled
-            q1_values = self.critic_net1(lstm_out, actions=u_sampled_persistent)
-            q2_values = self.critic_net2(lstm_out, actions=u_sampled_persistent)
+            q1_values = self.critic_net1(lstm_out, actions=actions_sampled_persistent)
+            q2_values = self.critic_net2(lstm_out, actions=actions_sampled_persistent)
             q_values = torch.min(q1_values, q2_values)
 
             # Calculate SAC Actor Loss
