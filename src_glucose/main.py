@@ -59,14 +59,14 @@ if __name__ == "__main__":
         # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
         agent = RecurrentPPO(env, env_creator_fn=env_creator_fn, gamma=GAMMA,
                              n_steps=1028,  # More data per update
-                             entropy_coef=0.001,  # Too high = too unstable
-                             clip_range=0.1,  # Relax the clip range
+                             entropy_coef=0.01,  # Too high = too unstable
+                             clip_range=0.2,  # Relax the clip range
                              batch_size=64,
                              gae_lambda=0.95,
-                             n_epochs=20,  # Fewer epochs
+                             n_epochs=10,  # Fewer epochs
                              hidden_dim=128,
                              seed=123,
-                             learning_rate=1e-3,  # Standard learning rate
+                             learning_rate=3e-4,  # Standard learning rate
                              eval_freq=100_000,
                              eval_episodes=500)
         agent.fit(total_timesteps=10_000_000)
