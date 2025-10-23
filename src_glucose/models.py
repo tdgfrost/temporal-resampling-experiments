@@ -1073,6 +1073,13 @@ class RecurrentCQLSAC(_RecurrentBase):
             q1_pred = self.critic_net1(lstm_out, actions=acts)
             q2_pred = self.critic_net2(lstm_out, actions=acts)
 
+            with torch.no_grad():
+                # We detach lstm_out to prevent critic gradients from flowing through here to the policy
+                params_data = self.policy_net(lstm_out.detach(), actions=None)
+                dist_data = self.dist.proba_distribution(params_data)
+                # Get log_prob of the *dataset action* (acts) under the current policy
+                log_pi_data = dist_data.log_prob(acts).unsqueeze(-1)  # Shape [N, T, 1]
+
             # --- Calculate Bellman Target Components ---
             with torch.no_grad():
                 # Get policy params from *online* policy net and *online* encoder
@@ -1196,16 +1203,22 @@ class RecurrentCQLSAC(_RecurrentBase):
                 # Use the mask returned by the filter function
                 valid_mask_expanded = valid_mask.unsqueeze(-1)  # Shape [N, T, 1]
 
+                # Filter log_pi_data to match
+                log_pi_data_sel = log_pi_data[valid_mask_expanded].view(-1, 1)
+
                 # Select the logsumexp terms for the *same* M timesteps
                 logsumexp_q1_sel = logsumexp_q1[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
                 logsumexp_q2_sel = logsumexp_q2[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
 
                 # Calculate CQL loss on selected elements
-                cql_diff1 = logsumexp_q1_sel - q1_pred_sel
-                cql_diff2 = logsumexp_q2_sel - q2_pred_sel
+                cql_term1_data = q1_pred_sel - log_pi_data_sel
+                cql_term2_data = q2_pred_sel - log_pi_data_sel
 
-                cql_loss1 = F.relu(cql_diff1 - self._cql_target)
-                cql_loss2 = F.relu(cql_diff2 - self._cql_target)
+                cql_diff1 = logsumexp_q1_sel - cql_term1_data - self._cql_target
+                cql_diff2 = logsumexp_q2_sel - cql_term2_data - self._cql_target
+
+                cql_loss1 = F.relu(cql_diff1)
+                cql_loss2 = F.relu(cql_diff2)
                 cql_loss = cql_loss1 + cql_loss2  # Shape [M, 1]
 
                 # Combine losses
@@ -1233,8 +1246,11 @@ class RecurrentCQLSAC(_RecurrentBase):
                                F.mse_loss(q2_pred, q_target, reduction='none')  # Shape [N, T, 1]
 
                 # Calculate CQL Loss for *all* timesteps
-                cql_diff1 = logsumexp_q1 - q1_pred - self._cql_target
-                cql_diff2 = logsumexp_q2 - q2_pred - self._cql_target
+                cql_term1_data = q1_pred - log_pi_data  # Shape [N, T, 1]
+                cql_term2_data = q2_pred - log_pi_data  # Shape [N, T, 1]
+
+                cql_diff1 = logsumexp_q1 - cql_term1_data - self._cql_target
+                cql_diff2 = logsumexp_q2 - cql_term2_data - self._cql_target
 
                 cql_loss1 = F.relu(cql_diff1)
                 cql_loss2 = F.relu(cql_diff2)
