@@ -997,6 +997,8 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._tau_target = tau_target
         self._cql_alpha = cql_alpha
         self._entropy_alpha = entropy_alpha
+        self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
+                                                             device=self._device))
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
@@ -1138,7 +1140,6 @@ class RecurrentCQLSAC(_RecurrentBase):
             high = self.dist.bias + self.dist.scale
 
             cql_uniform_actions = torch.empty(batch_size * cql_n_samples, seq_len, 1, device=obs.device).uniform_(low, high)
-            cql_uniform_log_probs = -torch.log(torch.tensor(2.0, device=obs.device))
 
             # If using decoy_interval == 0, persist actions over non-visible steps
             if self.decoy_interval == 0:
@@ -1166,8 +1167,8 @@ class RecurrentCQLSAC(_RecurrentBase):
             cql_q2_policy = cql_q2_policy - cql_policy_log_probs
 
             # We need to broadcast the scalar log_prob to the tensor shape [N*k, T, 1]
-            cql_q1_uniform = cql_q1_uniform - cql_uniform_log_probs
-            cql_q2_uniform = cql_q2_uniform - cql_uniform_log_probs
+            cql_q1_uniform = cql_q1_uniform - self.cql_uniform_log_probs
+            cql_q2_uniform = cql_q2_uniform - self.cql_uniform_log_probs
 
             # Concatenate policy and uniform samples along the sample dimension
             cql_q1_cat = torch.cat([reshape_cql(cql_q1_policy), reshape_cql(cql_q1_uniform)], dim=-1)
