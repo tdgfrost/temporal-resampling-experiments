@@ -167,11 +167,13 @@ class CustomBetaDistribution(nn.Module):
         self.distribution = None
         self.alpha = None
         self.beta = None
+        self.logit_clamp_min = -5.0
+        self.logit_clamp_max = 5.0
 
         # Pre-compute log_scale for log_prob calculation
         self.log_scale = torch.tensor(self.scale).log()
 
-    def proba_distribution(self, params: torch.Tensor, _=None):
+    def proba_distribution(self, params: torch.Tensor):
         """
         Creates the distribution from the actor network's output.
 
@@ -183,10 +185,8 @@ class CustomBetaDistribution(nn.Module):
         # F.softplus(x) = log(1 + exp(x))
         alpha, beta = torch.chunk(params, 2, dim=-1)
 
-        LOGIT_CLAMP_MIN = -5.0  # Tunable hyperparameter
-        LOGIT_CLAMP_MAX = 5.0  # Tunable hyperparameter
-        alpha = torch.clamp(alpha, LOGIT_CLAMP_MIN, LOGIT_CLAMP_MAX)
-        beta = torch.clamp(beta, LOGIT_CLAMP_MIN, LOGIT_CLAMP_MAX)
+        alpha = torch.clamp(alpha, self.logit_clamp_min, self.logit_clamp_max)
+        beta = torch.clamp(beta, self.logit_clamp_min, self.logit_clamp_max)
 
         self.alpha = F.softplus(alpha) + 1.0
         self.beta = F.softplus(beta) + 1.0
@@ -202,9 +202,6 @@ class CustomBetaDistribution(nn.Module):
         """
         # Get entropy from the base Beta distribution
         entropy = self.distribution.entropy()
-
-        # Sum entropy across action dimensions
-        entropy = sum_independent_dims(entropy)
 
         # Add the scaling factor's log-determinant
         # (we add log_scale for each dimension)
@@ -249,7 +246,6 @@ class CustomBetaDistribution(nn.Module):
         log_prob = self.distribution.log_prob(u)
 
         # Account for the scaling transformation
-        # log_prob(action) = log_prob(u) - log(scale)
         log_prob -= self.log_scale * self.action_dim
         return log_prob
 

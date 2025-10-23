@@ -113,11 +113,15 @@ class CustomBetaDistribution(nn.Module):
         self.bias = float(low)
         self.epsilon = 1e-6
         self.distribution = None
+        self.alpha = None
+        self.beta = None
+        self.logit_clamp_min = -5.0
+        self.logit_clamp_max = 5.0
 
         # Pre-compute log_scale for log_prob calculation
         self.log_scale = torch.tensor(self.scale).log()
 
-    def proba_distribution(self, params: torch.Tensor, _=None):
+    def proba_distribution(self, params: torch.Tensor):
         """
         Creates the distribution from the actor network's output.
 
@@ -128,6 +132,10 @@ class CustomBetaDistribution(nn.Module):
         # which makes the distribution more stable and uni-modal to start.
         # F.softplus(x) = log(1 + exp(x))
         alpha, beta = torch.chunk(params, 2, dim=-1)
+
+        alpha = torch.clamp(alpha, self.logit_clamp_min, self.logit_clamp_max)
+        beta = torch.clamp(beta, self.logit_clamp_min, self.logit_clamp_max)
+
         self.alpha = F.softplus(alpha) + 1.0
         self.beta = F.softplus(beta) + 1.0
 
@@ -142,9 +150,6 @@ class CustomBetaDistribution(nn.Module):
         """
         # Get entropy from the base Beta distribution
         entropy = self.distribution.entropy()
-
-        # Sum entropy across action dimensions
-        entropy = sum_independent_dims(entropy)
 
         # Add the scaling factor's log-determinant
         # (we add log_scale for each dimension)
@@ -173,12 +178,11 @@ class CustomBetaDistribution(nn.Module):
         # Scale and shift to [low, high]
         return self.scale * u + self.bias
 
-    def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         """
         Get the log-probability of taking a specific action.
 
         :param actions: The actions taken (in range [low, high])
-        :param gaussian_actions: Ignored (kept for API compatibility)
         """
         # Un-scale the actions from [low, high] back to [0, 1]
         u = (actions - self.bias) / self.scale
@@ -190,7 +194,6 @@ class CustomBetaDistribution(nn.Module):
         log_prob = self.distribution.log_prob(u)
 
         # Account for the scaling transformation
-        # log_prob(action) = log_prob(u) - log(scale)
         log_prob -= self.log_scale * self.action_dim
         return log_prob
 
@@ -200,7 +203,7 @@ class EncoderActorCriticLSTM(nn.Module):
     An Actor-Critic network that first encodes observations using a feature extractor
     and then processes the sequence of encoded features with an LSTM.
     """
-    def __init__(self, encoder: nn.Module, encoder_output_dim: int, hidden_dim: int, action_dim: int, action_space):
+    def __init__(self, encoder: nn.Module, encoder_output_dim: int, hidden_dim: int, action_dim: int):
         super(EncoderActorCriticLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
@@ -316,7 +319,6 @@ class RecurrentPPO:
             encoder_output_dim=self.hidden_dim,
             hidden_dim=self.hidden_dim,
             action_dim=self.action_dim,
-            action_space=env.action_space
         )
         self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
 
@@ -551,7 +553,7 @@ class RecurrentPPO:
                     sorted_c_state = batch_c_state[:, sorted_idx, :]
                     new_dist, new_values, _ = self.ac_network(packed_obs, (sorted_h_state, sorted_c_state))
                     new_values = new_values.squeeze()
-                    new_log_probs = new_dist.log_prob(sorted_actions)
+                    new_log_probs = new_dist.log_prob(sorted_actions).sum(-1)
                     ratio = (new_log_probs - sorted_log_probs).exp()
                     surr1 = ratio * sorted_advantages
                     surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * sorted_advantages
