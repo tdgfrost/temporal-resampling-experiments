@@ -888,7 +888,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         super().__init__(*args, **kwargs)
         self._tau_target = tau_target
         self._target_entropy_alpha = -1
-        self._target_cql_alpha_gap = 10.0
+        self._target_cql_alpha_gap = 2.0
         # We learn the log of entropy/cql alpha for numerical stability
         self.log_entropy_alpha = torch.zeros(1, requires_grad=True, device=self._device)
         self.log_cql_alpha = torch.zeros(1, requires_grad=True, device=self._device)
