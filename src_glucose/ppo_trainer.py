@@ -188,7 +188,6 @@ class CustomBetaDistribution(nn.Module):
 
         # Get log-prob from the base Beta distribution
         log_prob = self.distribution.log_prob(u)
-        log_prob = sum_independent_dims(log_prob)
 
         # Account for the scaling transformation
         # log_prob(action) = log_prob(u) - log(scale)
@@ -345,9 +344,7 @@ class RecurrentPPO:
     @classmethod
     def load_checkpoint(cls, path, env, *args, **kwargs):
         """Loads the model and optimizer state."""
-        if not os.path.exists(path):
-            print(f"No checkpoint found at {path}. Starting from scratch.")
-            return
+        assert os.path.exists(path), f"No checkpoint found at {path}"
 
         # Get the class instance
         new_agent = cls(env, *args, **kwargs)
