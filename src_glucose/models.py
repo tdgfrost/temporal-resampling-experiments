@@ -642,7 +642,6 @@ class _RecurrentBase(nn.Module):
     def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
         N, T = visible.shape[:2]
-        dev = q1.device
         dtype = r.dtype
 
         # --- NEW: Apply the mask to sanitize inputs ---
@@ -986,7 +985,6 @@ class RecurrentIQL(_RecurrentBase):
 class RecurrentCQLSAC(_RecurrentBase):
     def __init__(
             self,
-            cql_alpha: float = 1.0,
             tau_target: float = 0.005,
             entropy_alpha: float = 0.2,
             dropout_p: float = 0.0,
@@ -995,7 +993,9 @@ class RecurrentCQLSAC(_RecurrentBase):
     ):
         super().__init__(*args, **kwargs)
         self._tau_target = tau_target
-        self._cql_alpha = cql_alpha
+        self._cql_target = 5.0
+        # We learn the log of alpha for numerical stability
+        self.log_cql_alpha = torch.zeros(1, requires_grad=True, device=self._device)
         self._entropy_alpha = entropy_alpha
         self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
                                                              device=self._device))
@@ -1034,6 +1034,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         self.target_critic_net1 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
         self.target_critic_net2 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
         self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
+        self.cql_alpha_optim = torch.optim.AdamW([self.log_cql_alpha], lr=self._critic_lr)
 
         # --- Setup Optimizers ---
         shared_params = list(self.shared_encoder.parameters())
@@ -1200,12 +1201,23 @@ class RecurrentCQLSAC(_RecurrentBase):
                 logsumexp_q2_sel = logsumexp_q2[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
 
                 # Calculate CQL loss on selected elements
-                cql_loss1 = logsumexp_q1_sel - q1_pred_sel
-                cql_loss2 = logsumexp_q2_sel - q2_pred_sel
+                cql_diff1 = logsumexp_q1_sel - q1_pred_sel
+                cql_diff2 = logsumexp_q2_sel - q2_pred_sel
+
+                cql_loss1 = F.relu(cql_diff1 - self._cql_target)
+                cql_loss2 = F.relu(cql_diff2 - self._cql_target)
                 cql_loss = cql_loss1 + cql_loss2  # Shape [M, 1]
 
                 # Combine losses
-                total_loss_unmasked = bellman_loss + self._cql_alpha * cql_loss  # Shape [M, 1]
+                cql_alpha = self.log_cql_alpha.exp().detach()
+                total_loss_unmasked = bellman_loss + cql_alpha * cql_loss  # Shape [M, 1]
+
+                # --- NEW: Calculate and update log_cql_alpha ---
+                # The loss for alpha is the negative of the *mean* raw difference,
+                # weighted by the (non-detached) alpha.
+                # We want to increase alpha if (cql_diff - target) > 0
+                cql_diff_mean = (cql_diff1.mean() + cql_diff2.mean()) * 0.5
+                alpha_loss = -torch.exp(self.log_cql_alpha) * (cql_diff_mean - self._cql_target).detach()
 
                 # The loss is already filtered, just take the mean
                 total_loss = total_loss_unmasked.mean()
@@ -1221,23 +1233,44 @@ class RecurrentCQLSAC(_RecurrentBase):
                                F.mse_loss(q2_pred, q_target, reduction='none')  # Shape [N, T, 1]
 
                 # Calculate CQL Loss for *all* timesteps
-                cql_loss1 = logsumexp_q1 - q1_pred
-                cql_loss2 = logsumexp_q2 - q2_pred
+                cql_diff1 = logsumexp_q1 - q1_pred - self._cql_target
+                cql_diff2 = logsumexp_q2 - q2_pred - self._cql_target
+
+                cql_loss1 = F.relu(cql_diff1)
+                cql_loss2 = F.relu(cql_diff2)
                 cql_loss = cql_loss1 + cql_loss2  # Shape [N, T, 1]
 
                 # Combine losses
-                total_loss_unmasked = bellman_loss + self._cql_alpha * cql_loss  # Shape [N, T, 1]
+                cql_alpha = self.log_cql_alpha.exp().detach()
+                total_loss_unmasked = bellman_loss + cql_alpha * cql_loss  # Shape [N, T, 1]
 
                 # --- Apply Masking ---
                 # Use train_mask (which is False for padding AND burn-in)
-                final_mask = train_mask.squeeze(-1)  # Shape (N, T)
-                masked_loss = (total_loss_unmasked.squeeze(-1) * final_mask.float())
-                total_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
+                final_mask = train_mask.squeeze(-1).float()  # Shape (N, T)
+                valid_count = final_mask.sum() + self._eps
+                masked_loss = (total_loss_unmasked.squeeze(-1) * final_mask)
+                total_loss = masked_loss.sum() / valid_count
 
+                # do the same for the alpha loss
+                masked_cql_diff1 = (cql_diff1.squeeze(-1) * final_mask)
+                masked_cql_diff2 = (cql_diff2.squeeze(-1) * final_mask)
+                # Calculate the masked mean of the diffs
+                cql_diff1_mean = masked_cql_diff1.sum() / valid_count
+                cql_diff2_mean = masked_cql_diff2.sum() / valid_count
+                cql_diff_mean = (cql_diff1_mean + cql_diff2_mean) * 0.5
+                alpha_loss = -torch.exp(self.log_cql_alpha) * cql_diff_mean.detach()
+
+        # Update critic and alpha
         self.critic_optim.zero_grad()
+        self.cql_alpha_optim.zero_grad()
         if self.scaler:
-            self.scaler.scale(total_loss).backward()
+            self.scaler.scale(total_loss + alpha_loss).backward()
+            self.scaler.unscale_(self.critic_optim)
+            self.scaler.unscale_(self.cql_alpha_optim)
+            torch.nn.utils.clip_grad_norm_(self.critic_net1.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.critic_net2.parameters(), 0.5)
             self.scaler.step(self.critic_optim)
+            self.scaler.step(self.cql_alpha_optim)
             self.scaler.update()
         else:
             total_loss.backward()
@@ -1289,6 +1322,8 @@ class RecurrentCQLSAC(_RecurrentBase):
         self.policy_optim.zero_grad()
         if self.scaler:
             self.scaler.scale(policy_loss).backward()
+            self.scaler.unscale_(self.policy_optim)
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.scaler.step(self.policy_optim)
             self.scaler.update()
         else:

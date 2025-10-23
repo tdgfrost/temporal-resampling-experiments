@@ -15,7 +15,6 @@ parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 
                     help='Type of offline RL model to train (iql or cql)')
 parser.add_argument('--ppo_agent', default="best_model01_38.70.pth", type=str, help='Path to pre-trained PPO agent')
 
-parser.add_argument('--alpha', default=1.0, type=float, help='Alpha parameter for CQL (1.0 is default)')
 parser.add_argument('--expectile', default=0.7, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
 parser.add_argument('--beta', default=3., type=float, help='Beta parameter for IQL agent')
