@@ -1,13 +1,11 @@
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces, ObservationWrapper
 from gymnasium.utils import RecordConstructorArgs
-from gymnasium.wrappers import NormalizeObservation, NormalizeReward
-from minigrid.wrappers import ImgObsWrapper, Wrapper
+from gymnasium.wrappers import NormalizeReward
+from minigrid.wrappers import Wrapper
 from gymnasium.envs.registration import register
-from datetime import datetime, timedelta
-from simglucose.simulation.scenario import CustomScenario
 
 SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 24  # 24 * 10 minutes = 240 minutes
@@ -99,6 +97,13 @@ class FixedScaler(ObservationWrapper):
         self.kwargs = kwargs
         ObservationWrapper.__init__(self, env)
 
+        low, high = env.observation_space.low, env.observation_space.high
+        self.state_dim = (low.shape[0],)
+        self.dtype = low.dtype
+        self.observation_space = spaces.Box(
+            low=low, high=10 * np.ones_like(high), shape=self.state_dim, dtype=self.dtype
+        )
+
     def observation(self, obs):
         # Max BG = 600, min BG = 10
         # Max insulin = 30, min insulin = 0
@@ -169,10 +174,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             return
 
         self.steps_until_action_available = self.next_waiting_period
-
-        # self.next_waiting_period = int(np.clip(np.rint(np.random.lognormal(1.0, 1.0)), 1, TOTAL_SIZE)) - 1
         self.next_waiting_period = int(np.clip(np.rint(np.random.normal(6.0, 1.5)), 1, TOTAL_SIZE)) - 1
-        # self.next_waiting_period = np.random.randint(0, TOTAL_SIZE)
 
     @staticmethod
     def _get_current_bg(obs):

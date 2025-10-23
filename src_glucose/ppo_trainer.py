@@ -7,7 +7,6 @@ import numpy as np
 import os
 from gymnasium.vector import SyncVectorEnv
 from torch.distributions import Beta
-from stable_baselines3.common.distributions import sum_independent_dims
 from functools import partial
 import random
 
@@ -45,7 +44,7 @@ def set_seed(seed: int):
     # os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
-class MiniGridEncoder(nn.Module):
+class FeatureEncoder(nn.Module):
     """
     A feature extractor that uses self-attention on the input features.
 
@@ -54,8 +53,6 @@ class MiniGridEncoder(nn.Module):
 
     :param input_dim: The input dimension.
     :param hidden_dim: The final output dimension of the extractor.
-    :param embed_dim: The dimension to embed each input feature into.
-    :param num_heads: The number of attention heads. Must be a divisor of embed_dim.
     """
 
     def __init__(
@@ -261,7 +258,7 @@ class EncoderActorCriticLSTM(nn.Module):
         return dist, value, new_hidden
 
     def init_hidden_state(self, batch_size=1):
-        return (torch.zeros(1, batch_size, self.hidden_dim), torch.zeros(1, batch_size, self.hidden_dim))
+        return torch.zeros(1, batch_size, self.hidden_dim), torch.zeros(1, batch_size, self.hidden_dim)
 
 
 class RecurrentPPO:
@@ -308,7 +305,7 @@ class RecurrentPPO:
         if self.log_dir:
             os.makedirs(self.log_dir, exist_ok=True)
 
-        self.encoder = MiniGridEncoder(input_dim=self.input_dim, hidden_dim=self.hidden_dim)
+        self.encoder = FeatureEncoder(input_dim=self.input_dim, hidden_dim=self.hidden_dim)
         self.ac_network = EncoderActorCriticLSTM(
             encoder=self.encoder,
             encoder_output_dim=self.hidden_dim,
@@ -388,10 +385,12 @@ class RecurrentPPO:
         n_steps = len(rewards)
         advantages = np.zeros(n_steps, dtype=np.float32)
         last_advantage = 0
+
         with torch.no_grad():
             last_obs_tensor = torch.FloatTensor(self.last_obs).unsqueeze(0)
             _, last_value, _ = self.ac_network(last_obs_tensor, self.last_hidden_state)
-            last_value = last_value.item()
+
+        last_value = last_value.item()
 
         for t in reversed(range(n_steps)):
             mask = 1.0 - dones[t]
@@ -595,94 +594,3 @@ class RecurrentPPO:
 
         self.env.close()
 
-
-class ContinuousSemiMDPWrapper(gym.Wrapper):
-    def __init__(self, env, gamma):
-        super().__init__(env)
-        self._gamma = gamma
-        self.observation_space = gym.spaces.Box(
-            low=env.observation_space.low[np.newaxis],
-            high=env.observation_space.high[np.newaxis],
-            shape=(1,) + env.observation_space.shape,
-            dtype=env.observation_space.dtype
-        )
-
-    def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
-        return np.expand_dims(obs, 0), info
-
-    def step(self, action):
-        steps_to_take = np.random.randint(1, 4)
-        obs_lst, total_reward, actual_steps_taken = [], 0, 0
-        term, trunc = False, False
-        for i in range(steps_to_take):
-            obs, reward, term, trunc, info = self.env.step(action)
-            done = term or trunc
-            obs_lst.append(obs)
-            total_reward += (self._gamma ** i) * reward
-            actual_steps_taken += 1
-            if done:
-                break
-        info['steps_taken'] = actual_steps_taken
-        return np.stack(obs_lst), total_reward, term, trunc, info
-
-
-if __name__ == '__main__':
-    env_name = 'Pendulum-v1'
-    GAMMA = 0.9
-    LOG_DIR = "../logs_glucose/ppo_logs"
-
-    # --- Control training and loading ---
-    DO_TRAINING = True
-    LOAD_CHECKPOINT = False
-    CHECKPOINT_TO_LOAD = os.path.join(LOG_DIR, "best_model.pth")
-    DO_TESTING = True
-
-    if DO_TRAINING:
-        print("--- STARTING TRAINING ---")
-        base_env = gym.make(env_name, max_episode_steps=200)
-        env = ContinuousSemiMDPWrapper(base_env, gamma=GAMMA)
-
-        agent = RecurrentPPO(env, env_name=env_name, gamma=GAMMA,
-                             n_steps=2048,
-                             entropy_coef=0.01,
-                             clip_range=0.2,
-                             batch_size=64,
-                             gae_lambda=0.95,
-                             n_epochs=10,
-                             learning_rate=1e-3,
-                             eval_freq=100_000,
-                             log_dir=LOG_DIR)
-
-        if LOAD_CHECKPOINT:
-            agent.load_checkpoint(CHECKPOINT_TO_LOAD)
-
-        agent.fit(total_timesteps=2_000_000)
-
-    if DO_TESTING:
-        print("\n--- TESTING TRAINED AGENT ---")
-        # Create a dummy env to initialize the agent
-        test_env_for_agent = ContinuousSemiMDPWrapper(gym.make(env_name, max_episode_steps=200), gamma=GAMMA)
-        trained_agent = RecurrentPPO(test_env_for_agent, env_name=env_name, gamma=GAMMA, log_dir=LOG_DIR)
-        model_path = os.path.join(LOG_DIR, "best_model.pth")
-        trained_agent.load_checkpoint(model_path)
-        test_env_for_agent.close()
-
-        # Create the actual environment for testing with rendering
-        test_env = ContinuousSemiMDPWrapper(gym.make(env_name, max_episode_steps=200, render_mode='human'), gamma=GAMMA)
-        obs, _ = test_env.reset()
-        hidden_state = trained_agent.ac_network.init_hidden_state()
-
-        total_reward = 0
-        terminated, truncated = False, False
-
-        for _ in range(200):  # Run for one episode
-            action, hidden_state = trained_agent.predict(obs, hidden_state, deterministic=True)
-            obs, reward, terminated, truncated, _ = test_env.step(action)
-            done = terminated or truncated
-            total_reward += reward
-            if done:
-                break
-
-        print(f"Total reward during test: {total_reward}")
-        test_env.close()

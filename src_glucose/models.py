@@ -2,81 +2,48 @@ from collections import deque
 from contextlib import nullcontext
 from typing import Tuple, Dict, Optional
 
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
-from gymnasium import spaces
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from torch.distributions import Normal, Beta, TransformedDistribution, TanhTransform, AffineTransform
-from stable_baselines3.common.distributions import sum_independent_dims
+from torch.distributions import Beta
 from tqdm import tqdm
 from gym_wrappers import TOTAL_SIZE
 from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
 
 
-LOG_STD_MIN = -20.0
-LOG_STD_MAX = 2.0
-
-
-class MiniGridEncoder(nn.Module):
+class FeatureEncoder(nn.Module):
     """
     A feature extractor that uses self-attention on the input features.
 
     This network treats the input features as a sequence and uses a
     Multi-Head Attention block to learn the relationships between them.
 
-    :param observation_shape: The shape of the input observation.
+    :param input_dim: The input dimension.
     :param hidden_dim: The final output dimension of the extractor.
-    :param embed_dim: The dimension to embed each input feature into.
-    :param num_heads: The number of attention heads. Must be a divisor of embed_dim.
     """
 
     def __init__(
             self,
-            observation_shape,
+            input_dim,
             hidden_dim: int = 128,
-            embed_dim: int = 64,
-            num_heads: int = 4,
+            *args,
+            **kwargs
     ):
         super().__init__()
 
-        # Ensure that embed_dim is divisible by num_heads
-        if embed_dim % num_heads != 0:
-            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
-
-        num_inputs = observation_shape[0]  # Should be 6
-
-        # 1. Input Embedding Layer
-        # This layer projects each of the 6 input features into a richer,
-        # higher-dimensional space (the embed_dim).
-        self.embed_layer = nn.Linear(num_inputs, embed_dim)
-
-        # We will treat the 6 embedded features as a sequence of length 6
-
-        # 2. Multi-Head Self-Attention Layer
-        # This layer allows the 6 embedded features to interact and weigh their
-        # importance relative to each other.
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-        # 3. Final Feed-Forward Network (MLP)
-        # This processes the context-aware output from the attention layer
-        # to produce the final feature vector.
         self.fc = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
         )
-
-        # Use your original weight initialization method
         self.init_weights()
 
     def init_weights(self):
         """Initializes weights for the network."""
-
         def _init_fn(m: nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
@@ -91,59 +58,8 @@ class MiniGridEncoder(nn.Module):
         self.apply(_init_fn)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Assuming x has shape (batch_size, 6)
-
-        # 1. Embed the input
-        # Input: (batch, 6) -> Output: (batch, embed_dim)
-        embedded = self.embed_layer(x)
-
-        # 2. Prepare for attention by creating a "sequence" of length 1
-        # The attention layer expects a sequence. We can treat our single
-        # embedded vector as a sequence with one item.
-        # Shape: (batch, 1, embed_dim)
-        seq = embedded.unsqueeze(1)
-
-        # 3. Apply self-attention
-        # Query, Key, and Value are all the same for self-attention.
-        # attn_output shape: (batch, 1, embed_dim)
-        attn_output, _ = self.attention(query=seq, key=seq, value=seq)
-
-        # 4. Remove the sequence dimension
-        # Shape: (batch, embed_dim)
-        processed_features = attn_output.squeeze(1)
-
-        # 5. Pass through the final MLP
-        # Shape: (batch, hidden_dim)
-        return self.fc(processed_features)
-
-
-class PPOMiniGridEncoder(MiniGridEncoder):
-    def __init__(self, observation_shape: Tuple[int,], hidden_dim: int = 128,
-                 *args, **kwargs) -> None:
-        # Ignore all zeros at the start
-        self.shrink_obs = lambda x: x
-        super().__init__(observation_shape, hidden_dim)
-
-
-class OfflineMiniGridEncoder(MiniGridEncoder):
-    def __init__(self, observation_shape: Tuple[int,], hidden_dim: int = 128,
-                 input_scaling: bool = True, *args, **kwargs) -> None:
-        # additionally ignore flag channel at the start
-        self.shrink_obs = lambda x: x # x[:, 1:]
-        # new_obs_shape = (observation_shape[0] - 1,)
-
-        # super().__init__(new_obs_shape, hidden_dim)
-        super().__init__(observation_shape, hidden_dim)
-
-
-class PPOMiniGridFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.Space,
-                 features_dim: int = 512) -> None:  # , normalized_image: bool = False) -> None:
-        super().__init__(observation_space, features_dim)
-        self.net = PPOMiniGridEncoder(observation_space.shape, hidden_dim=features_dim)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.net(observations)
+        # Assuming x has shape (batch_size, num_inputs)
+        return self.fc(x)
 
 
 class CustomBetaDistribution(nn.Module):
@@ -255,17 +171,16 @@ class SharedRecurrentEncoder(nn.Module):
     sequence of LSTM hidden states (history-aware state features).
     """
 
-    def __init__(self, observation_shape: Tuple[int, int, int], hidden_dim: int = 128,
+    def __init__(self, input_dim, hidden_dim: int = 128,
                  recurrent_hidden_size: int = 128, device: str = 'cpu',
-                 feature_extractor=None, dropout_p: float = 0.0, burn_in_length: int = 0, *args, **kwargs) -> None:
+                 feature_extractor=None, burn_in_length: int = 0, *args, **kwargs) -> None:
         super().__init__()
         self._device = device
         self.recurrent_hidden_size = recurrent_hidden_size
 
         if feature_extractor is None:
             # This encoder now processes individual frames
-            self.encoder = OfflineMiniGridEncoder(observation_shape=observation_shape, hidden_dim=hidden_dim,
-                                                  dropout_p=dropout_p).to(device)
+            self.encoder = FeatureEncoder(input_dim=input_dim, hidden_dim=hidden_dim).to(device)
         else:
             self.encoder = feature_extractor
 
@@ -404,7 +319,7 @@ class RecurrentNet(nn.Module):
     """
 
     def __init__(self, input_feature_size: int, output_size: int, has_action_encoder: bool = False,
-                 device: str = 'cpu', dropout_p: float = 0.0, *args, **kwargs) -> None:
+                 device: str = 'cpu', *args, **kwargs) -> None:
         super().__init__()
         self._device = device
         self.input_feature_size = input_feature_size
@@ -415,7 +330,6 @@ class RecurrentNet(nn.Module):
                 nn.Linear(1, input_feature_size // 2),
                 nn.LayerNorm(input_feature_size // 2),
                 nn.ReLU(),
-                nn.Dropout(p=dropout_p),
                 nn.Linear(input_feature_size // 2, input_feature_size)
             )
         else:
@@ -425,7 +339,6 @@ class RecurrentNet(nn.Module):
             nn.Linear(input_feature_size, input_feature_size // 2),
             nn.LayerNorm(input_feature_size // 2),
             nn.ReLU(),
-            nn.Dropout(p=dropout_p),
             nn.Linear(input_feature_size // 2, output_size)
         ).to(device)
 
@@ -487,8 +400,8 @@ class RecurrentNet(nn.Module):
 
 
 class _RecurrentBase(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], action_space: spaces.Box,
-                 hidden_dim: int = 128, gamma: float = 0.99, recurrent_hidden_size: int = None, batch_size: int = 128,
+    def __init__(self, observation_shape: Tuple[int,], hidden_dim: int = 128, gamma: float = 0.99,
+                 recurrent_hidden_size: int = None, batch_size: int = 128,
                  device: str = 'cpu', decoy_interval: int = 0, critic_lr: float = 3e-4,
                  value_lr: float = 3e-4, actor_lr: float = 3e-4, sequence_length: int = 64,
                  burn_in_length: int = 20, *args, **kwargs):
@@ -541,7 +454,6 @@ class _RecurrentBase(nn.Module):
             n_epochs_per_eval: int = 1,
             evaluators=None,
             show_progress: bool = True,
-            experiment_name: str = None,
             decoy_interval: int = 0,
             dataset_kwargs: Optional[Dict] = None
     ):
@@ -584,7 +496,6 @@ class _RecurrentBase(nn.Module):
                     loss_dict, log_dict = self._log_progress(
                         epoch=epoch,
                         loss_dict=loss_dict,
-                        experiment_name=experiment_name,
                         evaluators=evaluators
                     )
 
@@ -615,6 +526,7 @@ class _RecurrentBase(nn.Module):
         # Pass the current hidden_state to the policy network
         # 1. Call the shared encoder
         #    Input: (1, 1, H, W, C), Output: (1, 1, hidden_size)
+        assert self.shared_encoder is not None, "Missing shared encoder in the recurrent network."
         lstm_out, next_hidden_state = self.shared_encoder(obs_tensor,
                                                           hidden_state=hidden_state,
                                                           padding_mask=None,
@@ -622,6 +534,7 @@ class _RecurrentBase(nn.Module):
 
         # 2. Call the policy decoder
         #    Input: (1, 1, hidden_size), Output: (1, 1, 2)
+        assert self.policy_net is not None, "Missing policy network in the recurrent network."
         params = self.policy_net(lstm_out, actions=None)
 
         dist = self.dist.proba_distribution(params)
@@ -663,8 +576,8 @@ class _RecurrentBase(nn.Module):
         t_idx = self._buffered_sequence_arange
         none = self._buffered_empty
 
-        def next_true_idx(mask):  # earliest j >= t if exists else T
-            cand = torch.where(mask, t_idx, none)
+        def next_true_idx(_mask):  # earliest j >= t if exists else T
+            cand = torch.where(_mask, t_idx, none)
             rev = torch.flip(cand, dims=[1])
             suf = torch.cummin(rev, dim=1).values
             return torch.flip(suf, dims=[1])
@@ -722,8 +635,7 @@ class _RecurrentBase(nn.Module):
         c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
         return h_0, c_0
 
-    def _log_progress(self, epoch: int, loss_dict: dict, experiment_name: str,
-                      evaluators: dict = None):
+    def _log_progress(self, epoch: int, loss_dict: dict, evaluators: dict = None):
 
         rewards = {}
         for key in evaluators.keys():
@@ -756,7 +668,6 @@ class RecurrentIQL(_RecurrentBase):
             self,
             expectile: float = 0.7,
             tau_target: float = 0.005,
-            dropout_p: float = 0.0,
             beta: float = 2.0,
             *args,
             **kwargs
@@ -765,27 +676,24 @@ class RecurrentIQL(_RecurrentBase):
         self._expectile = expectile
         self._cloning_only = expectile == 0.5
         self._tau_target = tau_target
-        self._has_dropout = dropout_p > 0.0
         self._beta = beta
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
-            observation_shape=self._observation_shape,
+            input_dim=self._observation_shape[0],
             hidden_dim=self._hidden_dim,
             recurrent_hidden_size=self._recurrent_hidden_size,
-            dropout_p=dropout_p,
             device=self._device
         )
 
         decoder_kwargs = dict(
             input_feature_size=self._recurrent_hidden_size,
-            dropout_p=dropout_p,
             device=self._device
         )
 
         # --- Create Shared Encoders ---
-        self.feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
-        self.target_feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
+        self.feature_extractor = FeatureEncoder(**encoder_kwargs).to(self._device)
+        self.target_feature_extractor = FeatureEncoder(**encoder_kwargs).to(self._device)
 
         self.shared_encoder = SharedRecurrentEncoder(
             feature_extractor=self.feature_extractor,
@@ -948,11 +856,7 @@ class RecurrentIQL(_RecurrentBase):
             # 5. Get the IQL weights
             weights = 1.0
             if not self._cloning_only:
-                weights = self._batch_diff
-                if self._has_dropout:
-                    weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
-                else:
-                    weights = torch.clip(torch.exp(self._beta * weights), -100, 100)
+                weights = torch.clip(torch.exp(self._beta * self._batch_diff), -100, 100)
 
                 # Ensure weights have the same shape as policy_loss for broadcasting
                 weights = weights.squeeze(-1)  # Shape (N, T)
@@ -981,8 +885,6 @@ class RecurrentCQLSAC(_RecurrentBase):
     def __init__(
             self,
             tau_target: float = 0.005,
-            # entropy_alpha: float = 0.2,
-            dropout_p: float = 0.0,
             *args,
             **kwargs
     ):
@@ -999,21 +901,19 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
-            observation_shape=self._observation_shape,
+            input_dim=self._observation_shape[0],
             hidden_dim=self._hidden_dim,
             recurrent_hidden_size=self._recurrent_hidden_size,
-            dropout_p=dropout_p,
             device=self._device
         )
 
         decoder_kwargs = dict(
             input_feature_size=self._recurrent_hidden_size,
-            dropout_p=dropout_p,
             device=self._device
         )
 
-        self.feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
-        self.target_feature_extractor = OfflineMiniGridEncoder(**encoder_kwargs).to(self._device)
+        self.feature_extractor = FeatureEncoder(**encoder_kwargs).to(self._device)
+        self.target_feature_extractor = FeatureEncoder(**encoder_kwargs).to(self._device)
 
         # --- Create Shared Encoders ---
         self.shared_encoder = SharedRecurrentEncoder(

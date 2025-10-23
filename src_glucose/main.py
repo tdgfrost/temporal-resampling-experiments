@@ -1,5 +1,4 @@
 import polars as pl
-from math import ceil
 from collections import defaultdict
 from functools import partial
 
@@ -16,7 +15,6 @@ parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 
 parser.add_argument('--ppo_agent', default="best_model01_38.70.pth", type=str, help='Path to pre-trained PPO agent')
 
 parser.add_argument('--expectile', default=0.7, type=float, help='Expectile value for IQL training (0.5 is BC)')
-parser.add_argument('--dropout_p', default=0.0, type=float, help='MC dropout probability for PPO agent')
 parser.add_argument('--beta', default=3., type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
@@ -26,19 +24,17 @@ torch.set_float32_matmul_precision('high')
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    if args.dropout_p > 0:
-        args.beta = 0.
 
     train_ppo = args.train_ppo
     train_offline = args.train_offline
     is_iql = args.offline_model == 'iql'
     is_cql = args.offline_model == 'cql'
+    ppo_agent = f'../logs_glucose/ppo_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
     assert not train_offline or is_iql or is_cql, (
         "Please choose a valid offline model: 'iql' or 'cql'.")
     offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
 
     if train_offline and not os.path.exists('./replay_buffer/COMPLETE'):
-        ppo_agent = f'../logs_glucose/ppo_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
         assert ppo_agent is not None, (
@@ -77,7 +73,7 @@ if __name__ == "__main__":
 
     if train_offline:
         print(
-            f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, DROPOUT_P: {args.dropout_p}, BETA: {args.beta}")
+            f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, BETA: {args.beta}")
 
         logs = defaultdict(list)
 
@@ -126,12 +122,11 @@ if __name__ == "__main__":
             # Alternately collect and training
             algo = offline_model(observation_shape=base_env.observation_space.shape,
                                  action_space=base_env.action_space,
-                                 hidden_dim=ceil(128 / (1 - args.dropout_p)),
+                                 hidden_dim=128,
                                  batch_size=32,
                                  expectile=EXPECTILE,
                                  gamma=GAMMA,
                                  decoy_interval=DECOY_INTERVAL,
-                                 dropout_p=args.dropout_p,
                                  value_lr=1e-4,
                                  policy_lr=1e-4,
                                  critic_lr=1e-4,
@@ -164,4 +159,4 @@ if __name__ == "__main__":
         os.makedirs('../logs_glucose/iql_minigrid_logs', exist_ok=True)
         pl.DataFrame(logs).write_csv(
             f'../logs_glucose/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}'
-            f'_dropout={args.dropout_p}_beta={args.beta}.csv')
+            f'_beta={args.beta}.csv')

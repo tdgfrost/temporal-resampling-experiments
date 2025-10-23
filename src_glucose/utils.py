@@ -13,8 +13,8 @@ from simglucose.simulation.env import bg_in_range, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
 
 
-class ReplayBufferEnv:
-    def __init__(self, env, buffer_size: int = 100000):
+class RecurrentReplayBufferEnv:
+    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20):
         self.observations = {
             i: deque(maxlen=buffer_size) for i in range(3)
         }
@@ -44,260 +44,16 @@ class ReplayBufferEnv:
         self.segments = self.n_samples // self.batch_size
         self.dataset_avg = None
         self.dataset_std = None
+        self.max_sequence_length = sequence_length
+        self.burn_in_length = burn_in_length
+        # This will store the valid start indices for each decoy interval
+        self.sequence_info = {i: [] for i in range(3)}
 
     def __iter__(self):
         return iter(self.generate())
 
     def __len__(self):
         return self.segments
-
-    def set_generate_params(self, batch_size: int = None, decoy_interval: int = None):
-        self.batch_size = batch_size if batch_size is not None else self.batch_size
-        self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
-        self.n_samples = sum(self.sample_bool[self.decoy_interval])
-        self.segments = self.n_samples // self.batch_size if self.n_samples > 0 else 0
-
-        assert self.n_samples >= self.batch_size, "Not enough samples in the replay buffer"
-        assert self.batch_size > 0, "Batch size must be positive"
-        assert self.decoy_interval in [0, 1, 2], "decoy_interval must be 0, 1, or 2"
-
-    def generate(self):
-        assert self.n_samples > 0, "Replay buffer is empty"
-        # The base class samples from a contiguous range.
-        valid_indices = np.where(self.sample_bool[self.decoy_interval])[0]
-        # We must subtract 1 because fetch_transition_batch accesses idxs+1
-        valid_indices = valid_indices[valid_indices < len(self.observations[self.decoy_interval]) - 1]
-
-        self.n_samples = len(valid_indices)
-        self.segments = self.n_samples // self.batch_size
-        assert self.segments > 0, f"Not enough valid samples to form a batch. Have {self.n_samples}, need {self.batch_size}"
-
-        idxs_np = np.random.choice(valid_indices, size=(self.segments, self.batch_size), replace=False)
-        idxs = torch.tensor(idxs_np, dtype=torch.long, device=self._device)
-
-        for idx in idxs:
-            yield self.fetch_transition_batch(idxs=idx, decoy_interval=self.decoy_interval)
-
-    def save(self, path: str):
-        if os.path.exists(path):
-            print(f"Warning: Overwriting existing replay buffer at {path}")
-            shutil.rmtree(path)
-        os.makedirs(path)
-        for key, value in [
-            ('observations', self.observations),
-            ('actions', self.actions),
-            ('rewards', self.rewards),
-            ('dones', self.dones),
-            ('sample_bool', self.sample_bool),
-            ('visible_states', self.visible_states)
-        ]:
-            save_dict = {i: list(value[i]) for i in range(3)}
-            np.savez(os.path.join(path, f'{key}.npz'),
-                     **{str(k): v for k, v in save_dict.items()})
-
-        # Also save reward dataset avg
-        np.savez(os.path.join(path, 'rewards_scale.npz'),
-                 **{'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
-
-        # Mark saving as complete
-        with open(os.path.join(path, 'COMPLETE'), 'w') as f:
-            f.close()
-
-    def load(self, path: str):
-        for key, value in [
-            ('observations', self.observations),
-            ('actions', self.actions),
-            ('rewards', self.rewards),
-            ('dones', self.dones),
-            ('sample_bool', self.sample_bool),
-            ('visible_states', self.visible_states)
-        ]:
-            loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
-            for k in loaded.files:
-                value[int(k)] = deque(loaded[k], maxlen=self.buffer_size)
-
-        # Load avg rewards
-        loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
-        self.dataset_avg = float(loaded_scale['dataset_avg'])
-        self.dataset_std = float(loaded_scale['dataset_std'])
-
-    def reset(self, seed: int = None):
-        obs, info = self.env.reset(seed=seed)
-        ep_buffer = self._reset_ep_buffer(obs, info)
-        return obs, info, ep_buffer
-
-    @staticmethod
-    def _reset_ep_buffer(obs, info):
-        return {
-            'all_obs': [obs],
-            'all_action': [],
-            'all_reward': [],
-            'all_term': [],
-            'all_trunc': [],
-            'all_done': [],
-            'visible_state': [True]
-        }
-
-    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, with_random: bool = True,
-                    rand_p: float = 0.05):
-        with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
-            frame_count = 0
-            if seed is None:
-                seed = 123
-
-            obs, info, ep_buffer = self.reset(seed=seed)
-            model.set_random_seed(seed)
-            total_rewards = []
-
-            while frame_count < n_frames:
-                done = False
-                lstm_states = model.ac_network.init_hidden_state(batch_size=1)
-                total_reward = 0
-                while not done:
-                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=True)
-                    # If desired, could add randomness here, either by setting deterministic=False,
-                    # or by selecting random actions:
-                    # if with_random and np.random.random() < rand_p:
-                    #       action = self.env.action_space.sample()
-                    #       action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
-                    obs, reward, term, trunc, info = self.env.step(action)
-                    # Get the real action delivered
-                    real_action = obs[1] * INSULIN_SCALE
-                    done = term or trunc
-                    total_reward += reward
-
-                    self.update_episode_buffer(obs, real_action, reward, term, trunc, info, ep_buffer)
-
-                    if done:
-                        ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
-                        obs, info = self.env.reset(seed=seed + frame_count)
-
-                    pbar.update(1)
-                    frame_count += 1
-                    model.set_random_seed(seed + frame_count)
-
-                # Add ep_buffer to permanent buffer
-                self.update_permanent_buffer(ep_buffer)
-                # Reset ep_buffer and add 'obs' to it
-                ep_buffer = self._reset_ep_buffer(obs, info)
-
-                # Keep track of total rewards for stats
-                total_rewards.append(total_reward)
-
-            # Add a garbage all-zeros "final obs"
-            for i in range(3):
-                self.observations[i] += [np.zeros_like(self.observations[0][0])]
-
-            # Save the dataset return
-            total_rewards = np.array(total_rewards)
-            self.dataset_avg = total_rewards.mean()
-            self.dataset_std = total_rewards.std()
-
-    def set_to_tensors(self, device: str = 'cpu'):
-        if self._tensors_set and self._device == device:
-            return
-
-        for i in range(3):
-            self.observations[i] = torch.from_numpy(np.array(self.observations[i])).float().to(device)
-            self.actions[i] = torch.from_numpy(np.array(self.actions[i])).float().to(device)
-            self.rewards[i] = torch.from_numpy(np.array(self.rewards[i])).float().to(device)
-            self.dones[i] = torch.from_numpy(np.array(self.dones[i])).bool().to(device)
-            self.visible_states[i] = torch.from_numpy(np.array(self.visible_states[i])).bool().to(device)
-
-        self._tensors_set = True
-        self._device = device
-
-    @staticmethod
-    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, term: bool, trunc: bool, info: dict,
-                              ep_buffer: dict):
-        ep_buffer['all_obs'] += [obs]
-        ep_buffer['all_action'] += [action]
-        ep_buffer['all_reward'] += [reward]
-        ep_buffer['all_term'] += [term]
-        ep_buffer['all_trunc'] += [trunc]
-        ep_buffer['all_done'] += [term or trunc]
-        ep_buffer['visible_state'] += [info['steps_until_action_available'] == 0]
-
-    def update_permanent_buffer(self, ep_buffer: dict):
-        visible_idxs = ep_buffer['visible_state']
-        for i in range(2):
-            for arr, key in [
-                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
-            ]:
-                arr[i] += ep_buffer[f'all_{key}']
-
-            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
-
-        # Update visible states
-        self.visible_states[0] += visible_idxs
-        self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
-
-        # Generate our aggregated datapoints for decoy_interval = 2
-        # e.g., for window_size = 3, we use the following aggregates:
-        # for i in [3, 6, 9, ...]
-        #      [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
-        # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
-        # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
-        # rew:                  |---------|    |----   (t3-t5, t6-t8, etc)
-        # (reward calculated from next obs)
-
-        agg_window = AGGREGATE_WINDOW_SIZE
-
-        obs = [
-            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)
-            for idx in range(0, len(ep_buffer['all_obs']) - agg_window, agg_window)
-        ]
-
-        actions = [
-            np.mean(ep_buffer['all_action'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_action']), agg_window)
-        ]
-
-        dones = [
-            np.any(ep_buffer['all_done'][idx: idx + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_done']), agg_window)
-        ]
-
-        rewards = [
-            np.mean(ep_buffer['all_reward'][idx: idx + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_reward']), agg_window)
-        ]
-
-        """
-        # Calculate early terminations for the additional reward component
-        terms = [
-            np.any(ep_buffer['all_term'][idx: idx + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_term']), agg_window)
-        ]
-
-        # Manually calculate reward
-        bg_levels = np.array([
-            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[-3]
-            for idx in range(agg_window, len(ep_buffer['all_obs']), agg_window)
-        ]) * (600 - 10) + 10  # Scale back to real bg levels
-
-        rewards = [bg_in_range([i]) * SAMPLE_TIME for i in bg_levels]
-        rewards[-1] += early_termination_reward(terms[-1])
-        """
-
-        if not dones or not dones[-1]:
-            # Skip this episode - too short
-            return
-        self.observations[2] += obs
-        self.actions[2] += actions
-        self.rewards[2] += rewards
-        self.dones[2] += dones
-        self.sample_bool[2] += [True for _ in range(len(dones))]
-        self.visible_states[2] += [True for _ in range(len(dones))]
-
-
-class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original class
-    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20):
-        super().__init__(env, buffer_size)
-        self.max_sequence_length = sequence_length
-        self.burn_in_length = burn_in_length
-        # This will store the valid start indices for each decoy interval
-        self.sequence_info = {i: [] for i in range(3)}
 
     def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None,
                             max_sequence_length: int = None, burn_in_length: int = None, epoch_fraction: float = 1.0):
@@ -387,24 +143,6 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
 
         self.set_to_tensors(device)
 
-    def set_to_tensors(self, device: str = 'cpu'):
-        def _set_device(some_arr):
-            if isinstance(some_arr, torch.Tensor):
-                return some_arr.to(device)
-            return torch.from_numpy(np.array(some_arr)).to(device)
-
-        i = self.decoy_interval
-
-        self.observations[i] = _set_device(self.observations[i]).float()
-        self.actions[i] = _set_device(self.actions[i]).float()
-        self.rewards[i] = _set_device(self.rewards[i]).float()
-        self.dones[i] = _set_device(self.dones[i]).bool()
-        self.visible_states[i] = _set_device(self.visible_states[i]).bool()
-        self.sequence_info[i] = _set_device(self.sequence_info[i]).long()
-
-        self._tensors_set = True
-        self._device = device
-
     def generate(self):
         """
         Generates batches by sampling EPISODE indices and then padding them.
@@ -493,14 +231,224 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
 
         # Get the next_padding_mask for next_obs
         next_padding_mask = torch.roll(padding_mask, shifts=-1, dims=1)
-        next_padding_mask[:, -1, :] = False  # Last step has no defined next
+        next_padding_mask[:, -1, :] = False  # Last step does not have a next step
 
         # This can be derived from the visible_batch after fetching
         next_visible_batch = torch.roll(visible_batch, shifts=-1, dims=1)
-        next_visible_batch[:, -1] = False  # Last step has no defined next step
+        next_visible_batch[:, -1] = False  # Last step does not have a next step
 
         return (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch,
                 visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask)
+
+    def save(self, path: str):
+        if os.path.exists(path):
+            print(f"Warning: Overwriting existing replay buffer at {path}")
+            shutil.rmtree(path)
+        os.makedirs(path)
+        for key, value in [
+            ('observations', self.observations),
+            ('actions', self.actions),
+            ('rewards', self.rewards),
+            ('dones', self.dones),
+            ('sample_bool', self.sample_bool),
+            ('visible_states', self.visible_states)
+        ]:
+            save_dict = {i: list(value[i]) for i in range(3)}
+            np.savez(os.path.join(path, f'{key}.npz'),
+                     **{str(k): v for k, v in save_dict.items()})
+
+        # Also save reward dataset avg
+        np.savez(os.path.join(path, 'rewards_scale.npz'),
+                 **{'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
+
+        # Mark saving as complete
+        with open(os.path.join(path, 'COMPLETE'), 'w') as f:
+            f.close()
+
+    def load(self, path: str):
+        for key, value in [
+            ('observations', self.observations),
+            ('actions', self.actions),
+            ('rewards', self.rewards),
+            ('dones', self.dones),
+            ('sample_bool', self.sample_bool),
+            ('visible_states', self.visible_states)
+        ]:
+            loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
+            for k in loaded.files:
+                value[int(k)] = deque(loaded[k], maxlen=self.buffer_size)
+
+        # Load avg rewards
+        loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
+        self.dataset_avg = float(loaded_scale['dataset_avg'])
+        self.dataset_std = float(loaded_scale['dataset_std'])
+
+    def reset(self, seed: int = None):
+        obs, info = self.env.reset(seed=seed)
+        ep_buffer = self._reset_ep_buffer(obs)
+        return obs, info, ep_buffer
+
+    @staticmethod
+    def _reset_ep_buffer(obs):
+        return {
+            'all_obs': [obs],
+            'all_action': [],
+            'all_reward': [],
+            'all_term': [],
+            'all_trunc': [],
+            'all_done': [],
+            'visible_state': [True]
+        }
+
+    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None):
+        with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
+            frame_count = 0
+            if seed is None:
+                seed = 123
+
+            obs, info, ep_buffer = self.reset(seed=seed)
+            model.set_random_seed(seed)
+            total_rewards = []
+
+            while frame_count < n_frames:
+                done = False
+                lstm_states = model.ac_network.init_hidden_state(batch_size=1)
+                total_reward = 0
+                while not done:
+                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=True)
+                    obs, reward, term, trunc, info = self.env.step(action)
+                    # Get the real action delivered
+                    real_action = obs[1] * INSULIN_SCALE
+                    done = term or trunc
+                    total_reward += reward
+
+                    self.update_episode_buffer(obs, real_action, reward, term, trunc, info, ep_buffer)
+
+                    if done:
+                        ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
+                        obs, info = self.env.reset(seed=seed + frame_count)
+
+                    pbar.update(1)
+                    frame_count += 1
+                    model.set_random_seed(seed + frame_count)
+
+                # Add ep_buffer to permanent buffer
+                self.update_permanent_buffer(ep_buffer)
+                # Reset ep_buffer and add 'obs' to it
+                ep_buffer = self._reset_ep_buffer(obs)
+
+                # Keep track of total rewards for stats
+                total_rewards.append(total_reward)
+
+            # Add a garbage all-zeros "final obs"
+            for i in range(3):
+                self.observations[i] += [np.zeros_like(self.observations[0][0])]
+
+            # Save the dataset return
+            total_rewards = np.array(total_rewards)
+            self.dataset_avg = total_rewards.mean()
+            self.dataset_std = total_rewards.std()
+
+    def set_to_tensors(self, device: str = 'cpu'):
+        def _set_device(some_arr):
+            if isinstance(some_arr, torch.Tensor):
+                return some_arr.to(device)
+            return torch.from_numpy(np.array(some_arr)).to(device)
+
+        i = self.decoy_interval
+
+        self.observations[i] = _set_device(self.observations[i]).float()
+        self.actions[i] = _set_device(self.actions[i]).float()
+        self.rewards[i] = _set_device(self.rewards[i]).float()
+        self.dones[i] = _set_device(self.dones[i]).bool()
+        self.visible_states[i] = _set_device(self.visible_states[i]).bool()
+        self.sequence_info[i] = _set_device(self.sequence_info[i]).long()
+
+        self._tensors_set = True
+        self._device = device
+
+    @staticmethod
+    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, term: bool, trunc: bool, info: dict,
+                              ep_buffer: dict):
+        ep_buffer['all_obs'] += [obs]
+        ep_buffer['all_action'] += [action]
+        ep_buffer['all_reward'] += [reward]
+        ep_buffer['all_term'] += [term]
+        ep_buffer['all_trunc'] += [trunc]
+        ep_buffer['all_done'] += [term or trunc]
+        ep_buffer['visible_state'] += [info['steps_until_action_available'] == 0]
+
+    def update_permanent_buffer(self, ep_buffer: dict):
+        visible_idxs = ep_buffer['visible_state']
+        for i in range(2):
+            for arr, key in [
+                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
+            ]:
+                arr[i] += ep_buffer[f'all_{key}']
+
+            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
+
+        # Update visible states
+        self.visible_states[0] += visible_idxs
+        self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
+
+        # Generate our aggregated datapoints for decoy_interval = 2
+        # e.g., for window_size = 3, we use the following aggregates:
+        # for i in [3, 6, 9, ...]
+        #      [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
+        # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
+        # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
+        # rew:                  |---------|    |----   (t3-t5, t6-t8, etc)
+        # (reward calculated from next obs)
+
+        agg_window = AGGREGATE_WINDOW_SIZE
+
+        obs = [
+            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)
+            for idx in range(0, len(ep_buffer['all_obs']) - agg_window, agg_window)
+        ]
+
+        actions = [
+            np.mean(ep_buffer['all_action'][(idx - 1): (idx - 1) + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_action']), agg_window)
+        ]
+
+        dones = [
+            np.any(ep_buffer['all_done'][idx: idx + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_done']), agg_window)
+        ]
+
+        rewards = [
+            np.mean(ep_buffer['all_reward'][idx: idx + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_reward']), agg_window)
+        ]
+
+        """
+        # Calculate early terminations for the additional reward component
+        terms = [
+            np.any(ep_buffer['all_term'][idx: idx + agg_window])
+            for idx in range(agg_window, len(ep_buffer['all_term']), agg_window)
+        ]
+
+        # Manually calculate reward
+        bg_levels = np.array([
+            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[-3]
+            for idx in range(agg_window, len(ep_buffer['all_obs']), agg_window)
+        ]) * (600 - 10) + 10  # Scale back to real bg levels
+
+        rewards = [bg_in_range([i]) * SAMPLE_TIME for i in bg_levels]
+        rewards[-1] += early_termination_reward(terms[-1])
+        """
+
+        if not dones or not dones[-1]:
+            # Skip this episode - too short
+            return
+        self.observations[2] += obs
+        self.actions[2] += actions
+        self.rewards[2] += rewards
+        self.dones[2] += dones
+        self.sample_bool[2] += [True for _ in range(len(dones))]
+        self.visible_states[2] += [True for _ in range(len(dones))]
 
 
 class SaveEachBestCallback(BaseCallback):
