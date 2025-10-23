@@ -990,17 +990,19 @@ class RecurrentCQLSAC(_RecurrentBase):
     def __init__(
             self,
             tau_target: float = 0.005,
-            entropy_alpha: float = 0.2,
+            # entropy_alpha: float = 0.2,
             dropout_p: float = 0.0,
             *args,
             **kwargs
     ):
         super().__init__(*args, **kwargs)
         self._tau_target = tau_target
-        self._cql_target = 5.0
-        # We learn the log of alpha for numerical stability
+        self._target_entropy_alpha = -1
+        self._target_cql_alpha_gap = 10.0
+        # We learn the log of entropy/cql alpha for numerical stability
+        self.log_entropy_alpha = torch.zeros(1, requires_grad=True, device=self._device)
         self.log_cql_alpha = torch.zeros(1, requires_grad=True, device=self._device)
-        self._entropy_alpha = entropy_alpha
+
         self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
                                                              device=self._device))
 
@@ -1039,6 +1041,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         self.target_critic_net2 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
         self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
         self.cql_alpha_optim = torch.optim.AdamW([self.log_cql_alpha], lr=self._critic_lr)
+        self.entropy_alpha_optim = torch.optim.AdamW([self.log_entropy_alpha], lr=self._critic_lr)
 
         # --- Setup Optimizers ---
         shared_params = list(self.shared_encoder.parameters())
@@ -1065,228 +1068,155 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         return q1_logits, q2_logits, policy_logits
 
-    @torch.compile
+    #@torch.compile
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                        train_mask):
-        def reshape_cql(tensor):
-            return tensor.view(batch_size, cql_n_samples, seq_len, 1).permute(0, 2, 1, 3).squeeze(-1)
+        """
+        CQL Q-loss: logsumexp_loss + bellman_error_loss
+        1) bellman_error_loss = MSE(Q(s,a), r + gamma * (1 - done) * V(s'))
+        2) logsumexp_loss = logsumexp(Q(s,a')) - E_{a~D}[Q(s,a)]
+
+        bellman_error_loss
+        1. Get the predicted Q-values for the observed state-action pair
+        2. Get our a' sampled from our policy
+        3. Get our Q(s',a') using the sampled a'
+        4. Create the Bellman loss
+
+        logsumexp_loss
+        5. Sample N actions - five from our policy, five from a uniform distribution (to cover the entire
+            action space)
+        6. Calculate the Q values for these sampled actions
+        7. Calculate the logsumexp for these Q values
+        8. Subtract the mean dataset Q from the logsumexp Q
+        9. Update our Lagrangian alpha
+        """
+        # Get the dimensions of the data
+        batch_size, seq_len, obs_dim = obs.shape
 
         with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
-            # --- Get Q-values for actions in the dataset ---
+            # ---- Bellman Loss ---- #
+            # 1. Get our Q-values for the observed state-action pair
             lstm_out, _ = self.shared_encoder(obs, padding_mask=padding_mask, train_mask=train_mask)
             q1_pred = self.critic_net1(lstm_out, actions=acts)
             q2_pred = self.critic_net2(lstm_out, actions=acts)
 
             with torch.no_grad():
-                # We detach lstm_out to prevent critic gradients from flowing through here to the policy
-                params_data = self.policy_net(lstm_out.detach(), actions=None)
-                dist_data = self.dist.proba_distribution(params_data)
-                # Get log_prob of the *dataset action* (acts) under the current policy
-                log_pi_data = dist_data.log_prob(acts).unsqueeze(-1)  # Shape [N, T, 1]
-
-            # --- Calculate Bellman Target Components ---
-            with torch.no_grad():
-                # Get policy params from *online* policy net and *online* encoder
+                # 2. Get our a' sampled from our policy
                 next_lstm_out, _ = self.shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
                 params = self.policy_net(next_lstm_out, actions=None)
 
                 # Create the Beta distribution
                 dist = self.dist.proba_distribution(params)
 
-                # Sample next action using reparameterization trick
-                # This action is already in the [low, high] range
-                next_actions = dist.sample()
+                # Sample next action
+                next_actions_sampled = dist.sample()
+                next_log_pi = dist.log_prob(next_actions_sampled)
 
-                # If using decoy_interval == 0, persist actions over non-visible steps
-                if self.decoy_interval == 0:
-                    next_actions_persistent = _persist_actions(next_actions, next_visible)
-                else:
-                    next_actions_persistent = next_actions
-
-                # Calculate log_prob
-                # The dist.log_prob method handles all scaling and transformations.
-                # We unsqueeze to get shape [N, T, 1] as log_prob returns [N, T]
-                next_log_probs = dist.log_prob(next_actions).unsqueeze(-1)
-
-                # Get Q-values from *target* critic decoders and *target* shared encoder
-                next_lstm_out_target, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
-                next_q1 = self.target_critic_net1(next_lstm_out_target, actions=next_actions_persistent)
-                next_q2 = self.target_critic_net2(next_lstm_out_target, actions=next_actions_persistent)
+                # 3. Get our Q(s',a') using the sampled action
+                next_lstm_out_target, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask,
+                                                                     train_mask=None)
+                next_q1 = self.target_critic_net1(next_lstm_out_target, actions=next_actions_sampled)
+                next_q2 = self.target_critic_net2(next_lstm_out_target, actions=next_actions_sampled)
                 next_q = torch.min(next_q1, next_q2)
 
-                # Target V-value (logit) = Q - alpha * log_prob
-                next_v = next_q - self._entropy_alpha * next_log_probs  # Shape [N, T, 1]
+                # Add entropy regularisation
+                alpha = self.log_entropy_alpha.exp().detach()
+                next_v = next_q - alpha * next_log_pi
 
-                r = rews.float()  # Shape [N, T, 1]
-                dones = dones.float()  # Shape [N, T, 1]
+                r = rews.float()
+                dones = dones.float()
 
-            # ---- CQL loss terms (calculated on full [N, T] grid) ----
-            cql_n_samples = 10
-            batch_size, seq_len, obs_dim = obs.shape
+            # 4. Create the Bellman loss
+            if self.decoy_interval == 0:
+                q1_pred, q2_pred, q_target, valid_mask = self._filter_to_correct_visibles(
+                    q1_pred, q2_pred, r, next_v, dones, visible, next_visible, padding_mask, train_mask)
 
-            cql_obs = obs.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples, seq_len, obs_dim)
-            cql_padding_mask = padding_mask.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples,
-                                                                                             seq_len, 1)
-            cql_train_mask = train_mask.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(batch_size * cql_n_samples,
-                                                                                         seq_len, 1)
+                bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
 
-            # Get policy params from *online* policy net and *online* encoder
-            cql_lstm_out_policy, _ = self.shared_encoder(cql_obs,
-                                                         padding_mask=cql_padding_mask,
-                                                         train_mask=cql_train_mask)
+            else:
+                q_target = r + self._gamma * (1 - dones) * next_v
+
+                bellman_loss = F.mse_loss(q1_pred, q_target, reduction='none') + \
+                               F.mse_loss(q2_pred, q_target, reduction='none')  # Shape [N, T, 1]
+
+                # Use train_mask (which is False for padding AND burn-in)
+                valid_count = train_mask.sum() + self._eps
+                bellman_loss = (bellman_loss * train_mask)
+                bellman_loss = bellman_loss.sum() / valid_count
+
+
+            # ---- Logsumexp Loss ---- #
+            cql_n_samples = 5 # for each of policy and uniform
+            collapsed_dim = (cql_n_samples * 2 * batch_size, seq_len, -1)
+            expanded_dim = (cql_n_samples * 2, batch_size, seq_len, -1)
+            cql_lstm_out = (
+                lstm_out.unsqueeze(0)
+                .expand(cql_n_samples * 2, batch_size, seq_len, -1)
+                .contiguous()
+                .view(*collapsed_dim)
+            )
 
             with torch.no_grad():
-                params = self.policy_net(cql_lstm_out_policy, actions=None)
+                # 5. Sample our actions
+                params = self.policy_net(lstm_out, actions=None)
 
                 # Create the Beta distribution
                 dist = self.dist.proba_distribution(params)
 
-                # Sample actions (already in [low, high] range)
-                cql_policy_actions = dist.sample()
+                # Sample policy and uniform actions -> [5, N, L, D]
+                cql_policy_actions = torch.stack([dist.sample() for _ in range(cql_n_samples)])
+                cql_uniform_actions = torch.empty(cql_n_samples, batch_size, seq_len, 1, device=obs.device)
+                cql_uniform_actions.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
 
-                # Calculate log prob
-                cql_policy_log_probs = dist.log_prob(cql_policy_actions).unsqueeze(-1)
+                # Concat together and reshape back to N,L,D
+                cql_sampled_actions = torch.cat([cql_policy_actions, cql_uniform_actions], 0)
+                cql_sampled_actions = cql_sampled_actions.view(*collapsed_dim)
 
-            # Get the [low, high] bounds from the distribution instance
-            low = self.dist.bias
-            high = self.dist.bias + self.dist.scale
+            # 6. Calculate the Q values for these sampled actions -> [10, N, L]
+            cql_q1_sampled = self.critic_net1(cql_lstm_out, actions=cql_sampled_actions)
+            cql_q2_sampled = self.critic_net2(cql_lstm_out, actions=cql_sampled_actions)
 
-            cql_uniform_actions = torch.empty(batch_size * cql_n_samples, seq_len, 1, device=obs.device).uniform_(low, high)
+            # 7. Calculate the logsumexp
+            cql_q1_logsumexp = torch.logsumexp(cql_q1_sampled.view(*expanded_dim), dim=0)
+            cql_q2_logsumexp = torch.logsumexp(cql_q2_sampled.view(*expanded_dim), dim=0)
 
-            # If using decoy_interval == 0, persist actions over non-visible steps
-            if self.decoy_interval == 0:
-                # We need the 'visible' mask, expanded to [N*k, T, 1]
-                # 'visible' shape is [N, T, 1]
-                cql_visible_mask = visible.unsqueeze(1).repeat(1, cql_n_samples, 1, 1).view(
-                    batch_size * cql_n_samples, seq_len, 1
-                )
+            # 8. Subtract the mean dataset Q from the logsumexp Q
+            dataset_q1 = self.critic_net1(lstm_out, actions=acts)
+            dataset_q2 = self.critic_net2(lstm_out, actions=acts)
 
-                cql_policy_actions_persistent = _persist_actions(cql_policy_actions, cql_visible_mask)
-                cql_uniform_actions_persistent = _persist_actions(cql_uniform_actions, cql_visible_mask)
-            else:
-                cql_policy_actions_persistent = cql_policy_actions
-                cql_uniform_actions_persistent = cql_uniform_actions
+            cql_loss1 = cql_q1_logsumexp - dataset_q1
+            cql_loss2 = cql_q2_logsumexp - dataset_q2
 
-            # --- Get Q-values for all sampled actions (using online encoder/decoders) ---
-            cql_q1_policy = self.critic_net1(cql_lstm_out_policy, actions=cql_policy_actions_persistent)
-            cql_q2_policy = self.critic_net2(cql_lstm_out_policy, actions=cql_policy_actions_persistent)
+            # 9. Apply and update our Lagrangian alpha
+            cql_alpha = self.log_cql_alpha.exp().clamp(min=0.0, max=100)
 
-            cql_q1_uniform = self.critic_net1(cql_lstm_out_policy, actions=cql_uniform_actions_persistent)
-            cql_q2_uniform = self.critic_net2(cql_lstm_out_policy, actions=cql_uniform_actions_persistent)
+            scaled_cql_loss1 = cql_alpha.detach() * (cql_loss1 - self._target_cql_alpha_gap)
+            scaled_cql_loss2 = cql_alpha.detach() * (cql_loss2 - self._target_cql_alpha_gap)
+            scaled_cql_loss = scaled_cql_loss1 + scaled_cql_loss2
 
-            # --- Apply log-prob correction (log Q - log pi) ---
-            cql_q1_policy = cql_q1_policy - cql_policy_log_probs
-            cql_q2_policy = cql_q2_policy - cql_policy_log_probs
+            cql_alpha_loss1 = cql_alpha * (cql_loss1.detach() - self._target_cql_alpha_gap)
+            cql_alpha_loss2 = cql_alpha * (cql_loss2.detach() - self._target_cql_alpha_gap)
+            cql_alpha_loss = (- cql_alpha_loss1 - cql_alpha_loss2) * 0.5
 
-            # We need to broadcast the scalar log_prob to the tensor shape [N*k, T, 1]
-            cql_q1_uniform = cql_q1_uniform - self.cql_uniform_log_probs
-            cql_q2_uniform = cql_q2_uniform - self.cql_uniform_log_probs
+            # Use train_mask (which is False for padding AND burn-in)
+            final_mask = (train_mask * visible).float()  # Shape (N, T)
+            valid_count = final_mask.sum() + self._eps
 
-            # Concatenate policy and uniform samples along the sample dimension
-            cql_q1_cat = torch.cat([reshape_cql(cql_q1_policy), reshape_cql(cql_q1_uniform)], dim=-1)
-            cql_q2_cat = torch.cat([reshape_cql(cql_q2_policy), reshape_cql(cql_q2_uniform)], dim=-1)
+            scaled_cql_loss = scaled_cql_loss * final_mask
+            scaled_cql_loss = scaled_cql_loss.sum() / valid_count
 
-            # Calculate logsumexp: shape [N, T, 1]
-            logsumexp_q1 = torch.logsumexp(cql_q1_cat, dim=-1, keepdim=True)
-            logsumexp_q2 = torch.logsumexp(cql_q2_cat, dim=-1, keepdim=True)
+            cql_alpha_loss = cql_alpha_loss * final_mask
+            cql_alpha_loss = cql_alpha_loss.sum() / valid_count
 
-            # --- 5. Combine Losses and Apply Visible/Next_Visible Mask ---
+            total_loss = bellman_loss + scaled_cql_loss + cql_alpha_loss
 
-            if self.decoy_interval == 0:
-                # --- N-Step Return Mode: Filter all loss components to [M, 1] ---
-
-                # Get selected Bellman terms (shape [M, 1]) and the mask (shape [N, T])
-                q1_pred_sel, q2_pred_sel, q_target_sel, valid_mask = self._filter_to_correct_visibles(
-                    q1_pred, q2_pred, r, next_v, dones, visible, next_visible, padding_mask, train_mask)
-
-                # Calculate Bellman loss on selected elements
-                bellman_loss = F.mse_loss(q1_pred_sel, q_target_sel, reduction='none') + \
-                               F.mse_loss(q2_pred_sel, q_target_sel, reduction='none')  # Shape [M, 1]
-
-                # --- Filter CQL components to match ---
-                # Use the mask returned by the filter function
-                valid_mask_expanded = valid_mask.unsqueeze(-1)  # Shape [N, T, 1]
-
-                # Filter log_pi_data to match
-                log_pi_data_sel = log_pi_data[valid_mask_expanded].view(-1, 1)
-
-                # Select the logsumexp terms for the *same* M timesteps
-                logsumexp_q1_sel = logsumexp_q1[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
-                logsumexp_q2_sel = logsumexp_q2[valid_mask_expanded].view(-1, 1)  # Shape [M, 1]
-
-                # Calculate CQL loss on selected elements
-                cql_term1_data = q1_pred_sel - log_pi_data_sel
-                cql_term2_data = q2_pred_sel - log_pi_data_sel
-
-                cql_diff1 = logsumexp_q1_sel - cql_term1_data - self._cql_target
-                cql_diff2 = logsumexp_q2_sel - cql_term2_data - self._cql_target
-
-                cql_loss1 = F.relu(cql_diff1)
-                cql_loss2 = F.relu(cql_diff2)
-                cql_loss = cql_loss1 + cql_loss2  # Shape [M, 1]
-
-                # Combine losses
-                cql_alpha = self.log_cql_alpha.exp().detach()
-                total_loss_unmasked = bellman_loss + cql_alpha * cql_loss  # Shape [M, 1]
-
-                # --- NEW: Calculate and update log_cql_alpha ---
-                # The loss for alpha is the negative of the *mean* raw difference,
-                # weighted by the (non-detached) alpha.
-                # We want to increase alpha if (cql_diff - target) > 0
-                cql_diff_mean = (cql_diff1.mean() + cql_diff2.mean()) * 0.5
-                alpha_loss = -torch.exp(self.log_cql_alpha) * (cql_diff_mean - self._cql_target).detach()
-
-                # The loss is already filtered, just take the mean
-                total_loss = total_loss_unmasked.mean()
-
-            else:
-                # --- 1-Step Return Mode: Calculate on [N, T, 1] and mask at the end ---
-
-                # Calculate 1-step target for *all* timesteps
-                q_target = r + self._gamma * (1 - dones.float()) * next_v  # Shape [N, T, 1]
-
-                # Calculate Bellman loss for *all* timesteps
-                bellman_loss = F.mse_loss(q1_pred, q_target, reduction='none') + \
-                               F.mse_loss(q2_pred, q_target, reduction='none')  # Shape [N, T, 1]
-
-                # Calculate CQL Loss for *all* timesteps
-                cql_term1_data = q1_pred - log_pi_data  # Shape [N, T, 1]
-                cql_term2_data = q2_pred - log_pi_data  # Shape [N, T, 1]
-
-                cql_diff1 = logsumexp_q1 - cql_term1_data - self._cql_target
-                cql_diff2 = logsumexp_q2 - cql_term2_data - self._cql_target
-
-                cql_loss1 = F.relu(cql_diff1)
-                cql_loss2 = F.relu(cql_diff2)
-                cql_loss = cql_loss1 + cql_loss2  # Shape [N, T, 1]
-
-                # Combine losses
-                cql_alpha = self.log_cql_alpha.exp().detach()
-                total_loss_unmasked = bellman_loss + cql_alpha * cql_loss  # Shape [N, T, 1]
-
-                # --- Apply Masking ---
-                # Use train_mask (which is False for padding AND burn-in)
-                final_mask = train_mask.squeeze(-1).float()  # Shape (N, T)
-                valid_count = final_mask.sum() + self._eps
-                masked_loss = (total_loss_unmasked.squeeze(-1) * final_mask)
-                total_loss = masked_loss.sum() / valid_count
-
-                # do the same for the alpha loss
-                masked_cql_diff1 = (cql_diff1.squeeze(-1) * final_mask)
-                masked_cql_diff2 = (cql_diff2.squeeze(-1) * final_mask)
-                # Calculate the masked mean of the diffs
-                cql_diff1_mean = masked_cql_diff1.sum() / valid_count
-                cql_diff2_mean = masked_cql_diff2.sum() / valid_count
-                cql_diff_mean = (cql_diff1_mean + cql_diff2_mean) * 0.5
-                alpha_loss = -torch.exp(self.log_cql_alpha) * cql_diff_mean.detach()
 
         # Update critic and alpha
         self.critic_optim.zero_grad()
         self.cql_alpha_optim.zero_grad()
         if self.scaler:
-            self.scaler.scale(total_loss + alpha_loss).backward()
+            self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.critic_optim)
-            self.scaler.unscale_(self.cql_alpha_optim)
             torch.nn.utils.clip_grad_norm_(self.critic_net1.parameters(), 0.5)
             torch.nn.utils.clip_grad_norm_(self.critic_net2.parameters(), 0.5)
             self.scaler.step(self.critic_optim)
@@ -1294,7 +1224,11 @@ class RecurrentCQLSAC(_RecurrentBase):
             self.scaler.update()
         else:
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic_net1.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.critic_net2.parameters(), 0.5)
             self.critic_optim.step()
+            self.cql_alpha_optim.step()
+
         return total_loss
 
     @torch.compile
@@ -1311,46 +1245,48 @@ class RecurrentCQLSAC(_RecurrentBase):
             # This is the new 'actions_sampled'
             actions_sampled = dist.sample()
 
-            # If using decoy_interval == 0, persist actions over non-visible steps
-            if self.decoy_interval == 0:
-                actions_sampled_persistent = _persist_actions(actions_sampled, visible)
-            else:
-                actions_sampled_persistent = actions_sampled
-
             # Calculate log_prob of the sampled action
             # dist.log_prob() returns [N, T], so unsqueeze to [N, T, 1]
-            log_pi_sampled = dist.log_prob(actions_sampled).unsqueeze(-1)
+            log_pi_sampled = dist.log_prob(actions_sampled)
 
             # Get Q-values for these new actions
             # We pass u_sampled (normalized action) to the critics, as they expect.
             # We do *not* detach gradients here, as we need them to flow through Q into u_sampled
-            q1_values = self.critic_net1(lstm_out, actions=actions_sampled_persistent)
-            q2_values = self.critic_net2(lstm_out, actions=actions_sampled_persistent)
+            q1_values = self.critic_net1(lstm_out, actions=actions_sampled)
+            q2_values = self.critic_net2(lstm_out, actions=actions_sampled)
             q_values = torch.min(q1_values, q2_values)
 
             # Calculate SAC Actor Loss
             # The loss is (alpha * log_prob) - Q_value
-            policy_loss_unmasked = (self._entropy_alpha * log_pi_sampled - q_values)
+            entropy_alpha = self.log_entropy_alpha.exp().clamp(min=0.0, max=100.0)
+            policy_loss = (entropy_alpha.detach() * log_pi_sampled - q_values)
 
-            final_mask = train_mask.squeeze(-1)
-            if self.decoy_interval == 0:
-                final_mask = final_mask & visible.squeeze(-1)
+            # Calculate the alpha loss
+            alpha_loss = - (entropy_alpha * (log_pi_sampled + self._target_entropy_alpha).detach())
 
-            masked_loss = (policy_loss_unmasked.squeeze(-1) * final_mask.float())
-            policy_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
+            total_loss = policy_loss + alpha_loss
+
+            # Apply the mask to our losses
+            final_mask = (train_mask * visible)
+            total_loss = (total_loss * final_mask)
+            total_loss = total_loss.sum() / (final_mask.sum() + self._eps)
 
         self.policy_optim.zero_grad()
+        self.entropy_alpha_optim.zero_grad()
         if self.scaler:
-            self.scaler.scale(policy_loss).backward()
+            self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.policy_optim)
             torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.scaler.step(self.policy_optim)
+            self.scaler.step(self.entropy_alpha_optim)
             self.scaler.update()
         else:
-            policy_loss.backward()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.policy_optim.step()
+            self.entropy_alpha_optim.step()
 
-        return policy_loss
+        return total_loss
 
     def sync_target_networks(self, tau=None):
         tau = tau or self._tau_target
