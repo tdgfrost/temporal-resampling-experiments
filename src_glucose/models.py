@@ -182,6 +182,12 @@ class CustomBetaDistribution(nn.Module):
         # which makes the distribution more stable and uni-modal to start.
         # F.softplus(x) = log(1 + exp(x))
         alpha, beta = torch.chunk(params, 2, dim=-1)
+
+        LOGIT_CLAMP_MIN = -5.0  # Tunable hyperparameter
+        LOGIT_CLAMP_MAX = 5.0  # Tunable hyperparameter
+        alpha = torch.clamp(alpha, LOGIT_CLAMP_MIN, LOGIT_CLAMP_MAX)
+        beta = torch.clamp(beta, LOGIT_CLAMP_MIN, LOGIT_CLAMP_MAX)
+
         self.alpha = F.softplus(alpha) + 1.0
         self.beta = F.softplus(beta) + 1.0
 
@@ -227,12 +233,11 @@ class CustomBetaDistribution(nn.Module):
         # Scale and shift to [low, high]
         return self.scale * u + self.bias
 
-    def log_prob(self, actions: torch.Tensor, gaussian_actions: torch.Tensor | None = None) -> torch.Tensor:
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         """
         Get the log-probability of taking a specific action.
 
         :param actions: The actions taken (in range [low, high])
-        :param gaussian_actions: Ignored (kept for API compatibility)
         """
         # Un-scale the actions from [low, high] back to [0, 1]
         u = (actions - self.bias) / self.scale
@@ -242,7 +247,6 @@ class CustomBetaDistribution(nn.Module):
 
         # Get log-prob from the base Beta distribution
         log_prob = self.distribution.log_prob(u)
-        log_prob = sum_independent_dims(log_prob)
 
         # Account for the scaling transformation
         # log_prob(action) = log_prob(u) - log(scale)
