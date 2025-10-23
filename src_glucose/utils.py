@@ -135,7 +135,7 @@ class ReplayBufferEnv:
             'all_term': [],
             'all_trunc': [],
             'all_done': [],
-            'visible_state': [obs[0] == 0]
+            'visible_state': [True]
         }
 
     def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, with_random: bool = True,
@@ -162,7 +162,7 @@ class ReplayBufferEnv:
                     #       action = np.random.uniform(low=0, high=2, size=1).astype(np.float32)
                     obs, reward, term, trunc, info = self.env.step(action)
                     # Get the real action delivered
-                    real_action = obs[-2] * INSULIN_SCALE
+                    real_action = obs[1] * INSULIN_SCALE
                     done = term or trunc
                     total_reward += reward
 
@@ -216,23 +216,14 @@ class ReplayBufferEnv:
         ep_buffer['all_term'] += [term]
         ep_buffer['all_trunc'] += [trunc]
         ep_buffer['all_done'] += [term or trunc]
-        ep_buffer['visible_state'] += [obs[1] == 0]
+        ep_buffer['visible_state'] += [info['steps_until_action_available'] == 0]
 
     def update_permanent_buffer(self, ep_buffer: dict):
         visible_idxs = ep_buffer['visible_state']
-        #ep_buffer['all_obs'] = np.stack(ep_buffer['all_obs'])
-        #ep_buffer['all_obs'][:, 1:3] = 0  # Set the flags to 0 for the decoy buffers
-        #ep_buffer['all_obs'] = ep_buffer['all_obs'].tolist()
         for i in range(2):
             for arr, key in [
                 (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
             ]:
-                if i > 0 and key == 'obs':
-                    # Set the flags to 0 for the decoy buffers
-                    ep_buffer['all_obs'] = np.stack(ep_buffer['all_obs'])
-                    ep_buffer['all_obs'][..., 1:3] = 0
-                    ep_buffer['all_obs'] = ep_buffer['all_obs'].tolist()
-
                 arr[i] += ep_buffer[f'all_{key}']
 
             self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
@@ -289,10 +280,6 @@ class ReplayBufferEnv:
         rewards[-1] += early_termination_reward(terms[-1])
         """
 
-        # if not dones[-1]:
-        # rewards[-1] = ep_buffer['reward'][-1]
-        # dones[-1] = ep_buffer['done'][-1]
-        # assert dones[-1], "Last done flag should be True"
         if not dones or not dones[-1]:
             # Skip this episode - too short
             return
@@ -302,27 +289,6 @@ class ReplayBufferEnv:
         self.dones[2] += dones
         self.sample_bool[2] += [True for _ in range(len(dones))]
         self.visible_states[2] += [True for _ in range(len(dones))]
-
-    def sample_transition_batch(self, batch_size: int = 32, decoy_interval: int = 0):
-        idxs = torch.randint(0, len(self.observations[decoy_interval]) - 1, (batch_size,), device=self._device)
-        return self.fetch_transition_batch(idxs, decoy_interval)
-
-    def fetch_transition_batch(self, idxs: torch.Tensor, decoy_interval: int = 0):
-        assert self._tensors_set, "Replay buffer must be set to tensors first using .set_to_tensors(model)"
-        obs_batch = self.observations[decoy_interval][idxs]
-        next_obs_batch = self.observations[decoy_interval][idxs + 1]
-        action_batch = self.actions[decoy_interval][idxs].unsqueeze(-1)
-        reward_batch = self.rewards[decoy_interval][idxs].unsqueeze(-1)
-        done_batch = self.dones[decoy_interval][idxs].unsqueeze(-1)
-
-        flags = self._extract_flags(obs_batch)
-        next_flags = self._extract_flags(next_obs_batch)
-
-        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, flags, next_flags
-
-    @staticmethod
-    def _extract_flags(obs):
-        return obs[..., 0].unsqueeze(-1).long()
 
 
 class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original class
@@ -402,9 +368,7 @@ class RecurrentReplayBufferEnv(ReplayBufferEnv):  # Inherits from your original 
 
         # n_samples is now the number of sequences in the buffer
         self.n_samples = len(self.sequence_info[self.decoy_interval])
-        # old code: self.segments = self.n_samples // self.batch_size if self.n_samples > 0 else 0
         if self.n_samples == 0:
-            total_segments = 0
             self.segments = 0
         else:
             total_segments = self.n_samples // self.batch_size

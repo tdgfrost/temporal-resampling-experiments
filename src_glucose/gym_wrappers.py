@@ -129,6 +129,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         self.last_action = 0
         obs, info = self.env.reset(*args, **kwargs)
         self._apply_rules(obs)
+        info['steps_until_action_available'] = self.steps_until_action_available
         return obs, info
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -137,12 +138,14 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             obs, reward, term, trunc, info = self.env.step(action)
             # flip the steps, calculate steps remaining
             self._flip_step_modes(action, obs)
+            info['steps_until_action_available'] = self.steps_until_action_available
         else:
             # Repeat the last action
             obs, reward, term, trunc, info = self.env.step(self.last_action)
 
             # Deduce 1 step from steps remaining
             self.steps_until_action_available -= 1
+            info['steps_until_action_available'] = self.steps_until_action_available
 
         return obs, reward, term, trunc, info
 
@@ -182,27 +185,22 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     0 -> next action repeats once; 1 -> next action repeats twice.
     """
 
-    def __init__(self, env, use_flag: bool = True):
+    def __init__(self, env):
         RecordConstructorArgs.__init__(self)
         ObservationWrapper.__init__(self, env)
 
         assert isinstance(env.observation_space, spaces.Box)
         low, high = env.observation_space.low, env.observation_space.high
-        self.state_dim = (low.shape[0] + 3,)
+        self.state_dim = (low.shape[0] + 1,)
         self.dtype = low.dtype
-        low, high = np.concatenate([[0, 0, 0], low]), np.concatenate([[48, 1, 2], high])
+        low, high = np.concatenate([low, [0]]), np.concatenate([high, [1]])
         self.observation_space = spaces.Box(
             low=low, high=high, shape=self.state_dim, dtype=self.dtype
         )
-        self.use_flag = use_flag
 
     def observation(self, obs):
-        # Concat flag (0/1) to the start of the channels
-        # - always set to 0 if use_flag = False
-        steps_left = self.env.get_wrapper_attr("steps_until_action_available") / TOTAL_SIZE if self.use_flag else 0
-        waiting_period = self.env.get_wrapper_attr("next_waiting_period") / TOTAL_SIZE if self.use_flag and steps_left == 0 else 0
         hour_float = self.env.get_wrapper_attr('get_time')() / 48
-        return np.concatenate([[hour_float, steps_left, waiting_period], obs], axis=-1)
+        return np.concatenate([obs, [hour_float]], axis=-1)
 
 
 class EnforcePPOWrapper(Wrapper):
@@ -246,7 +244,7 @@ class EnforcePPOWrapper(Wrapper):
 
 
 def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
-                     forced_interval: int = 0, use_flag: bool = True, use_scaling: bool = False, **kwargs):
+                     forced_interval: int = 0, use_scaling: bool = False, **kwargs):
     env = T1DPatientEnv(use_test_ids, **kwargs)
     env = SampleTimeWrapper(env)
     if use_scaling:
@@ -255,5 +253,5 @@ def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = F
         env = EpisodeRewardsOnly(env)
     env = FixedScaler(env)
     env = AlternateStepWrapper(env, forced_interval=forced_interval)
-    env = RepeatFlagChannel(env, use_flag=use_flag)  # +1 channel flag
+    env = RepeatFlagChannel(env)
     return env

@@ -104,25 +104,19 @@ if __name__ == "__main__":
 
         # Get our evaluators
         evaluators = {}
-        for key, (interval, flag) in [
-            ["glucose_irregular", (0, not DECOY_INTERVAL)],
-            ["glucose_regular", (1, False)],
+        for key, interval in [
+            ["glucose_irregular", 0],
+            ["glucose_regular", 1],
         ]:
-            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=flag,
-                                                                    forced_interval=interval,
-                                                                    no_interim_rewards=True,
+            evaluators[key] = EnvironmentEvaluator(make_glucose_env(forced_interval=interval,
                                                                     use_test_ids=True),
-                                                   n_trials=50,
-                                                   )
+                                                   n_trials=50)
 
         if DECOY_INTERVAL == 2:
-            evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(use_flag=False,  # flag,
-                                                                                               forced_interval=interval,
-                                                                                               no_interim_rewards=True,
+            evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(forced_interval=0,
                                                                                                use_test_ids=True),
                                                                               n_trials=50,
-                                                                              running_average_obs=True,
-                                                                              )
+                                                                              running_average_obs=True)
 
         for n_trial in range(10):
             logs['expectile'].append(EXPECTILE)
