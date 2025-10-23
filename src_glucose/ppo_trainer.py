@@ -128,14 +128,9 @@ class CustomBetaDistribution(nn.Module):
         :param params: Raw output from the actor head (batch_size, action_dim * 2)
         """
         # Split the output into alpha and beta parameters
-        # We add 1.0 + softplus(x) to ensure alpha and beta are > 1,
-        # which makes the distribution more stable and uni-modal to start.
-        # F.softplus(x) = log(1 + exp(x))
         alpha, beta = torch.chunk(params, 2, dim=-1)
 
-        alpha = torch.clamp(alpha, self.logit_clamp_min, self.logit_clamp_max)
-        beta = torch.clamp(beta, self.logit_clamp_min, self.logit_clamp_max)
-
+        # Softplus to keep alpha, beta > 1 for unimodal distribution
         self.alpha = F.softplus(alpha) + 1.0
         self.beta = F.softplus(beta) + 1.0
 
