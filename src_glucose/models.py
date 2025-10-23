@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
-from torch.distributions import Beta
+from torch.distributions import Beta, Normal
 from tqdm import tqdm
 from gym_wrappers import TOTAL_SIZE
 from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
@@ -158,6 +158,150 @@ class CustomBetaDistribution(nn.Module):
 
         # Account for the scaling transformation
         log_prob -= self.log_scale * self.action_dim
+        return log_prob
+
+
+class SquashedGaussianDistribution(nn.Module):
+    """
+    Squashed Gaussian distribution.
+
+    A Gaussian distribution is sampled, passed through a tanh squashing function
+    to bound the output to [-1, 1], and then scaled and shifted to fit the
+    arbitrary range [low, high].
+
+    This is commonly used in policy gradient methods (e.g., SAC) for
+    continuous action spaces with hard constraints.
+
+    :param action_dim: Dimension of the action space.
+    :param low: The lower bound of the action space.
+    :param high: The upper bound of the action space.
+    """
+
+    def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
+        super().__init__()
+        self.action_dim = action_dim
+        self.low = low
+        self.high = high
+
+        self.scale = (high - low) / 2.0
+        self.bias = (high + low) / 2.0
+
+        self.epsilon = 1e-6
+        self.distribution = None
+        self.mu = None
+        self.std = None
+
+        # --- Constants for numerical stability ---
+        self.LOG_STD_MIN = -20.0
+        self.LOG_STD_MAX = 2.0
+
+        # Pre-compute log_scale and register as a buffer
+        # This is log( (high - low) / 2 )
+        self.register_buffer("log_scale", torch.tensor(self.scale).log())
+
+    def proba_distribution(self, params: torch.Tensor):
+        """
+        Creates the distribution from the actor network's output.
+
+        :param params: Raw output from the actor head (batch_size, action_dim * 2)
+                       Assumed to be [mu, log_std].
+        """
+        # Split the output into mu and log_std
+        self.mu, log_std = torch.chunk(params, 2, dim=-1)
+
+        # Clamp log_std for numerical stability
+        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+
+        # Calculate std
+        self.std = log_std.exp()
+
+        # Create the underlying Normal (Gaussian) distribution
+        self.distribution = Normal(self.mu, self.std)
+        return self
+
+    def entropy(self) -> torch.Tensor:
+        """
+        Get the entropy of the *base* Gaussian distribution.
+
+        Note: This is an approximation. The true entropy of the squashed
+        and scaled distribution is complex to compute. In many RL algorithms
+        (like SAC), the "entropy bonus" is actually the expectation of the
+        log-probability, not the true differential entropy.
+
+        This returns the per-dimension entropy. The caller can .sum() if total
+        entropy is needed.
+        """
+        # Get entropy from the base Normal distribution
+        return self.distribution.entropy()
+
+    def sample(self) -> torch.Tensor:
+        """
+        Sample an action, using the reparameterization trick (rsample).
+        """
+        # 1. Sample from Normal(mu, std) -> range (-inf, inf)
+        z = self.distribution.rsample()
+
+        # 2. Squash using tanh -> range [-1, 1]
+        u = torch.tanh(z)
+
+        # 3. Scale and shift to [low, high]
+        return self.scale * u + self.bias
+
+    def mode(self) -> torch.Tensor:
+        """
+        Return the mode of the distribution (most likely action).
+        For a Gaussian, the mode is the mean (mu).
+        We pass the mean through the deterministic transformations.
+        """
+        # 1. Mode of the base Gaussian is mu
+        z = self.mu
+
+        # 2. Squash using tanh
+        u = torch.tanh(z)
+
+        # 3. Scale and shift
+        return self.scale * u + self.bias
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Get the log-probability of taking a specific action.
+
+        This requires inverting the transformations and applying the
+        change of variables formula.
+
+        :param actions: The actions taken (in range [low, high])
+        """
+        # --- Invert Transformations ---
+
+        # 1. Un-scale from [low, high] back to [-1, 1]
+        # u = (actions - bias) / scale
+        u = (actions - self.bias) / self.scale
+
+        # 2. Clamp for numerical stability (atanh is undefined at +/- 1)
+        # We clamp *slightly* inside the [-1, 1] bounds.
+        u = torch.clamp(u, -1.0 + self.epsilon, 1.0 - self.epsilon)
+
+        # 3. Invert tanh to get the pre-squashed Gaussian sample (z)
+        # z = atanh(u)
+        z = 0.5 * torch.log((1 + u) / (1 - u))
+
+        # 1. Get log-prob from the base Gaussian distribution
+        # This has shape (batch_size, action_dim)
+        log_prob_z = self.distribution.log_prob(z)
+
+        # 2. Calculate the log-determinant of the Jacobian
+        # log(1 - u^2)
+        log_det_tanh = torch.log(1 - u.pow(2) + self.epsilon)
+
+        # Total log-determinant (log_scale is scalar, broadcasts)
+        # (batch_size, action_dim)
+        log_det_jacobian = self.log_scale + log_det_tanh
+
+        # 3. Apply the change of variables formula
+        # log_prob(action) = log_prob(z) - log_det_jacobian
+        log_prob = log_prob_z - log_det_jacobian
+
+        # Returns log-prob per dimension, matching original class's behavior
         return log_prob
 
 
@@ -418,7 +562,8 @@ class _RecurrentBase(nn.Module):
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
-        self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH)
+        #self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH)
+        self.dist = SquashedGaussianDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH)
         self._eps = 1e-5
         self._tanh_scale = 1.0
 
@@ -857,7 +1002,7 @@ class RecurrentIQL(_RecurrentBase):
             # Get the IQL weights
             weights = 1.0
             if not self._cloning_only:
-                weights = torch.clip(torch.exp(self._beta * self._batch_diff), -100, 100)
+                weights = torch.clip(torch.exp(self._beta * self._batch_diff), 0, 100)
 
             # Apply the mask
             final_mask = train_mask & visible
