@@ -765,20 +765,31 @@ class RecurrentIQL(_RecurrentBase):
                 # Use target shared encoder and target value decoder
                 next_lstm_out, _ = self.target_shared_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None)
                 v_next = self.target_value_net(next_lstm_out, actions=None)
-                r = rews.float()
 
             if self.decoy_interval == 0:
                 q1, q2, q_target, _ = self._filter_to_correct_visibles(
-                    q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask)
-            else:
-                q_target = r + self._gamma * (1 - dones.float()) * v_next
+                    q1, q2, rews, v_next, dones, visible, next_visible, padding_mask, train_mask)
 
-            critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+                critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+
+            else:
+                q_target = rews + self._gamma * (1 - dones.float()) * v_next
+
+                q1_loss = F.mse_loss(q1, q_target, reduction='none')
+                q2_loss = F.mse_loss(q2, q_target, reduction='none')
+                critic_loss_unmasked = q1_loss + q2_loss
+
+                # Apply the mask
+                masked_loss = critic_loss_unmasked * train_mask
+                critic_loss = masked_loss.sum() / (train_mask.sum() + self._eps)
 
         # Scale the loss and perform the backward pass
         self.critic_optim.zero_grad()
         if self.scaler:
             self.scaler.scale(critic_loss).backward()
+            self.scaler.unscale_(self.critic_optim)
+            torch.nn.utils.clip_grad_norm_(self.critic_net1.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.critic_net2.parameters(), 0.5)
             self.scaler.step(self.critic_optim)
             self.scaler.update()
         else:
@@ -807,26 +818,17 @@ class RecurrentIQL(_RecurrentBase):
             weights = torch.absolute(self._expectile - (self._batch_diff < 0).float())
             value_loss_unmasked = (weights * (diff ** 2))  # Loss per timestep
 
-            # --- CORRECTED MASKING LOGIC ---
-            # Use train_mask (which is False for padding AND burn-in)
-            final_mask = train_mask.squeeze(-1)  # Shape (N, T)
-
-            # If the decoy_interval logic is active, also apply the 'visible' mask
-            if self.decoy_interval == 0:
-                final_mask = final_mask & visible.squeeze(-1)
-
-            # Apply the final mask to the loss
-            masked_loss = value_loss_unmasked.squeeze(-1) * final_mask.float()
-
-            # Calculate the mean loss ONLY over the valid, masked timesteps
-            # Add a small epsilon to prevent division by zero
+            # Apply the mask
+            final_mask = train_mask & visible
+            masked_loss = value_loss_unmasked * final_mask
             value_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
-            # --- END OF CORRECTION ---
 
         # The rest of the function remains the same
         self.value_optim.zero_grad()
         if self.scaler:
             self.scaler.scale(value_loss).backward()
+            self.scaler.unscale_(self.value_optim)
+            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
             self.scaler.step(self.value_optim)
             self.scaler.update()
         else:
@@ -846,33 +848,28 @@ class RecurrentIQL(_RecurrentBase):
             dist = self.dist.proba_distribution(params)
 
             # Calculate the log-probability of the expert actions `acts`
-            #    under the new Beta distribution.
-            #    The `dist.log_prob` method handles all transformations and scaling.
+            # under the new Beta distribution.
             log_pi = dist.log_prob(acts)
 
-            # 2. The policy loss is the Negative Log-Likelihood (NLL)
+            # The policy loss is the Negative Log-Likelihood (NLL)
             policy_loss_unmasked = -log_pi
 
-            # 5. Get the IQL weights
+            # Get the IQL weights
             weights = 1.0
             if not self._cloning_only:
                 weights = torch.clip(torch.exp(self._beta * self._batch_diff), -100, 100)
 
-                # Ensure weights have the same shape as policy_loss for broadcasting
-                weights = weights.squeeze(-1)  # Shape (N, T)
-
             # Apply the mask
-            final_mask = train_mask.squeeze(-1)
-            if self.decoy_interval == 0:
-                final_mask = final_mask & visible.squeeze(-1)
-
-            masked_loss = policy_loss_unmasked * weights * final_mask.float()
+            final_mask = train_mask & visible
+            masked_loss = policy_loss_unmasked * weights * final_mask
             policy_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
         # The rest of the function remains the same
         self.policy_optim.zero_grad()
         if self.scaler:
             self.scaler.scale(policy_loss).backward()
+            self.scaler.unscale_(self.policy_optim)
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.scaler.step(self.policy_optim)
             self.scaler.update()
         else:
@@ -1014,21 +1011,20 @@ class RecurrentCQLSAC(_RecurrentBase):
                 alpha = self.log_entropy_alpha.exp().detach()
                 next_v = next_q - alpha * next_log_pi
 
-                r = rews.float()
-                dones = dones.float()
-
             # 4. Create the Bellman loss
             if self.decoy_interval == 0:
                 q1_pred, q2_pred, q_target, valid_mask = self._filter_to_correct_visibles(
-                    q1_pred, q2_pred, r, next_v, dones, visible, next_visible, padding_mask, train_mask)
+                    q1_pred, q2_pred, rews, next_v, dones, visible, next_visible, padding_mask, train_mask)
 
                 bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
 
             else:
-                q_target = r + self._gamma * (1 - dones) * next_v
+                q_target = rews + self._gamma * (1 - dones) * next_v
 
-                bellman_loss = F.mse_loss(q1_pred, q_target, reduction='none') + \
-                               F.mse_loss(q2_pred, q_target, reduction='none')  # Shape [N, T, 1]
+                q1_loss = F.mse_loss(q1_pred, q_target, reduction='none')
+                q2_loss = F.mse_loss(q2_pred, q_target, reduction='none')
+
+                bellman_loss = q1_loss + q2_loss  # Shape [N, T, 1]
 
                 # Use train_mask (which is False for padding AND burn-in)
                 valid_count = train_mask.sum() + self._eps
@@ -1037,7 +1033,7 @@ class RecurrentCQLSAC(_RecurrentBase):
 
 
             # ---- Logsumexp Loss ---- #
-            cql_n_samples = 5 # for each of policy and uniform
+            cql_n_samples = 10 # for each of policy and uniform
             collapsed_dim = (cql_n_samples * 2 * batch_size, seq_len, -1)
             expanded_dim = (cql_n_samples * 2, batch_size, seq_len, -1)
             cql_lstm_out = (
@@ -1090,7 +1086,7 @@ class RecurrentCQLSAC(_RecurrentBase):
             cql_alpha_loss = (- cql_alpha_loss1 - cql_alpha_loss2) * 0.5
 
             # Use train_mask (which is False for padding AND burn-in)
-            final_mask = (train_mask * visible).float()  # Shape (N, T)
+            final_mask = train_mask * visible  # Shape (N, T)
             valid_count = final_mask.sum() + self._eps
 
             scaled_cql_loss = scaled_cql_loss * final_mask
