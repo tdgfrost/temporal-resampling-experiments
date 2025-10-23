@@ -109,7 +109,7 @@ if __name__ == "__main__":
             ["glucose_irregular", (0, not DECOY_INTERVAL)],
             ["glucose_regular", (1, False)],
         ]:
-            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=False,  # flag,
+            evaluators[key] = EnvironmentEvaluator(make_glucose_env(use_flag=flag,
                                                                     forced_interval=interval,
                                                                     no_interim_rewards=True,
                                                                     use_test_ids=True),
@@ -147,7 +147,7 @@ if __name__ == "__main__":
 
             algo.compile()
 
-            n_train_epochs = 200 if EXPECTILE == 0.5 else 50
+            n_train_epochs = 200 if EXPECTILE == 0.5 else 100
             epoch_frac = 1.0
             if DECOY_INTERVAL == 1:
                 # n_train_epochs = int(n_train_epochs // 10)

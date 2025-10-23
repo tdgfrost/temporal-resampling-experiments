@@ -220,9 +220,26 @@ class ReplayBufferEnv:
 
     def update_permanent_buffer(self, ep_buffer: dict):
         visible_idxs = ep_buffer['visible_state']
-        ep_buffer['all_obs'] = np.stack(ep_buffer['all_obs'])
-        ep_buffer['all_obs'][:, 1:3] = 0  # Set the flags to 0 for the non-decoy buffer
-        ep_buffer['all_obs'] = ep_buffer['all_obs'].tolist()
+        #ep_buffer['all_obs'] = np.stack(ep_buffer['all_obs'])
+        #ep_buffer['all_obs'][:, 1:3] = 0  # Set the flags to 0 for the decoy buffers
+        #ep_buffer['all_obs'] = ep_buffer['all_obs'].tolist()
+        for i in range(2):
+            for arr, key in [
+                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
+            ]:
+                if i > 0 and key == 'obs':
+                    # Set the flags to 0 for the decoy buffers
+                    ep_buffer['all_obs'] = np.stack(ep_buffer['all_obs'])
+                    ep_buffer['all_obs'][..., 1:3] = 0
+                    ep_buffer['all_obs'] = ep_buffer['all_obs'].tolist()
+
+                arr[i] += ep_buffer[f'all_{key}']
+
+            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
+
+        # Update visible states
+        self.visible_states[0] += visible_idxs
+        self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
 
         # Generate our aggregated datapoints for decoy_interval = 2
         # e.g., for window_size = 3, we use the following aggregates:
@@ -285,18 +302,6 @@ class ReplayBufferEnv:
         self.dones[2] += dones
         self.sample_bool[2] += [True for _ in range(len(dones))]
         self.visible_states[2] += [True for _ in range(len(dones))]
-
-        for i in range(2):
-            for arr, key in [
-                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
-            ]:
-                arr[i] += ep_buffer[f'all_{key}']
-
-            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
-
-        # Update visible states
-        self.visible_states[0] += visible_idxs
-        self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
 
     def sample_transition_batch(self, batch_size: int = 32, decoy_interval: int = 0):
         idxs = torch.randint(0, len(self.observations[decoy_interval]) - 1, (batch_size,), device=self._device)
