@@ -95,7 +95,7 @@ class ReplayBufferEnv:
             np.savez(os.path.join(path, f'{key}.npz'),
                      **{str(k): v for k, v in save_dict.items()})
 
-        # Also save min/max rewards scale and dataset avg
+        # Also save reward dataset avg
         np.savez(os.path.join(path, 'rewards_scale.npz'),
                  **{'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
 
@@ -116,7 +116,7 @@ class ReplayBufferEnv:
             for k in loaded.files:
                 value[int(k)] = deque(loaded[k], maxlen=self.buffer_size)
 
-        # Load min/max rewards scale
+        # Load avg rewards
         loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
         self.dataset_avg = float(loaded_scale['dataset_avg'])
         self.dataset_std = float(loaded_scale['dataset_std'])
@@ -151,7 +151,7 @@ class ReplayBufferEnv:
 
             while frame_count < n_frames:
                 done = False
-                lstm_states = None
+                lstm_states = model.ac_network.init_hidden_state(batch_size=1)
                 total_reward = 0
                 while not done:
                     action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=True)
