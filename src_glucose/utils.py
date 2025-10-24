@@ -350,6 +350,16 @@ class RecurrentReplayBufferEnv:
             self.dataset_avg = total_rewards.mean()
             self.dataset_std = total_rewards.std()
 
+            # Scale the rewards for training
+            all_rewards = np.array(self.rewards[0])
+            #r_mean, r_std = all_rewards.mean(), all_rewards.std()
+            rmin, rmax = all_rewards.min(), all_rewards.max()
+            for i in [0, 1, 2]:
+                rewards = np.array(self.rewards[i])
+                #norm_rewards = (rewards - r_mean) / (r_std + 1e-8)
+                norm_rewards = (rewards - rmin) / (rmax - rmin + 1e-8)
+                self.rewards[i] = deque(norm_rewards.tolist(), maxlen=self.buffer_size)
+
     def set_to_tensors(self, device: str = 'cpu'):
         def _set_device(some_arr):
             if isinstance(some_arr, torch.Tensor):
@@ -406,22 +416,22 @@ class RecurrentReplayBufferEnv:
 
         obs = [
             np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)
-            for idx in range(0, len(ep_buffer['all_obs']) - agg_window, agg_window)
+            for idx in range(0, len(ep_buffer['all_obs']) + 1 - agg_window, agg_window)
         ]
 
         actions = [
             np.mean(ep_buffer['all_action'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_action']), agg_window)
+            for idx in range(agg_window, len(ep_buffer['all_action']) + 1, agg_window)
         ]
 
         dones = [
             np.any(ep_buffer['all_done'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_done']), agg_window)
+            for idx in range(agg_window, len(ep_buffer['all_done']) + 1, agg_window)
         ]
 
         rewards = [
             np.mean(ep_buffer['all_reward'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_reward']), agg_window)
+            for idx in range(agg_window, len(ep_buffer['all_reward']) + 1, agg_window)
         ]
 
         """
