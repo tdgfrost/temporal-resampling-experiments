@@ -194,8 +194,8 @@ class SquashedGaussianDistribution(nn.Module):
         self.std = None
 
         # --- Constants for numerical stability ---
-        self.LOG_STD_MIN = -5.0
-        self.LOG_STD_MAX = 2.0
+        self.log_std_min = -10.0
+        self.log_std_max = 2.0
 
         # Pre-compute log_scale and register as a buffer
         # This is log( (high - low) / 2 )
@@ -212,7 +212,7 @@ class SquashedGaussianDistribution(nn.Module):
         self.mu, log_std = torch.chunk(params, 2, dim=-1)
 
         # Clamp log_std for numerical stability
-        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
 
         # Calculate std
         self.std = log_std.exp()
@@ -609,8 +609,6 @@ class _RecurrentBase(nn.Module):
         self.policy_net: RecurrentNet = None
         # ---
 
-        if self.decoy_interval == 0:
-            sequence_length *= int((1 + TOTAL_SIZE) / 2)
         self._sequence_length = sequence_length
         self._burn_in_length = burn_in_length
         # Total sequence length including burn-in
@@ -1086,11 +1084,8 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._target_entropy_alpha = -1
         self._target_cql_alpha_gap = 0.
         self._update_step = 0
-        # We learn the log of entropy/cql alpha for numerical stability
-        self.log_entropy_alpha = torch.zeros(1, requires_grad=True, device=self._device)
-        self.log_cql_alpha = torch.zeros(1, requires_grad=True, device=self._device)
-        self.log_cql_alpha.data.fill_(-3)
-
+        self._entropy_alpha = torch.tensor(1.0, device=self._device)
+        self._cql_alpha = torch.tensor(1.0, device=self._device)
         self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
                                                              device=self._device))
 
@@ -1129,8 +1124,6 @@ class RecurrentCQLSAC(_RecurrentBase):
         self.target_critic_net2 = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(
             self._device)
         self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
-        self.cql_alpha_optim = torch.optim.Adam([self.log_cql_alpha], lr=self._critic_lr)
-        self.entropy_alpha_optim = torch.optim.Adam([self.log_entropy_alpha], lr=self._actor_lr)
 
         # --- Setup Optimizers ---
         self.critic_optim = torch.optim.Adam(
@@ -1212,8 +1205,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                 next_q = torch.min(next_q1, next_q2)
 
                 # Add entropy regularisation
-                alpha = self.log_entropy_alpha.exp().detach()
-                next_v = next_q - alpha * next_log_pi
+                next_v = next_q - self._entropy_alpha * next_log_pi
 
             # 4. Create the Bellman loss
             if self.decoy_interval == 0:
@@ -1223,7 +1215,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                 bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
 
             else:
-                q_target = rews + self._gamma * (1 - dones) * next_v
+                q_target = rews + self._gamma * (1 - dones.float()) * next_v
 
                 q1_loss = F.mse_loss(q1_pred, q_target, reduction='none')
                 q2_loss = F.mse_loss(q2_pred, q_target, reduction='none')
@@ -1291,15 +1283,9 @@ class RecurrentCQLSAC(_RecurrentBase):
             cql_loss2 = cql_q2_logsumexp - dataset_q2
 
             # 9. Apply and update our Lagrangian alpha
-            cql_alpha = self.log_cql_alpha.exp().clamp(min=0.0, max=10)
-
-            scaled_cql_loss1 = cql_alpha.detach() * (cql_loss1 - self._target_cql_alpha_gap)
-            scaled_cql_loss2 = cql_alpha.detach() * (cql_loss2 - self._target_cql_alpha_gap)
+            scaled_cql_loss1 = self._cql_alpha * (cql_loss1 - self._target_cql_alpha_gap)
+            scaled_cql_loss2 = self._cql_alpha * (cql_loss2 - self._target_cql_alpha_gap)
             scaled_cql_loss = scaled_cql_loss1 + scaled_cql_loss2
-
-            cql_alpha_loss1 = cql_alpha * (cql_loss1.detach() - self._target_cql_alpha_gap)
-            cql_alpha_loss2 = cql_alpha * (cql_loss2.detach() - self._target_cql_alpha_gap)
-            cql_alpha_loss = (- cql_alpha_loss1 - cql_alpha_loss2) * 0.5
 
             # Use train_mask (which is False for padding AND burn-in)
             final_mask = train_mask * visible  # Shape (N, T)
@@ -1308,14 +1294,10 @@ class RecurrentCQLSAC(_RecurrentBase):
             scaled_cql_loss = scaled_cql_loss * final_mask
             scaled_cql_loss = scaled_cql_loss.sum() / valid_count
 
-            cql_alpha_loss = cql_alpha_loss * final_mask
-            cql_alpha_loss = cql_alpha_loss.sum() / valid_count
-
-            total_loss = bellman_loss + scaled_cql_loss + cql_alpha_loss
+            total_loss = bellman_loss + scaled_cql_loss
 
         # Update critic and alpha
         self.critic_optim.zero_grad()
-        self.cql_alpha_optim.zero_grad()
         if self.scaler:
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.critic_optim)
@@ -1323,7 +1305,6 @@ class RecurrentCQLSAC(_RecurrentBase):
             torch.nn.utils.clip_grad_norm_(self.critic_net2.parameters(), 0.5)
             torch.nn.utils.clip_grad_norm_(self.shared_critic_encoder.parameters(), 0.5)
             self.scaler.step(self.critic_optim)
-            self.scaler.step(self.cql_alpha_optim)
             self.scaler.update()
         else:
             total_loss.backward()
@@ -1331,13 +1312,11 @@ class RecurrentCQLSAC(_RecurrentBase):
             torch.nn.utils.clip_grad_norm_(self.critic_net2.parameters(), 0.5)
             torch.nn.utils.clip_grad_norm_(self.shared_critic_encoder.parameters(), 0.5)
             self.critic_optim.step()
-            self.cql_alpha_optim.step()
 
-        if self._update_step % 500 == 0:
+        if False: # self._update_step % 500 == 0:
             # Print out the average Q values, average losses, and alphas
             print(f"\n===============\n"
-                  f"Step {self._update_step}: CQL Alpha = {cql_alpha.item():.5f}, Entropy Alpha = {alpha.item():.5f}, \n"
-                  f"Bellman Loss = {bellman_loss.item():.5f}, CQL Loss = {scaled_cql_loss.item():.5f}, \n"
+                  f"Step {self._update_step}: Bellman Loss = {bellman_loss.item():.5f}, CQL Loss = {scaled_cql_loss.item():.5f}, \n"
                   f"Avg Q1 = {q1_pred.mean().item():.5f}, Avg Q2 = {q2_pred.mean().item():.5f}, Avg CQL diff = {cql_loss1.mean()}, Avg entropy = {dist.entropy().mean()}\n===============")
 
         return bellman_loss + scaled_cql_loss
@@ -1371,37 +1350,26 @@ class RecurrentCQLSAC(_RecurrentBase):
 
             # Calculate SAC Actor Loss
             # The loss is (alpha * log_prob) - Q_value
-            entropy_alpha = self.log_entropy_alpha.exp().clamp(min=0.0, max=10.0)
             # Having (q_sampled - q_values) rather than q_sampled on its own doesn't change the gradient,
             # but does tell us if the actor is converging to positive-advantage actions during loss inspection.
-            policy_loss = (entropy_alpha.detach() * log_pi_sampled - (q_sampled - q_values))
-
-            # Calculate the alpha loss
-            alpha_loss = - (self.log_entropy_alpha * (log_pi_sampled + self._target_entropy_alpha).detach())
+            policy_loss = (self._entropy_alpha * log_pi_sampled - (q_sampled - q_values))
 
             # Apply the mask to our losses
             final_mask = (train_mask * visible)
             policy_loss = (policy_loss * final_mask)
             policy_loss = policy_loss.sum() / (final_mask.sum() + self._eps)
-            alpha_loss = (alpha_loss * final_mask)
-            alpha_loss = alpha_loss.sum() / (final_mask.sum() + self._eps)
-
-            total_loss = policy_loss + alpha_loss
 
         self.policy_optim.zero_grad()
-        self.entropy_alpha_optim.zero_grad()
         if self.scaler:
-            self.scaler.scale(total_loss).backward()
+            self.scaler.scale(policy_loss).backward()
             self.scaler.unscale_(self.policy_optim)
             torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.scaler.step(self.policy_optim)
-            self.scaler.step(self.entropy_alpha_optim)
             self.scaler.update()
         else:
-            total_loss.backward()
+            policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.policy_optim.step()
-            self.entropy_alpha_optim.step()
 
         return policy_loss
 

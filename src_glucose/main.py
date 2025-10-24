@@ -12,10 +12,10 @@ parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train P
 parser.add_argument('--train_offline', default=True, type=parse_bool, help='Train offline agent')
 parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql'],
                     help='Type of offline RL model to train (iql or cql)')
-parser.add_argument('--ppo_agent', default="best_model01_38.70.pth", type=str, help='Path to pre-trained PPO agent')
+parser.add_argument('--ppo_agent', default="best_model06_207.86.pth", type=str, help='Path to pre-trained PPO agent')
 
-parser.add_argument('--expectile', default=0.7, type=float, help='Expectile value for IQL training (0.5 is BC)')
-parser.add_argument('--beta', default=3., type=float, help='Beta parameter for IQL agent')
+parser.add_argument('--expectile', default=0.8, type=float, help='Expectile value for IQL training (0.5 is BC)')
+parser.add_argument('--beta', default=1., type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
@@ -72,8 +72,12 @@ if __name__ == "__main__":
         agent.fit(total_timesteps=10_000_000)
 
     if train_offline:
-        print(
-            f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}, BETA: {args.beta}")
+        if is_iql:
+            print(
+                f"DECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {args.beta}")
+        else:
+            print(
+                f"DECOY_INTERVAL: {DECOY_INTERVAL}")
 
         logs = defaultdict(list)
 
@@ -138,14 +142,14 @@ if __name__ == "__main__":
 
             algo.compile()
 
-            n_train_epochs = 200 if EXPECTILE == 0.5 else 100
             epoch_frac = 1.0
-            if DECOY_INTERVAL == 1:
-                # n_train_epochs = int(n_train_epochs // 10)
+            if DECOY_INTERVAL in [0, 1]:
                 n_train_epochs = 1
-                epoch_frac = 1.0
+                # epoch_frac = 0.5
             elif DECOY_INTERVAL == 2:
                 n_train_epochs = 200
+            else:
+                raise ValueError("Invalid decoy interval.")
 
             log_dict = algo.fit(
                 dataset=replay_buffer_env,
