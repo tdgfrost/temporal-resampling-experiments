@@ -160,6 +160,11 @@ if __name__ == "__main__":
 
         # Save logs
         os.makedirs('../logs_glucose/iql_minigrid_logs', exist_ok=True)
-        pl.DataFrame(logs).write_csv(
-            f'../logs_glucose/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}'
-            f'_beta={args.beta}.csv')
+        if is_iql:
+            csv_path = (f'../logs_glucose/iql_minigrid_logs/decoy={DECOY_INTERVAL}_expectile={EXPECTILE}'
+                        f'_beta={args.beta}.csv')
+        elif is_cql:
+            csv_path = f'../logs_glucose/iql_minigrid_logs/decoy={DECOY_INTERVAL}_CQL.csv'
+        else:
+            raise ValueError("Invalid offline model type.")
+        pl.DataFrame(logs).write_csv(csv_path)
