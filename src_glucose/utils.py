@@ -398,7 +398,7 @@ class RecurrentReplayBufferEnv:
         #      [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
         # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
         # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
-        # rew:                  |---------|    |----   (t3-t5, t6-t8, etc)
+        # rew:             |---------|    |-------     (t2-t4, t5-t7, etc)
         # (reward calculated from next obs)
 
         agg_window = AGGREGATE_WINDOW_SIZE
@@ -414,12 +414,12 @@ class RecurrentReplayBufferEnv:
         ]
 
         dones = [
-            np.any(ep_buffer['all_done'][idx: idx + agg_window])
+            np.any(ep_buffer['all_done'][(idx - 1): (idx - 1) + agg_window])
             for idx in range(agg_window, len(ep_buffer['all_done']), agg_window)
         ]
 
         rewards = [
-            np.mean(ep_buffer['all_reward'][idx: idx + agg_window])
+            np.mean(ep_buffer['all_reward'][(idx - 1): (idx - 1) + agg_window])
             for idx in range(agg_window, len(ep_buffer['all_reward']), agg_window)
         ]
 
