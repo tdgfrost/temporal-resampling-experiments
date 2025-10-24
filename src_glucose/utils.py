@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Callable, Optional, Tuple
 import numpy as np
 import torch
 from pathlib import Path
@@ -11,6 +11,7 @@ import os
 import shutil
 from simglucose.simulation.env import bg_in_range, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
+from gymnasium.vector import SyncVectorEnv
 
 
 class RecurrentReplayBufferEnv:
@@ -451,30 +452,6 @@ class RecurrentReplayBufferEnv:
         self.visible_states[2] += [True for _ in range(len(dones))]
 
 
-class SaveEachBestCallback(BaseCallback):
-    """Called by EvalCallback when a new best model is found."""
-
-    def __init__(self, save_dir: str, verbose: int = 0):
-        super().__init__(verbose)
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.idx = 0
-
-    def _on_step(self) -> bool:
-        # This is triggered by EvalCallback when there's a new best
-        self.idx += 1
-        best_mean = getattr(self.parent, "best_mean_reward", None)  # provided by EvalCallback
-        if best_mean is None:
-            fname = f"best_{self.idx:03d}_steps={self.num_timesteps}.zip"
-        else:
-            fname = f"best_{self.idx:03d}_steps={self.num_timesteps}_mean={best_mean:.2f}.zip"
-        path = self.save_dir / fname
-        self.model.save(str(path))
-        if self.verbose:
-            print(f"[SaveEachBest] Saved: {path}")
-        return True
-
-
 class EnvironmentEvaluator:
     def __init__(self, env, n_trials: int, running_average_obs: bool = False):
         assert n_trials > 0, "n_trials must be positive"
@@ -507,6 +484,140 @@ class EnvironmentEvaluator:
             mean_returns.append(total_reward)
 
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
+
+
+class ParallelEnvironmentEvaluator:
+    """
+    Evaluates a policy over n_eval_episodes using parallel environments.
+
+    :param env_fn: A function that returns a new Gymnasium environment instance.
+    :param n_eval_episodes: The total number of episodes to evaluate.
+    :param n_eval_envs: The number of parallel environments to run.
+    :param running_average_obs: Whether to feed the policy a running average
+        of observations.
+    :param aggregate_window_size: The window size for the observation average.
+    :param seed: An optional seed for environment reproducibility.
+    """
+
+    def __init__(self,
+                 env_fn: Callable,
+                 n_eval_episodes: int,
+                 n_eval_envs: int,
+                 running_average_obs: bool = False,
+                 aggregate_window_size: int = AGGREGATE_WINDOW_SIZE,
+                 seed: Optional[int] = None):
+
+        assert n_eval_episodes > 0, "n_eval_episodes must be positive"
+        assert n_eval_envs > 0, "n_eval_envs must be positive"
+
+        # Create the vectorized environment
+        self.eval_env = SyncVectorEnv([env_fn for _ in range(n_eval_envs)])
+
+        self.n_eval_episodes = n_eval_episodes
+        self.n_eval_envs = n_eval_envs
+        self.running_average_obs = running_average_obs
+        self.aggregate_window_size = aggregate_window_size
+        self.seed = seed
+
+    def __call__(self, algo) -> Tuple[float, float]:
+        # --- 1. Setup ---
+        all_episode_rewards = []
+        episode_rewards = np.zeros(self.n_eval_envs)
+
+        running_avg_deques = None
+        if self.running_average_obs:
+            running_avg_deques = [deque(maxlen=self.aggregate_window_size)
+                                  for _ in range(self.n_eval_envs)]
+
+        # --- 2. Reset Envs ---
+        if self.seed is not None:
+            # Seed each parallel environment deterministically
+            eval_seeds = [self.seed + i for i in range(self.n_eval_envs)]
+            obs, info = self.eval_env.reset(seed=eval_seeds)
+        else:
+            obs, info = self.eval_env.reset()
+
+        # Initialize running average deques with the first observation
+        if self.running_average_obs:
+            for i in range(self.n_eval_envs):
+                running_avg_deques[i].append(obs[i])
+
+        # Get initial hidden state for the batch
+        hidden_state = algo.get_initial_states(batch_size=self.n_eval_envs)
+
+        # --- 3. Run Episodes ---
+        while len(all_episode_rewards) < self.n_eval_episodes:
+
+            # --- 3a. Prepare Observations ---
+            obs_to_predict = obs
+            if self.running_average_obs:
+                # Calculate mean obs for each env in the batch
+                mean_obs_batch = [np.mean(np.stack(deque), axis=0)
+                                  for deque in running_avg_deques]
+                obs_to_predict = np.stack(mean_obs_batch) # for seq dim
+
+            # --- 3b. Predict Action ---
+            with torch.no_grad():
+                # Make sure the seq_dim is present
+                obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
+                action, hidden_state = algo.predict(obs_to_predict,
+                                                    hidden_state=hidden_state,
+                                                    deterministic=True)
+
+            # --- 3c. Step Environment ---
+            # action is a batch (B, ...), so we pass it directly
+            # (or convert to numpy if it's a tensor)
+            try:
+                action_np = action.cpu().numpy()
+            except AttributeError:
+                action_np = action  # Assume it's already numpy
+
+            next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
+            dones = terminated | truncated
+
+            episode_rewards += reward
+
+            # --- 3d. Handle Dones and State Updates ---
+            for i, done in enumerate(dones):
+                # Always append the *next* observation for the running average
+                if self.running_average_obs:
+                    running_avg_deques[i].append(next_obs[i])
+
+                if done:
+                    # An episode finished
+                    all_episode_rewards.append(episode_rewards[i])
+                    episode_rewards[i] = 0  # Reset reward accumulator
+
+                    # Reset hidden state for this env (mimicking your example)
+                    if isinstance(hidden_state, tuple):
+                        # Handle LSTM-like states (h, c)
+                        hidden_state[0][:, i, :] = 0
+                        hidden_state[1][:, i, :] = 0
+                    elif hidden_state is not None:
+                        # Handle GRU-like states
+                        hidden_state[:, i, :] = 0
+
+                    # Reset the running average deque for this env
+                    if self.running_average_obs:
+                        running_avg_deques[i].clear()
+                        # Add the new obs from the auto-reset
+                        running_avg_deques[i].append(next_obs[i])
+
+                        # The observation for the next loop
+            obs = next_obs
+
+        # --- 4. Cleanup & Return ---
+        self.eval_env.close()
+
+        # Ensure we only use the requested number of episodes
+        final_rewards = all_episode_rewards[:self.n_eval_episodes]
+        n_collected = len(final_rewards)
+
+        mean_return = float(np.mean(final_rewards))
+        # Calculate standard error of the mean
+        std_err = float(np.std(final_rewards) / np.sqrt(n_collected))
+
+        return mean_return, std_err
 
 
 def parse_bool(value, name: str = ''):

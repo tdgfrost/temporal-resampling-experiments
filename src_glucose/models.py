@@ -663,14 +663,15 @@ class _RecurrentBase(nn.Module):
         """
         Predicts an action for a single observation and manages the recurrent state.
         Returns the action and the next hidden state.
+
+        Expects obs to be of the relevant shape already (N, L, 1)
         """
         obs_tensor = self._to_tensors(obs)[0]
-        # Add batch dimension
-        obs_tensor = obs_tensor.unsqueeze(0)
+        assert obs_tensor.ndim == 3, "Observation must have shape (N, L, 1)."
 
         # Pass the current hidden_state to the policy network
         # 1. Call the shared encoder
-        #    Input: (1, 1, H, W, C), Output: (1, 1, hidden_size)
+        #    Input: (N, L, obs), Output: (N, L, D)
         assert self.shared_encoder is not None, "Missing shared encoder in the recurrent network."
         lstm_out, next_hidden_state = self.shared_encoder(obs_tensor,
                                                           hidden_state=hidden_state,
@@ -1331,37 +1332,3 @@ class RecurrentCQLSAC(_RecurrentBase):
         # Sync target shared encoder
         for target_param, param in zip(self.target_shared_encoder.parameters(), self.shared_encoder.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
-
-
-@torch.compile
-def _persist_actions(actions, visible_mask):
-    # We must clone to avoid modifying the original tensor
-    persisted_actions = actions.clone()
-
-    B, T, A_dim = persisted_actions.shape
-    device = persisted_actions.device
-
-    # 1. Create a tensor of indices [0, 1, 2, ..., T-1]
-    # Shape: [1, T, 1]
-    indices = torch.arange(T, device=device).view(1, T, 1)
-
-    # (Where not visible, set index to 0)
-    masked_indices = torch.where(
-        visible_mask,
-        indices,
-        0  # Set to 0 where not visible
-    )
-
-    # 3. Apply cummax to forward-fill the last valid index
-    # Shape: [B, T, 1]
-    filled_indices = torch.cummax(masked_indices, dim=1).values
-
-    # 4. Expand indices to match action dim and gather
-    # Shape: [B, T, A_dim]
-    filled_indices_expanded = filled_indices.expand(-1, -1, A_dim)
-
-    # Gather values from the actions
-    # This single operation replaces the entire loop
-    persisted_actions = torch.gather(persisted_actions, 1, filled_indices_expanded)
-
-    return persisted_actions

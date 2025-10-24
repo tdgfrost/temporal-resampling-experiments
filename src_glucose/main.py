@@ -104,15 +104,18 @@ if __name__ == "__main__":
             ["glucose_irregular", 0],
             ["glucose_regular", 1],
         ]:
-            evaluators[key] = EnvironmentEvaluator(make_glucose_env(forced_interval=interval,
-                                                                    use_test_ids=True),
-                                                   n_trials=50)
+            evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                   forced_interval=interval,
+                                                                   use_test_ids=True),
+                                                           n_eval_envs=5,
+                                                           n_eval_episodes=100)
 
         if DECOY_INTERVAL == 2:
-            evaluators["glucose_irregular_aggregated"] = EnvironmentEvaluator(make_glucose_env(forced_interval=0,
-                                                                                               use_test_ids=True),
-                                                                              n_trials=50,
-                                                                              running_average_obs=True)
+            evaluators["glucose_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                                              forced_interval=0,
+                                                                                              use_test_ids=True),
+                                                                                      n_eval_envs=5,
+                                                                                      n_eval_episodes=100)
 
         for n_trial in range(10):
             logs['expectile'].append(EXPECTILE)
