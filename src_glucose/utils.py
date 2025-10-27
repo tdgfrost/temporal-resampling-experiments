@@ -9,7 +9,8 @@ import argparse
 import inquirer
 import os
 import shutil
-from simglucose.simulation.env import bg_in_range, early_termination_reward
+
+from simglucose.simulation.env import bg_in_range_magni, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
 from gymnasium.vector import AsyncVectorEnv
 
@@ -452,7 +453,7 @@ class RecurrentReplayBufferEnv:
             for idx in range(agg_window, len(ep_buffer['all_obs']), agg_window)
         ]) * (600 - 10) + 10  # Scale back to real bg levels
 
-        rewards = [bg_in_range([i]) * SAMPLE_TIME for i in bg_levels]
+        rewards = [bg_in_range_magni([i]) * SAMPLE_TIME for i in bg_levels]
         rewards[-1] += early_termination_reward(terms[-1])
         """
 

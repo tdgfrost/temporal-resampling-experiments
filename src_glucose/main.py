@@ -14,8 +14,8 @@ parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 
                     help='Type of offline RL model to train (iql or cql)')
 parser.add_argument('--ppo_agent', default="best_model06_207.86.pth", type=str, help='Path to pre-trained PPO agent')
 
-parser.add_argument('--expectile', default=0.8, type=float, help='Expectile value for IQL training (0.5 is BC)')
-parser.add_argument('--beta', default=1., type=float, help='Beta parameter for IQL agent')
+parser.add_argument('--expectile', default=0.9, type=float, help='Expectile value for IQL training (0.5 is BC)')
+parser.add_argument('--beta', default=10., type=float, help='Beta parameter for IQL agent')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
@@ -52,7 +52,7 @@ if __name__ == "__main__":
     if train_ppo:
         GAMMA = 0.99
 
-        base_env = make_glucose_env()
+        base_env = make_glucose_env(use_scaling=True)
         env = EnforcePPOWrapper(base_env, gamma=GAMMA)
         env_creator_fn = partial(make_glucose_env, use_test_ids=True)
 
@@ -61,9 +61,9 @@ if __name__ == "__main__":
                              n_steps=1028,  # More data per update
                              entropy_coef=0.01,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
-                             batch_size=64,
+                             batch_size=256,
                              gae_lambda=0.95,
-                             n_epochs=10,  # Fewer epochs
+                             n_epochs=5,  # Fewer epochs
                              hidden_dim=128,
                              seed=123,
                              learning_rate=3e-4,  # Standard learning rate
@@ -85,7 +85,7 @@ if __name__ == "__main__":
         base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 500_000
+        dataset_size = 5_000_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
             model = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
@@ -130,10 +130,9 @@ if __name__ == "__main__":
             algo = offline_model(observation_shape=base_env.observation_space.shape,
                                  action_space=base_env.action_space,
                                  hidden_dim=128,
-                                 batch_size=32,
+                                 batch_size=256,
                                  expectile=EXPECTILE,
                                  gamma=GAMMA,
-                                 decoy_interval=DECOY_INTERVAL,
                                  value_lr=1e-4,
                                  policy_lr=1e-4,
                                  critic_lr=1e-4,
@@ -157,7 +156,7 @@ if __name__ == "__main__":
                 n_epochs_per_eval=n_train_epochs,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
-                dataset_kwargs={'decoy_interval': DECOY_INTERVAL, 'batch_size': 32, 'epoch_fraction': epoch_frac},
+                dataset_kwargs={'epoch_fraction': epoch_frac},
             )
             for key in evaluators.keys():
                 logs[f'{key}_eval'].append(log_dict[key][0])

@@ -11,7 +11,7 @@ from functools import partial
 import random
 
 INSULIN_ACTION_LOW = 0.0
-INSULIN_ACTION_HIGH = 2.0
+INSULIN_ACTION_HIGH = 0.5
 
 
 def set_seed(seed: int):
@@ -112,8 +112,6 @@ class CustomBetaDistribution(nn.Module):
         self.distribution = None
         self.alpha = None
         self.beta = None
-        self.logit_clamp_min = -5.0
-        self.logit_clamp_max = 5.0
 
         # Pre-compute log_scale for log_prob calculation
         self.log_scale = torch.tensor(self.scale).log()

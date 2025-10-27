@@ -148,7 +148,7 @@ class CustomBetaDistribution(nn.Module):
         We use the mean as a stable approximation.
         Mean is a / (a + b)
         """
-        u = self.distribution.mode  # range [0, 1]
+        u = self.distribution.mean  # range [0, 1]
 
         # Scale and shift to [low, high]
         return self.scale * u + self.bias
@@ -635,13 +635,13 @@ class RecurrentNet(nn.Module):
 class _RecurrentBase(nn.Module):
     def __init__(self, observation_shape: Tuple[int,], hidden_dim: int = 128, gamma: float = 0.99,
                  recurrent_hidden_size: int = None, batch_size: int = 128,
-                 device: str = 'cpu', decoy_interval: int = 0, critic_lr: float = 3e-4,
+                 device: str = 'cpu', critic_lr: float = 3e-4,
                  value_lr: float = 3e-4, actor_lr: float = 3e-4, sequence_length: int = 64,
                  burn_in_length: int = 20, *args, **kwargs):
         super().__init__()
         self._cloning_only = False
         self._device = device
-        self.decoy_interval = decoy_interval
+        self.decoy_interval = None
         self.scaler = None
         self._batch_diff = None
         self._critic_lr = critic_lr
@@ -689,13 +689,15 @@ class _RecurrentBase(nn.Module):
             decoy_interval: int = 0,
             dataset_kwargs: Optional[Dict] = None
     ):
-        # Initialise our dataset and loss dictionary
-        dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
-        dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
-                                    burn_in_length=self._burn_in_length, **dataset_kwargs)
         self.decoy_interval = decoy_interval
         if torch.cuda.is_available():
             self.scaler = torch.amp.GradScaler('cuda')
+
+        # Initialise our dataset and loss dictionary
+        dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
+        dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
+                                    decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
+                                    batch_size=self._batch_size, **dataset_kwargs)
 
         loss_dict = self._reset_loss_dict()
 

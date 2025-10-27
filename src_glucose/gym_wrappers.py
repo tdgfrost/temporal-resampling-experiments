@@ -6,6 +6,7 @@ from gymnasium.utils import RecordConstructorArgs
 from gymnasium.wrappers import NormalizeReward
 from minigrid.wrappers import Wrapper
 from gymnasium.envs.registration import register
+import random
 
 SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 24  # 24 * 10 minutes = 240 minutes
@@ -168,13 +169,15 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         - 0600 - 2200 - Lognormal sampling
         """
         current_bg = self._get_current_bg(obs)
-        if current_bg < 70 or current_bg > 300:
+        if False: #current_bg < 54 or current_bg > 450:
             self.steps_until_action_available = 0
             self.next_waiting_period = 0
             return
 
         self.steps_until_action_available = self.next_waiting_period
-        self.next_waiting_period = int(np.clip(np.rint(np.random.normal(6.0, 1.5)), 1, TOTAL_SIZE)) - 1
+        # self.next_waiting_period = int(np.clip(np.rint(np.random.normal(12.0, 2)), 6, TOTAL_SIZE)) - 1
+        # self.next_waiting_period = int(np.random.choice([1, 3, 6, 9, 12], p=[0.1, 0.1, 0.1, 0.1, 0.6])) - 1
+        self.next_waiting_period = random.randint(1, TOTAL_SIZE) - 1
 
     @staticmethod
     def _get_current_bg(obs):
