@@ -76,20 +76,25 @@ class CustomBetaDistribution(nn.Module):
     :param high: The upper bound of the action space.
     """
 
-    def __init__(self, action_dim: int, low: float = 0.0, high: float = 2.0):
+    def __init__(self, action_dim: int = 1, low: float = 0.0, high: float = 2.0):
         super().__init__()
         self.action_dim = action_dim
+        self.low = low
+        self.high = high
+
         self.scale = float(high - low)
         self.bias = float(low)
+
         self.epsilon = 1e-6
         self.distribution = None
         self.alpha = None
         self.beta = None
-        self.logit_clamp_min = -5.0
-        self.logit_clamp_max = 5.0
+
+        # --- Constants for numerical stability ---
+        # self.clamp_max = 50.0
 
         # Pre-compute log_scale for log_prob calculation
-        self.log_scale = torch.tensor(self.scale).log()
+        self.register_buffer("log_scale", torch.tensor(self.scale).log())
 
     def proba_distribution(self, params: torch.Tensor):
         """
@@ -103,6 +108,10 @@ class CustomBetaDistribution(nn.Module):
         # Softplus to keep alpha, beta > 1 for unimodal distribution
         self.alpha = F.softplus(alpha) + 1.0
         self.beta = F.softplus(beta) + 1.0
+
+        # (optional) Clamp for numerical stability
+        # self.alpha = torch.clamp(self.alpha, 1.0, self.clamp_max)
+        # self.beta = torch.clamp(self.beta, 1.0, self.clamp_max)
 
         # Create the underlying Beta distribution
         self.distribution = Beta(self.alpha, self.beta)
@@ -138,7 +147,7 @@ class CustomBetaDistribution(nn.Module):
         We use the mean as a stable approximation.
         Mean is a / (a + b)
         """
-        u = self.distribution.mean  # range [0, 1]
+        u = self.distribution.mode  # range [0, 1]
 
         # Scale and shift to [low, high]
         return self.scale * u + self.bias
@@ -160,7 +169,34 @@ class CustomBetaDistribution(nn.Module):
 
         # Account for the scaling transformation
         log_prob -= self.log_scale * self.action_dim
-        return log_prob
+        return log_prob.sum(dim=-1, keepdim=True)
+
+    def sample_and_logprob(self):
+        """
+        Samples an action using the reparameterization trick AND computes
+        its log-probability in a single, numerically stable pass.
+
+        :return: (actions, log_prob)
+        """
+        # 1. Sample from Beta(alpha, beta) -> range [0, 1]
+        u = self.distribution.rsample()
+
+        # 2. Scale and shift to [low, high]
+        actions = self.scale * u + self.bias
+
+        # --- Calculate log_prob from u ---
+
+        # 1. Clamp u for numerical stability before log_prob
+        u_clamped = torch.clamp(u, self.epsilon, 1.0 - self.epsilon)
+
+        # 2. Get log-prob from the base Beta distribution
+        log_prob_u = self.distribution.log_prob(u_clamped)
+
+        # 3. Apply the change of variables formula
+        # log_prob(action) = log_prob(u) - log(scale)
+        log_pi = log_prob_u - self.log_scale * self.action_dim
+
+        return actions, log_pi.sum(dim=-1, keepdim=True)
 
 
 class SquashedGaussianDistribution(nn.Module):
