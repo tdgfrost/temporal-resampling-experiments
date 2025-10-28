@@ -352,12 +352,12 @@ class RecurrentReplayBufferEnv:
 
             # Scale the rewards for training
             all_rewards = np.array(self.rewards[0])
-            #r_mean, r_std = all_rewards.mean(), all_rewards.std()
-            rmin, rmax = all_rewards.min(), all_rewards.max()
+            r_mean, r_std = all_rewards.mean(), all_rewards.std()
+            # rmin, rmax = all_rewards.min(), all_rewards.max()
             for i in [0, 1, 2]:
                 rewards = np.array(self.rewards[i])
-                #norm_rewards = (rewards - r_mean) / (r_std + 1e-8)
-                norm_rewards = (rewards - rmin) / (rmax - rmin + 1e-8)
+                norm_rewards = (rewards - r_mean) / (r_std + 1e-8)
+                # norm_rewards = (rewards - rmin) / (rmax - rmin + 1e-8)
                 self.rewards[i] = deque(norm_rewards.tolist(), maxlen=self.buffer_size)
 
     def set_to_tensors(self, device: str = 'cpu'):
