@@ -11,7 +11,7 @@ import os
 import shutil
 from simglucose.simulation.env import bg_in_range, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
-from gymnasium.vector import SyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv
 
 
 class RecurrentReplayBufferEnv:
@@ -414,25 +414,25 @@ class RecurrentReplayBufferEnv:
 
         agg_window = AGGREGATE_WINDOW_SIZE
 
-        obs = [
-            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)
-            for idx in range(0, len(ep_buffer['all_obs']) + 1 - agg_window, agg_window)
-        ]
+        obs_data = np.array(ep_buffer['all_obs'])
+        action_data = np.array(ep_buffer['all_action'])
+        done_data = np.array(ep_buffer['all_done'])
+        reward_data = np.array(ep_buffer['all_reward'])
 
-        actions = [
-            np.mean(ep_buffer['all_action'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_action']) + 1, agg_window)
-        ]
+        # --- Aggregage obs ---
+        obs_indices = range(agg_window, len(obs_data) + 1, agg_window)
+        obs_splits = np.array_split(obs_data, obs_indices, axis=0)[:-1]  # Exclude last partial window
+        obs = [np.mean(chunk, axis=0) for chunk in obs_splits if chunk.size > 0]
 
-        dones = [
-            np.any(ep_buffer['all_done'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_done']) + 1, agg_window)
-        ]
+        # --- Aggregate actions / dones / rewards ---
+        slice_indices = range(agg_window - 1, len(obs_data), agg_window)
+        action_splits = np.array_split(action_data, slice_indices, axis=0)[1:]  # Exclude first partial window
+        done_splits = np.array_split(done_data, slice_indices, axis=0)[1:]  # Exclude first partial window
+        reward_splits = np.array_split(reward_data, slice_indices, axis=0)[1:]  # Exclude first partial window
 
-        rewards = [
-            np.mean(ep_buffer['all_reward'][(idx - 1): (idx - 1) + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_reward']) + 1, agg_window)
-        ]
+        actions = [np.mean(chunk, axis=0) for chunk in action_splits if chunk.size > 0]
+        dones = [np.any(chunk) for chunk in done_splits if chunk.size > 0]
+        rewards = [np.mean(chunk) for chunk in reward_splits if chunk.size > 0]
 
         """
         # Calculate early terminations for the additional reward component
@@ -520,9 +520,7 @@ class ParallelEnvironmentEvaluator:
         assert n_eval_episodes > 0, "n_eval_episodes must be positive"
         assert n_eval_envs > 0, "n_eval_envs must be positive"
 
-        # Create the vectorized environment
-        self.eval_env = SyncVectorEnv([env_fn for _ in range(n_eval_envs)])
-
+        self.env_fn = env_fn
         self.n_eval_episodes = n_eval_episodes
         self.n_eval_envs = n_eval_envs
         self.running_average_obs = running_average_obs
@@ -533,6 +531,9 @@ class ParallelEnvironmentEvaluator:
         # --- 1. Setup ---
         all_episode_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
+        
+        # Create the vectorized environment
+        self.eval_env = AsyncVectorEnv([self.env_fn for _ in range(self.n_eval_envs)])
 
         running_avg_deques = None
         if self.running_average_obs:
@@ -616,7 +617,7 @@ class ParallelEnvironmentEvaluator:
                         # The observation for the next loop
             obs = next_obs
 
-        # --- 4. Cleanup & Return ---
+        # Cleanup
         self.eval_env.close()
 
         # Ensure we only use the requested number of episodes

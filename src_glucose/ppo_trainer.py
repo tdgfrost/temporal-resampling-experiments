@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import gymnasium as gym
 import numpy as np
 import os
-from gymnasium.vector import SyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv
 from torch.distributions import Beta
 from functools import partial
 import random
@@ -405,7 +405,7 @@ class RecurrentPPO:
 
     def _evaluate_policy(self, n_eval_envs=4, n_eval_episodes=None):
         n_eval_episodes = n_eval_episodes or self.eval_episodes
-        eval_env = SyncVectorEnv([lambda: self.env_creator_fn() for _ in range(n_eval_envs)])
+        eval_env = AsyncVectorEnv([lambda: self.env_creator_fn() for _ in range(n_eval_envs)])
         all_episode_rewards = []
         all_episode_steps = []
         episode_rewards = np.zeros(n_eval_envs)
