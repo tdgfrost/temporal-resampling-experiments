@@ -238,8 +238,13 @@ class RecurrentReplayBufferEnv:
         next_visible_batch = torch.roll(visible_batch, shifts=-1, dims=1)
         next_visible_batch[:, -1] = False  # Last step does not have a next step
 
+        # Get our lengths
+        lengths = padding_mask.sum(dim=1).squeeze(-1).cpu().to(torch.int64).clamp(min=1)
+        next_lengths = next_padding_mask.sum(dim=1).squeeze(-1).cpu().to(torch.int64).clamp(min=1)
+
         return (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch,
-                visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask)
+                visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask,
+                lengths, next_lengths)
 
     def save(self, path: str):
         if os.path.exists(path):
