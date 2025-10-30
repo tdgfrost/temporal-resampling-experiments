@@ -91,7 +91,7 @@ class CustomBetaDistribution(nn.Module):
         self.beta = None
 
         # --- Constants for numerical stability ---
-        # self.clamp_max = 50.0
+        self.clamp_max = 100.0
 
         # Pre-compute log_scale for log_prob calculation
         self.register_buffer("log_scale", torch.tensor(self.scale).log())
@@ -110,8 +110,8 @@ class CustomBetaDistribution(nn.Module):
         self.beta = F.softplus(beta) + 1.0
 
         # (optional) Clamp for numerical stability
-        # self.alpha = torch.clamp(self.alpha, 1.0, self.clamp_max)
-        # self.beta = torch.clamp(self.beta, 1.0, self.clamp_max)
+        self.alpha = torch.clamp(self.alpha, 1.0, self.clamp_max)
+        self.beta = torch.clamp(self.beta, 1.0, self.clamp_max)
 
         # Create the underlying Beta distribution
         self.distribution = Beta(self.alpha, self.beta)
@@ -651,8 +651,8 @@ class _RecurrentBase(nn.Module):
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
-        # self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
-        self.dist = SquashedGaussianDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
+        self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
+        # self.dist = SquashedGaussianDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
         self._eps = 1e-5
         self._tanh_scale = 1.0
 
