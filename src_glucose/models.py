@@ -1,5 +1,4 @@
 from collections import deque
-from contextlib import nullcontext
 from typing import Tuple, Dict, Optional, List
 
 import numpy as np
@@ -643,6 +642,7 @@ class _RecurrentBase(nn.Module):
         self._device = device
         self.decoy_interval = None
         self.scaler = None
+        self._scaler_dtype = None
         self._batch_diff = None
         self._critic_lr = critic_lr
         self._value_lr = value_lr
@@ -692,6 +692,7 @@ class _RecurrentBase(nn.Module):
         self.decoy_interval = decoy_interval
         if torch.cuda.is_available():
             self.scaler = torch.amp.GradScaler('cuda')
+            self._scaler_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
@@ -714,6 +715,9 @@ class _RecurrentBase(nn.Module):
                         loss_dict['critic_loss'].append(self.update_critic(*batch))
                         loss_dict['value_loss'].append(self.update_value(*batch))
                     loss_dict['policy_loss'].append(self.update_actor(*batch))
+
+                    if self.scaler is not None:
+                        self.scaler.update()
 
                     # Soft update of target value network
                     self.sync_target_networks()
@@ -752,7 +756,6 @@ class _RecurrentBase(nn.Module):
             for net in nets:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             self.scaler.step(optimizer)
-            self.scaler.update()
         else:
             loss.backward()
             for net in nets:
@@ -1019,7 +1022,7 @@ class RecurrentIQL(_RecurrentBase):
 
         return critic_loss
 
-    @torch.compile(mode='reduce-overhead')
+    @torch.compile(mode='default') # reduce-overhead leads to NaNs here
     def _update_critic_compiled(self, obs, acts, next_obs, padding_mask, next_padding_mask, train_mask, lengths,
                                 next_lengths):
         # We only need the network output, not the final hidden state for training
@@ -1038,7 +1041,7 @@ class RecurrentIQL(_RecurrentBase):
 
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                        train_mask, lengths, next_lengths):
-        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, padding_mask, next_padding_mask,
                                                           train_mask, lengths, next_lengths)
 
@@ -1074,10 +1077,10 @@ class RecurrentIQL(_RecurrentBase):
 
         return value_loss
 
-    @torch.compile
+    @torch.compile(mode='reduce-overhead')
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
-        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Value function doesn't depend on actions
             lstm_out_q, _ = self.shared_critic_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
                                                        lengths=lengths)
@@ -1090,7 +1093,7 @@ class RecurrentIQL(_RecurrentBase):
 
             diff = q - v
             weights = torch.absolute(self._expectile - (diff < 0).float())
-            value_loss_unmasked = (weights * (diff ** 2))  # Loss per timestep
+            value_loss_unmasked = (weights * (diff.float() ** 2))  # Use .float() to avoid bfloat16 issues
 
             # Apply the mask
             final_mask = train_mask & visible
@@ -1101,7 +1104,8 @@ class RecurrentIQL(_RecurrentBase):
 
     def update_actor(self, *batch):
         # Scale the loss and perform the backward pass
-        policy_loss = self._update_actor(*batch, self._batch_diff.clone())
+        diff = self._batch_diff.clone() if self._batch_diff is not None else None
+        policy_loss = self._update_actor(*batch, diff)
         policy_loss = self.generic_update(
             policy_loss,
             self.policy_optim,
@@ -1110,10 +1114,10 @@ class RecurrentIQL(_RecurrentBase):
 
         return policy_loss
 
-    @torch.compile(mode='reduce-overhead')
+    @torch.compile(mode='default')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths, diff):
-        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Policy doesn't depend on actions
             lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
                                                 lengths=lengths)
@@ -1229,7 +1233,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         )
         return critic_loss
 
-    @torch.compile(mode='reduce-overhead')
+    @torch.compile(mode='default')
     def _update_critic_inference_compiled(self, obs, acts, next_obs, visible, padding_mask, next_padding_mask,
                                           train_mask, lengths, next_lengths):
         # -- Inference for Bellman loss -- #
@@ -1350,7 +1354,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         8. Subtract the mean dataset Q from the logsumexp Q
         9. Update our Lagrangian alpha
         '''
-        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1_pred, q2_pred, next_v, cql_loss = self._update_critic_inference_compiled(
                 obs, acts, next_obs, visible, padding_mask, next_padding_mask, train_mask, lengths, next_lengths
             )
@@ -1389,10 +1393,10 @@ class RecurrentCQLSAC(_RecurrentBase):
         )
         return policy_loss
 
-    @torch.compile
+    @torch.compile(mode='reduce-overhead')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
-        with torch.autocast(device_type="cuda") if self.scaler is not None else nullcontext():
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # 1. Get policy params (action-independent)
             lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
                                                 lengths=lengths)
