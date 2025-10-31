@@ -121,7 +121,7 @@ if __name__ == "__main__":
                                                                                       n_eval_envs=5,
                                                                                       n_eval_episodes=100)
 
-        for n_trial in range(10):
+        for n_trial in range(5):
             logs['expectile'].append(EXPECTILE)
             logs['decoy_interval'].append(DECOY_INTERVAL)
             logs['dataset_reward'].append(replay_buffer_env.dataset_avg)
@@ -130,12 +130,12 @@ if __name__ == "__main__":
             algo = offline_model(observation_shape=base_env.observation_space.shape,
                                  action_space=base_env.action_space,
                                  hidden_dim=128,
-                                 batch_size=256,
+                                 batch_size=1024,
                                  expectile=EXPECTILE,
                                  gamma=GAMMA,
-                                 value_lr=1e-4,
-                                 policy_lr=1e-4,
-                                 critic_lr=1e-4,
+                                 value_lr=3e-4,
+                                 policy_lr=3e-4,
+                                 critic_lr=3e-4,
                                  beta=args.beta,
                                  device='cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -143,10 +143,9 @@ if __name__ == "__main__":
 
             epoch_frac = 1.0
             if DECOY_INTERVAL in [0, 1]:
-                n_train_epochs = 1
-                # epoch_frac = 0.5
+                n_train_epochs = 5
             elif DECOY_INTERVAL == 2:
-                n_train_epochs = 200
+                n_train_epochs = 1000
             else:
                 raise ValueError("Invalid decoy interval.")
 
