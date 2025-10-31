@@ -124,7 +124,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     def __init__(self, env: gym.Env, forced_interval: int = 0) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
-        self.last_action = 0
+        self.last_action = None
         self.steps_until_action_available = 0
         self.next_waiting_period = 0
         self.hour_float = None
@@ -132,7 +132,9 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         self.forced_interval = forced_interval
 
     def reset(self, *args, **kwargs) -> np.ndarray:
-        self.last_action = 0
+        self.last_action = None
+        self.steps_until_action_available = 0
+        self.next_waiting_period = 0
         obs, info = self.env.reset(*args, **kwargs)
         self._apply_rules(obs)
         info['steps_until_action_available'] = self.steps_until_action_available
