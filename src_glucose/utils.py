@@ -589,65 +589,69 @@ class ParallelEnvironmentEvaluator:
         hidden_state = algo.get_initial_states(batch_size=self.n_eval_envs)
 
         # --- 3. Run Episodes ---
-        while len(all_episode_rewards) < self.n_eval_episodes:
+        with tqdm(total=self.n_eval_episodes, desc="Evaluating Episodes", mininterval=2.0) as pbar:
+            while len(all_episode_rewards) < self.n_eval_episodes:
 
-            # --- 3a. Prepare Observations ---
-            obs_to_predict = obs
-            if self.running_average_obs:
-                # Calculate mean obs for each env in the batch
-                mean_obs_batch = [np.mean(np.stack(deque), axis=0)
-                                  for deque in running_avg_deques]
-                obs_to_predict = np.stack(mean_obs_batch) # for seq dim
-
-            # --- 3b. Predict Action ---
-            with torch.no_grad():
-                # Make sure the seq_dim is present
-                obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
-                action, hidden_state = algo.predict(obs_to_predict,
-                                                    hidden_state=hidden_state,
-                                                    deterministic=True)
-
-            # --- 3c. Step Environment ---
-            # action is a batch (B, ...), so we pass it directly
-            # (or convert to numpy if it's a tensor)
-            try:
-                action_np = action.cpu().numpy()
-            except AttributeError:
-                action_np = action  # Assume it's already numpy
-
-            next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
-            dones = terminated | truncated
-
-            episode_rewards += reward
-
-            # --- 3d. Handle Dones and State Updates ---
-            for i, done in enumerate(dones):
-                # Always append the *next* observation for the running average
+                # --- 3a. Prepare Observations ---
+                obs_to_predict = obs
                 if self.running_average_obs:
-                    running_avg_deques[i].append(next_obs[i])
+                    # Calculate mean obs for each env in the batch
+                    mean_obs_batch = [np.mean(np.stack(deque), axis=0)
+                                      for deque in running_avg_deques]
+                    obs_to_predict = np.stack(mean_obs_batch) # for seq dim
 
-                if done:
-                    # An episode finished
-                    all_episode_rewards.append(episode_rewards[i])
-                    episode_rewards[i] = 0  # Reset reward accumulator
+                # --- 3b. Predict Action ---
+                with torch.no_grad():
+                    # Make sure the seq_dim is present
+                    obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
+                    action, hidden_state = algo.predict(obs_to_predict,
+                                                        hidden_state=hidden_state,
+                                                        deterministic=True)
 
-                    # Reset hidden state for this env (mimicking your example)
-                    if isinstance(hidden_state, tuple):
-                        # Handle LSTM-like states (h, c)
-                        hidden_state[0][:, i, :] = 0
-                        hidden_state[1][:, i, :] = 0
-                    elif hidden_state is not None:
-                        # Handle GRU-like states
-                        hidden_state[:, i, :] = 0
+                # --- 3c. Step Environment ---
+                # action is a batch (B, ...), so we pass it directly
+                # (or convert to numpy if it's a tensor)
+                try:
+                    action_np = action.cpu().numpy()
+                except AttributeError:
+                    action_np = action  # Assume it's already numpy
 
-                    # Reset the running average deque for this env
+                next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
+                dones = terminated | truncated
+
+                episode_rewards += reward
+
+                # --- 3d. Handle Dones and State Updates ---
+                for i, done in enumerate(dones):
+                    # Always append the *next* observation for the running average
                     if self.running_average_obs:
-                        running_avg_deques[i].clear()
-                        # Add the new obs from the auto-reset
                         running_avg_deques[i].append(next_obs[i])
 
-                        # The observation for the next loop
-            obs = next_obs
+                    if done:
+                        # An episode finished
+                        all_episode_rewards.append(episode_rewards[i])
+                        episode_rewards[i] = 0  # Reset reward accumulator
+
+                        # Update the progress bar
+                        pbar.update(1)
+
+                        # Reset hidden state for this env (mimicking your example)
+                        if isinstance(hidden_state, tuple):
+                            # Handle LSTM-like states (h, c)
+                            hidden_state[0][:, i, :] = 0
+                            hidden_state[1][:, i, :] = 0
+                        elif hidden_state is not None:
+                            # Handle GRU-like states
+                            hidden_state[:, i, :] = 0
+
+                        # Reset the running average deque for this env
+                        if self.running_average_obs:
+                            running_avg_deques[i].clear()
+                            # Add the new obs from the auto-reset
+                            running_avg_deques[i].append(next_obs[i])
+
+                            # The observation for the next loop
+                obs = next_obs
 
         # Cleanup
         self.eval_env.close()
