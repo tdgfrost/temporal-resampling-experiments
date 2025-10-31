@@ -730,7 +730,7 @@ class _RecurrentBase(nn.Module):
                                      refresh=False)
 
                 # Logging
-                if (epoch + 1) % n_epochs_per_eval == 0 and evaluators is not None:
+                if epoch % n_epochs_per_eval == 0 and evaluators is not None:
                     loss_dict, log_dict = self._log_progress(
                         epoch=epoch,
                         loss_dict=loss_dict,
