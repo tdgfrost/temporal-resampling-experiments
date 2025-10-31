@@ -1,6 +1,7 @@
 import polars as pl
 from collections import defaultdict
 from functools import partial
+from scipy.stats import trim_mean
 
 from gym_wrappers import *
 from models import *
@@ -9,10 +10,10 @@ from utils import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
-parser.add_argument('--train_offline', default=True, type=parse_bool, help='Train offline agent')
+parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train offline agent')
 parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql'],
                     help='Type of offline RL model to train (iql or cql)')
-parser.add_argument('--ppo_agent', default="best_model06_207.86.pth", type=str, help='Path to pre-trained PPO agent')
+parser.add_argument('--ppo_agent', default="best_model17_6837.02.pth", type=str, help='Path to pre-trained PPO agent')
 
 parser.add_argument('--expectile', default=0.9, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--beta', default=10., type=float, help='Beta parameter for IQL agent')
@@ -85,7 +86,7 @@ if __name__ == "__main__":
         base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 5_000_000
+        dataset_size = 1_000_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
             model = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
@@ -96,35 +97,42 @@ if __name__ == "__main__":
             print('=' * 50, '\nRe-using existing dataset...\n', '=' * 50)
             replay_buffer_env.load('./replay_buffer')
 
-        dataset_rew_avg, dataset_rew_std = replay_buffer_env.dataset_avg, replay_buffer_env.dataset_std
+        dataset_sem = replay_buffer_env.dataset_IQR_std / np.sqrt(replay_buffer_env.dataset_IQR_n_episodes)
         mean_ep_duration = np.array(replay_buffer_env.observations[0]).shape[0] / sum(replay_buffer_env.dones[0])
-        print(f"\n=================\nBaseline reward of the dataset: "
-              f"{dataset_rew_avg:.2f}"
-              f"+/- {dataset_rew_std:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
+        print(f"\n=================\nBaseline IQR return of the dataset: "
+              f"{replay_buffer_env.dataset_IQR_return:.2f}"
+              f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
-        # Get our evaluators
-        evaluators = {}
-        for key, interval in [
-            ["glucose_irregular", 0],
-            ["glucose_regular", 1],
-        ]:
-            evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
-                                                                   forced_interval=interval,
-                                                                   use_test_ids=True),
-                                                           n_eval_envs=5,
-                                                           n_eval_episodes=100)
-
-        if DECOY_INTERVAL == 2:
-            evaluators["glucose_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
-                                                                                              forced_interval=0,
-                                                                                              use_test_ids=True),
-                                                                                      n_eval_envs=5,
-                                                                                      n_eval_episodes=100)
-
-        for n_trial in range(5):
-            logs['expectile'].append(EXPECTILE)
+        # 10 independent runs of the experiment
+        all_scores = defaultdict(list)
+        n_runs = 10
+        for seed in np.arange(n_runs) * 1000:
+            # Log meta data
+            algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
+            logs['seed'].append(seed)
+            logs['algo'].append(algo)
             logs['decoy_interval'].append(DECOY_INTERVAL)
-            logs['dataset_reward'].append(replay_buffer_env.dataset_avg)
+            logs['dataset_iqr_return'].append(replay_buffer_env.dataset_IQR_return)
+            logs['dataset_iqr_std'].append(replay_buffer_env.dataset_IQR_std)
+
+            # Get our evaluators
+            evaluators = {}
+            for key, interval in [
+                ["glucose_irregular", 0],
+                ["glucose_regular", 1],
+            ]:
+                evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                       forced_interval=interval,
+                                                                       use_test_ids=True),
+                                                               n_eval_envs=5,
+                                                               n_eval_episodes=100)
+
+            if DECOY_INTERVAL == 2:
+                evaluators["glucose_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                                                  forced_interval=0,
+                                                                                                  use_test_ids=True),
+                                                                                          n_eval_envs=5,
+                                                                                          n_eval_episodes=100)
 
             # Alternately collect and training
             algo = offline_model(observation_shape=base_env.observation_space.shape,
@@ -137,6 +145,7 @@ if __name__ == "__main__":
                                  policy_lr=3e-4,
                                  critic_lr=3e-4,
                                  beta=args.beta,
+                                 seed=seed,
                                  device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
@@ -158,7 +167,18 @@ if __name__ == "__main__":
                 dataset_kwargs={'epoch_fraction': epoch_frac},
             )
             for key in evaluators.keys():
-                logs[f'{key}_eval'].append(log_dict[key][0])
+                all_scores[key].append(log_dict[key])
+
+        # Calculate our bootstrap IQM for each evaluator
+        for key, scores in all_scores.items():
+            scores = np.array(scores)
+            bootstrap_scores = np.random.choice(scores, size=(100_000, 10), replace=True)
+            bootstrap_iqm = trim_mean(bootstrap_scores, proportiontocut=0.25, axis=-1)
+            bootstrap_low_q = np.percentile(bootstrap_iqm, 2.5)
+            bootstrap_high_q = np.percentile(bootstrap_iqm, 97.5)
+            logs[f'{key}_iqm'] = np.mean(bootstrap_iqm)
+            logs[f'{key}_2.5%'] = bootstrap_low_q
+            logs[f'{key}_97.5%'] = bootstrap_high_q
 
         # Save logs
         os.makedirs('../logs_glucose/iql_minigrid_logs', exist_ok=True)

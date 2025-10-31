@@ -9,6 +9,7 @@ import argparse
 import inquirer
 import os
 import shutil
+from scipy.stats import trimboth
 
 from simglucose.simulation.env import bg_in_range_magni, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
@@ -44,8 +45,11 @@ class RecurrentReplayBufferEnv:
         self.decoy_interval = 0
         self.n_samples = 0
         self.segments = self.n_samples // self.batch_size
-        self.dataset_avg = None
-        self.dataset_std = None
+        self.dataset_IQR_return = None
+        self.dataset_IQR_std = None
+        self.dataset_IQR_n_episodes = None
+        self.reward_mean = {i: None for i in range(3)}
+        self.reward_std = {i: None for i in range(3)}
         self.max_sequence_length = sequence_length
         self.burn_in_length = burn_in_length
         # This will store the valid start indices for each decoy interval
@@ -264,9 +268,12 @@ class RecurrentReplayBufferEnv:
             np.savez(os.path.join(path, f'{key}.npz'),
                      **{str(k): v for k, v in save_dict.items()})
 
-        # Also save reward dataset avg
-        np.savez(os.path.join(path, 'rewards_scale.npz'),
-                 **{'dataset_avg': self.dataset_avg, 'dataset_std': self.dataset_std})
+        # Save dataset IQR return and scaling
+        save_dict = {'dataset_iqr_avg': self.dataset_IQR_return, 'dataset_iqr_std': self.dataset_IQR_std,
+                     'dataset_iqr_n_episodes': self.dataset_IQR_n_episodes}
+        save_dict.update({f'reward_mean_{i}': self.reward_mean[i] for i in range(3)})
+        save_dict.update({f'reward_std_{i}': self.reward_std[i] for i in range(3)})
+        np.savez(os.path.join(path, 'rewards_scale.npz'), **save_dict)
 
         # Mark saving as complete
         with open(os.path.join(path, 'COMPLETE'), 'w') as f:
@@ -285,12 +292,17 @@ class RecurrentReplayBufferEnv:
             for k in loaded.files:
                 value[int(k)] = deque(loaded[k], maxlen=self.buffer_size)
 
-        # Load avg rewards
+        # Load dataset IQR return and scaling
         loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
-        self.dataset_avg = float(loaded_scale['dataset_avg'])
-        self.dataset_std = float(loaded_scale['dataset_std'])
+        self.dataset_IQR_return = float(loaded_scale['dataset_iqr_avg'])
+        self.dataset_IQR_std = float(loaded_scale['dataset_iqr_std'])
+        self.dataset_IQR_n_episodes = int(loaded_scale['dataset_iqr_n_episodes'])
+        for i in range(3):
+            self.reward_mean[i] = float(loaded_scale[f'reward_mean_{i}'])
+            self.reward_std[i] = float(loaded_scale[f'reward_std_{i}'])
 
-        # Tweak to shorten to 1M steps
+        # Tweak to shorten to 1M steps if needed
+        """
         for i in range(3):
             n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 5
             new_idx = np.where(np.array(self.dones[i]))[0][n_episodes] + 1
@@ -298,6 +310,7 @@ class RecurrentReplayBufferEnv:
             for arr in [self.actions, self.rewards, self.dones,
                         self.sample_bool, self.visible_states]:
                 arr[i] = deque(list(arr[i])[:new_idx], maxlen=self.buffer_size)
+        """
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
@@ -360,20 +373,23 @@ class RecurrentReplayBufferEnv:
             for i in range(3):
                 self.observations[i] += [np.zeros_like(self.observations[0][0])]
 
-            # Save the dataset return
+            # Save the IQR dataset return
             total_rewards = np.array(total_rewards)
-            self.dataset_avg = total_rewards.mean()
-            self.dataset_std = total_rewards.std()
+            IQR = trimboth(total_rewards, proportiontocut=0.25)
+
+            self.dataset_IQR_return = IQR.mean()
+            self.dataset_IQR_std = IQR.std()
+            self.dataset_IQR_n_episodes = len(IQR)
 
             # Scale the rewards for training
-            all_rewards = np.array(self.rewards[0])
-            r_mean, r_std = all_rewards.mean(), all_rewards.std()
-            # rmin, rmax = all_rewards.min(), all_rewards.max()
             for i in [0, 1, 2]:
-                rewards = np.array(self.rewards[i])
-                norm_rewards = (rewards - r_mean) / (r_std + 1e-8)
-                # norm_rewards = (rewards - rmin) / (rmax - rmin + 1e-8)
+                all_rewards = np.array(self.rewards[i])
+                r_mean, r_std = all_rewards.mean(), all_rewards.std()
+                # Standardise rewards
+                norm_rewards = (all_rewards - r_mean) / (r_std + 1e-8)
                 self.rewards[i] = deque(norm_rewards.tolist(), maxlen=self.buffer_size)
+                self.reward_mean[i] = r_mean
+                self.reward_std[i] = r_std
 
     def set_to_tensors(self, device: str = 'cpu'):
         def _set_device(some_arr):
@@ -542,11 +558,12 @@ class ParallelEnvironmentEvaluator:
         self.aggregate_window_size = aggregate_window_size
         self.seed = seed
 
-    def __call__(self, algo) -> Tuple[float, float]:
+    def __call__(self, algo, seed=None) -> Tuple[float, float]:
         # --- 1. Setup ---
         all_episode_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
-        
+        seed = seed or self.seed
+
         # Create the vectorized environment
         self.eval_env = AsyncVectorEnv([self.env_fn for _ in range(self.n_eval_envs)])
 
@@ -556,9 +573,9 @@ class ParallelEnvironmentEvaluator:
                                   for _ in range(self.n_eval_envs)]
 
         # --- 2. Reset Envs ---
-        if self.seed is not None:
+        if seed is not None:
             # Seed each parallel environment deterministically
-            eval_seeds = [self.seed + i for i in range(self.n_eval_envs)]
+            eval_seeds = [int(seed + i) for i in range(self.n_eval_envs)]
             obs, info = self.eval_env.reset(seed=eval_seeds)
         else:
             obs, info = self.eval_env.reset()
@@ -637,13 +654,8 @@ class ParallelEnvironmentEvaluator:
 
         # Ensure we only use the requested number of episodes
         final_rewards = all_episode_rewards[:self.n_eval_episodes]
-        n_collected = len(final_rewards)
 
-        mean_return = float(np.mean(final_rewards))
-        # Calculate standard error of the mean
-        std_err = float(np.std(final_rewards) / np.sqrt(n_collected))
-
-        return mean_return, std_err
+        return final_rewards
 
 
 def parse_bool(value, name: str = ''):

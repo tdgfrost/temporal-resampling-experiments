@@ -9,7 +9,7 @@ from torch.distributions import Beta, Normal
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 from tqdm import tqdm
 
-from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
+from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, set_seed
 
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
@@ -636,7 +636,11 @@ class _RecurrentBase(nn.Module):
                  recurrent_hidden_size: int = None, batch_size: int = 128,
                  device: str = 'cpu', critic_lr: float = 3e-4,
                  value_lr: float = 3e-4, actor_lr: float = 3e-4, sequence_length: int = 64,
-                 burn_in_length: int = 20, *args, **kwargs):
+                 burn_in_length: int = 20, seed: Optional[int] = None, *args, **kwargs):
+        # Set our seed
+        self._seed = seed
+        if seed is not None:
+            set_seed(seed)
         super().__init__()
         self._cloning_only = False
         self._device = device
@@ -730,12 +734,18 @@ class _RecurrentBase(nn.Module):
                                      refresh=False)
 
                 # Logging
-                if epoch % n_epochs_per_eval == 0 and evaluators is not None:
-                    loss_dict, log_dict = self._log_progress(
+                if epoch < n_epochs_train and epoch % n_epochs_per_eval == 0 and evaluators is not None:
+                    loss_dict, _ = self._log_progress(
                         epoch=epoch,
                         loss_dict=loss_dict,
                         evaluators=evaluators
                     )
+
+            _, log_dict = self._log_progress(
+                epoch=epoch,
+                loss_dict=loss_dict,
+                evaluators=evaluators
+            )
 
         return log_dict
 
@@ -890,15 +900,23 @@ class _RecurrentBase(nn.Module):
         return h_0, c_0
 
     def _log_progress(self, epoch: int, loss_dict: dict, evaluators: dict = None):
-
-        rewards = {}
-        for key in evaluators.keys():
-            mean_rew, std_rew = evaluators[key](self)
-            rewards[key] = (mean_rew, std_rew)
-
+        log_rewards = {}
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
-        for key in rewards.keys():
-            eval_str += f"\n     {key} = {rewards[key][0]:.2f} +/- {rewards[key][1]:.2f}"
+        for key in evaluators.keys():
+            episodic_rewards = evaluators[key](self, seed=self._seed)
+
+            episodic_rewards = np.array(episodic_rewards)
+            log_rewards[key] = episodic_rewards.mean()
+
+            # Get IQM for printout only
+            low_q = np.quantile(episodic_rewards, 0.25)
+            high_q = np.quantile(episodic_rewards, 0.75)
+            iqr_rewards = episodic_rewards[(episodic_rewards >= low_q) & (episodic_rewards <= high_q)]
+            iqr_mean = np.mean(iqr_rewards)
+            iqr_std = np.std(iqr_rewards)
+            iqr_n_samples = len(iqr_rewards)
+
+            eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
 
         eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
         eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"
@@ -906,7 +924,7 @@ class _RecurrentBase(nn.Module):
         eval_str += '=' * 40 + '\n'
         print(eval_str)
 
-        return self._reset_loss_dict(), rewards
+        return self._reset_loss_dict(), log_rewards
 
     @staticmethod
     def _reset_loss_dict():
