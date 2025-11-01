@@ -86,7 +86,7 @@ if __name__ == "__main__":
         base_env = make_glucose_env()
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 1_000_000
+        dataset_size = 10_000_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
             model = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
@@ -122,15 +122,15 @@ if __name__ == "__main__":
                 evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                        forced_interval=interval,
                                                                        use_test_ids=True),
-                                                               n_eval_envs=5,
-                                                               n_eval_episodes=100)
+                                                               n_eval_envs=100,
+                                                               n_eval_episodes=1000)
 
             if DECOY_INTERVAL == 2:
                 evaluators["glucose_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                                                   forced_interval=0,
                                                                                                   use_test_ids=True),
-                                                                                          n_eval_envs=5,
-                                                                                          n_eval_episodes=100)
+                                                                                          n_eval_envs=100,
+                                                                                          n_eval_episodes=1000)
 
             # Alternately collect and training
             algo = offline_model(observation_shape=base_env.observation_space.shape,

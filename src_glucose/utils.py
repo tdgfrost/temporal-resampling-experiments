@@ -304,7 +304,7 @@ class RecurrentReplayBufferEnv:
         # Tweak to shorten to 1M steps if needed
         """
         for i in range(3):
-            n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 5
+            n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 10
             new_idx = np.where(np.array(self.dones[i]))[0][n_episodes] + 1
             self.observations[i] = deque(list(self.observations[i])[:new_idx + 1], maxlen=self.buffer_size)
             for arr in [self.actions, self.rewards, self.dones,
@@ -606,7 +606,7 @@ class ParallelEnvironmentEvaluator:
                     obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
                     action, hidden_state = algo.predict(obs_to_predict,
                                                         hidden_state=hidden_state,
-                                                        deterministic=True)
+                                                        deterministic=False)
 
                 # --- 3c. Step Environment ---
                 # action is a batch (B, ...), so we pass it directly
