@@ -106,15 +106,13 @@ if __name__ == "__main__":
         # 10 independent runs of the experiment
         all_scores = defaultdict(list)
         n_runs = 10
+        # Log meta data
+        algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
+        logs['algo'].append(algo)
+        logs['decoy_interval'].append(DECOY_INTERVAL)
+        logs['dataset_iqr_return'].append(replay_buffer_env.dataset_IQR_return)
+        logs['dataset_iqr_std'].append(replay_buffer_env.dataset_IQR_std)
         for seed in np.arange(n_runs) * 1000:
-            # Log meta data
-            algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
-            logs['seed'].append(seed)
-            logs['algo'].append(algo)
-            logs['decoy_interval'].append(DECOY_INTERVAL)
-            logs['dataset_iqr_return'].append(replay_buffer_env.dataset_IQR_return)
-            logs['dataset_iqr_std'].append(replay_buffer_env.dataset_IQR_std)
-
             # Get our evaluators
             evaluators = {}
             for key, interval in [
