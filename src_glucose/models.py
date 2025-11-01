@@ -560,7 +560,7 @@ class RecurrentNet(nn.Module):
             self.action_encoder = nn.Sequential(
                 nn.Linear(1, input_feature_size // 2),
                 nn.LayerNorm(input_feature_size // 2),
-                nn.ReLU(),
+                nn.LeakyReLU(),
                 nn.Linear(input_feature_size // 2, input_feature_size)
             )
             self.encoded_input_dim = input_feature_size * 2
@@ -571,7 +571,7 @@ class RecurrentNet(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(self.encoded_input_dim, self.encoded_input_dim // 2),
             nn.LayerNorm(self.encoded_input_dim // 2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(self.encoded_input_dim // 2, output_size)
         ).to(device)
 
