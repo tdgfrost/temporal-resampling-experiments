@@ -140,7 +140,7 @@ if __name__ == "__main__":
                                  expectile=EXPECTILE,
                                  gamma=GAMMA,
                                  value_lr=3e-4,
-                                 policy_lr=3e-4,
+                                 policy_lr=3e-5,
                                  critic_lr=3e-4,
                                  beta=args.beta,
                                  seed=seed,
@@ -150,7 +150,7 @@ if __name__ == "__main__":
 
             epoch_frac = 1.0
             if DECOY_INTERVAL in [0, 1]:
-                n_train_epochs = 5
+                n_train_epochs = 10
             elif DECOY_INTERVAL == 2:
                 n_train_epochs = 1000
             else:

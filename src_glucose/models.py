@@ -89,6 +89,8 @@ class CustomBetaDistribution(nn.Module):
         self.distribution = None
         self.alpha = None
         self.beta = None
+        self.mu = None
+        self.kappa = None
 
         # --- Constants for numerical stability ---
         self.clamp_max = 100.0
@@ -103,15 +105,18 @@ class CustomBetaDistribution(nn.Module):
         :param params: Raw output from the actor head (batch_size, action_dim * 2)
         """
         # Split the output into alpha and beta parameters
-        alpha, beta = torch.chunk(params, 2, dim=-1)
+        mu_logits, kappa_logits = torch.chunk(params, 2, dim=-1)
+
+        self.mu = torch.sigmoid(mu_logits)
+        self.kappa = torch.exp(kappa_logits) + 1.0
 
         # Softplus to keep alpha, beta > 1 for unimodal distribution
-        self.alpha = F.softplus(alpha) + 1.0
-        self.beta = F.softplus(beta) + 1.0
+        self.alpha = self.mu * self.kappa
+        self.beta = (1 - self.mu) * self.kappa
 
         # (optional) Clamp for numerical stability
-        self.alpha = torch.clamp(self.alpha, 1.0, self.clamp_max)
-        self.beta = torch.clamp(self.beta, 1.0, self.clamp_max)
+        # self.alpha = torch.clamp(self.alpha, 1.0, self.clamp_max)
+        # self.beta = torch.clamp(self.beta, 1.0, self.clamp_max)
 
         # Create the underlying Beta distribution
         self.distribution = Beta(self.alpha, self.beta)
@@ -197,6 +202,11 @@ class CustomBetaDistribution(nn.Module):
         log_pi = log_prob_u - self.log_scale * self.action_dim
 
         return actions, log_pi.sum(dim=-1, keepdim=True)
+
+    def variance(self):
+        mu = self.mu.detach()
+        variance = (mu * (1-mu)) / (self.kappa + 1)
+        return variance
 
 
 class SquashedGaussianDistribution(nn.Module):
@@ -1123,14 +1133,15 @@ class RecurrentIQL(_RecurrentBase):
     def update_actor(self, *batch):
         # Scale the loss and perform the backward pass
         diff = self._batch_diff.clone() if self._batch_diff is not None else None
-        policy_loss = self._update_actor(*batch, diff)
-        policy_loss = self.generic_update(
-            policy_loss,
+        policy_loss, variance_loss = self._update_actor(*batch, diff)
+        total_loss = policy_loss + variance_loss
+        _ = self.generic_update(
+            total_loss,
             self.policy_optim,
             self.policy_net, self.actor_encoder
         )
 
-        return policy_loss
+        return policy_loss.item()
 
     @torch.compile(mode='default')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
@@ -1149,6 +1160,10 @@ class RecurrentIQL(_RecurrentBase):
             # The policy loss is the Negative Log-Likelihood (NLL)
             policy_loss_unmasked = -log_pi
 
+            # Get the variance target
+            variance = dist.variance()
+            variance_loss = (variance - 0.001) ** 2
+
             # Get the IQL weights
             weights = 1.0
             if not self._cloning_only:
@@ -1159,7 +1174,11 @@ class RecurrentIQL(_RecurrentBase):
             masked_loss = policy_loss_unmasked * weights * final_mask
             policy_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
-        return policy_loss
+            variance_loss = (variance_loss * weights * final_mask).sum() / (final_mask.sum() + self._eps)
+            # Scale to match policy loss
+            variance_loss = (policy_loss.abs() / variance_loss.abs()).detach() * variance_loss
+
+        return policy_loss, variance_loss
 
 
 class RecurrentCQLSAC(_RecurrentBase):

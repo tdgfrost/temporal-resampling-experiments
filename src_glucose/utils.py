@@ -302,7 +302,7 @@ class RecurrentReplayBufferEnv:
             self.reward_std[i] = float(loaded_scale[f'reward_std_{i}'])
 
         # Tweak to shorten to 1M steps if needed
-        """
+        print('Trimming 10M to ~1M steps...')
         for i in range(3):
             n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 10
             new_idx = np.where(np.array(self.dones[i]))[0][n_episodes] + 1
@@ -310,7 +310,6 @@ class RecurrentReplayBufferEnv:
             for arr in [self.actions, self.rewards, self.dones,
                         self.sample_bool, self.visible_states]:
                 arr[i] = deque(list(arr[i])[:new_idx], maxlen=self.buffer_size)
-        """
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
