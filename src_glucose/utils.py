@@ -544,6 +544,7 @@ class ParallelEnvironmentEvaluator:
                  env_fn: Callable,
                  n_eval_episodes: int,
                  n_eval_envs: int,
+                 gamma: float = 0.99,
                  running_average_obs: bool = False,
                  aggregate_window_size: int = AGGREGATE_WINDOW_SIZE,
                  seed: Optional[int] = None):
@@ -557,11 +558,15 @@ class ParallelEnvironmentEvaluator:
         self.running_average_obs = running_average_obs
         self.aggregate_window_size = aggregate_window_size
         self.seed = seed
+        self.gamma = gamma
 
     def __call__(self, algo, seed=None) -> Tuple[float, float]:
         # --- 1. Setup ---
         all_episode_rewards = []
+        all_episode_disc_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
+        episode_disc_rewards = np.zeros(self.n_eval_envs)
+        episode_gammas = np.ones(self.n_eval_envs)
         seed = seed or self.seed
 
         # Create the vectorized environment
@@ -620,6 +625,8 @@ class ParallelEnvironmentEvaluator:
                 dones = terminated | truncated
 
                 episode_rewards += reward
+                episode_disc_rewards += reward * episode_gammas
+                episode_gammas *= self.gamma
 
                 # --- 3d. Handle Dones and State Updates ---
                 for i, done in enumerate(dones):
@@ -630,7 +637,10 @@ class ParallelEnvironmentEvaluator:
                     if done:
                         # An episode finished
                         all_episode_rewards.append(episode_rewards[i])
+                        all_episode_disc_rewards.append(episode_disc_rewards[i])
                         episode_rewards[i] = 0  # Reset reward accumulator
+                        episode_disc_rewards[i] = 0
+                        episode_gammas[i] = 1.0
 
                         # Update the progress bar
                         pbar.update(1)
@@ -658,8 +668,9 @@ class ParallelEnvironmentEvaluator:
 
         # Ensure we only use the requested number of episodes
         final_rewards = all_episode_rewards[:self.n_eval_episodes]
+        final_disc_rewards = all_episode_disc_rewards[:self.n_eval_episodes]
 
-        return final_rewards
+        return final_rewards, final_disc_rewards
 
 
 class WISOPEEvaluator:
@@ -695,8 +706,9 @@ class WISOPEEvaluator:
         obs_data, act_data, rew_data, done_data, visible_data = self.unpack_dataset()
 
         # Iterate through episodes, storing log-ratios and returns
-        log_rho_list = []
-        return_list = []
+        all_seq_log_rhos = []
+        all_rewards = []
+        all_discounts = []
 
         # Find all episode boundaries
         done_indices = torch.where(done_data)[0]
@@ -717,9 +729,7 @@ class WISOPEEvaluator:
                     continue
 
                 # Calculate the episode return (G)
-                # discounts = torch.pow(self.gamma, torch.arange(ep_len, device=self.device))
-                # ep_return = torch.sum(ep_rew * discounts)
-                ep_return = torch.sum(ep_rew)
+                discounts = torch.pow(self.gamma, torch.arange(ep_len, device=self.device))
 
                 # Calculate the episode importance ratio (rho)
                 ppo_hn, ppo_cn = self.ppo_agent.ac_network.init_hidden_state(batch_size=1)
@@ -739,11 +749,12 @@ class WISOPEEvaluator:
                     ep_log_rhos = log_prob_e - log_prob_b
                     # - Cancel non-visible states
                     ep_log_rhos = torch.where(ep_visible, ep_log_rhos, torch.zeros_like(ep_log_rhos))
-                    ep_log_rho = ep_log_rhos.sum()
+                    seq_log_rhos = torch.cumsum(ep_log_rhos, dim=0)
 
-                    # Store log_rho and return
-                    log_rho_list.append(ep_log_rho)
-                    return_list.append(ep_return)
+                    # Store seq_log_rhos and return
+                    all_seq_log_rhos.append(seq_log_rhos)
+                    all_rewards.append(ep_rew)
+                    all_discounts.append(discounts)
 
                     # Update start index for next loop
                     start_idx = end_idx + 1
@@ -751,15 +762,19 @@ class WISOPEEvaluator:
                 pbar.update(1)
 
         # Perform WIS calculation
-        all_log_rhos = torch.stack(log_rho_list)
-        all_returns = torch.stack(return_list)
+        all_seq_log_rhos = torch.cat(all_seq_log_rhos)
+        all_rewards = torch.cat(all_rewards)
+        all_discounts = torch.cat(all_discounts)
 
         # Find the maximum log_rho and substract for numerical stability
-        max_log_rho = torch.max(all_log_rhos)
-        stabilised_log_rhos = all_log_rhos - max_log_rho
+        max_log_rho = torch.max(all_seq_log_rhos)
+        stabilised_log_rhos = all_seq_log_rhos - max_log_rho
         stabilised_rhos = stabilised_log_rhos.exp()
 
-        numerator = (stabilised_rhos * all_returns).sum()
+        # Calculate the WPDIS numerator and denominator
+        # Numerator: sum( gamma^t * rho_0:t * r_t )
+        # Denominator: sum( gamma^t * rho_0:t )
+        numerator = (stabilised_rhos * all_discounts * all_rewards).sum()
         denominator = stabilised_rhos.sum()
 
         wis_estimate = numerator / (denominator + 1e-6)

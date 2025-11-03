@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.distributions import Beta, Normal
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 from tqdm import tqdm
+from scipy.stats import trimboth
 
 from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, set_seed
 
@@ -921,26 +922,29 @@ class _RecurrentBase(nn.Module):
         log_rewards = {}
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
         for key in evaluators.keys():
-            episodic_rewards = evaluators[key](self, seed=self._seed)
+            eval_output = evaluators[key](self, seed=self._seed)
 
-            if isinstance(episodic_rewards, float):
+            if isinstance(eval_output, float):
                 # WIS estimate
-                log_rewards[key] = episodic_rewards
-                eval_str += f"\n     {key} = {episodic_rewards:.2f} (WIS estimate)"
+                log_rewards[key] = eval_output
+                eval_str += f"\n     {key} = {eval_output:.2f} (WIS discounted estimate)"
                 continue
 
+            episodic_rewards, discounted_episodic_rewards = eval_output
+
             episodic_rewards = np.array(episodic_rewards)
+            discounted_episodic_rewards = np.array(discounted_episodic_rewards)
             log_rewards[key] = episodic_rewards.mean()
+            log_rewards[key + '_discounted'] = discounted_episodic_rewards.mean()
 
             # Get IQM for printout only
-            low_q = np.quantile(episodic_rewards, 0.25)
-            high_q = np.quantile(episodic_rewards, 0.75)
-            iqr_rewards = episodic_rewards[(episodic_rewards >= low_q) & (episodic_rewards <= high_q)]
-            iqr_mean = np.mean(iqr_rewards)
-            iqr_std = np.std(iqr_rewards)
-            iqr_n_samples = len(iqr_rewards)
+            for arr_key, arr in [('', episodic_rewards), ('_discounted', discounted_episodic_rewards)]:
+                iqr = trimboth(arr, proportiontocut=0.25)
+                iqr_mean = np.mean(iqr)
+                iqr_std = np.std(iqr)
+                iqr_n_samples = len(iqr)
 
-            eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
+                eval_str += f"\n     {key + arr_key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
 
         eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
         eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"

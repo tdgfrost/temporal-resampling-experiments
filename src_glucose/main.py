@@ -102,36 +102,33 @@ if __name__ == "__main__":
               f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
         # Get our evaluators
-        evaluators = {}
+        evaluators = dict()
         # - OPE evaluation
-        for key, interval in [
-            ["wis_ope_irregular", 0],
-            ["wis_ope_interpolated", 1],
-            ["wis_ope_binned", 2]
-        ]:
-            evaluators[key] = WISOPEEvaluator(ppo_agent=ppo_agent,
-                                              dataset=replay_buffer_env,
-                                              gamma=GAMMA,
-                                              decoy_interval=interval,
-                                              device=DEVICE)
+        evaluators["wis_ope"] = WISOPEEvaluator(ppo_agent=ppo_agent,
+                                                dataset=replay_buffer_env,
+                                                gamma=GAMMA,
+                                                decoy_interval=DECOY_INTERVAL,
+                                                device=DEVICE)
 
         # - Online evaluation
         for key, interval in [
-            ["online_eval_irregular", 0],
-            ["online_eval_interpolated", 1],
+            ["online_irregular", 0],
+            ["online_interpolated", 1],
         ]:
             evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                    forced_interval=interval,
                                                                    use_test_ids=True),
                                                            n_eval_envs=10,
-                                                           n_eval_episodes=100)
+                                                           n_eval_episodes=100,
+                                                           gamma=GAMMA)
 
         if DECOY_INTERVAL == 2:
-            evaluators["online_eval_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
-                                                                                                  forced_interval=0,
-                                                                                                  use_test_ids=True),
-                                                                                          n_eval_envs=10,
-                                                                                          n_eval_episodes=100)
+            evaluators["online_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                                             forced_interval=0,
+                                                                                             use_test_ids=True),
+                                                                                     n_eval_envs=10,
+                                                                                     n_eval_episodes=100,
+                                                                                     gamma=GAMMA)
 
         # 10 independent runs of the experiment
         all_scores = defaultdict(list)
