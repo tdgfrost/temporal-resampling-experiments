@@ -123,15 +123,15 @@ if __name__ == "__main__":
             evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                    forced_interval=interval,
                                                                    use_test_ids=True),
-                                                           n_eval_envs=100,
-                                                           n_eval_episodes=1000)
+                                                           n_eval_envs=10,
+                                                           n_eval_episodes=100)
 
         if DECOY_INTERVAL == 2:
             evaluators["online_eval_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                                                   forced_interval=0,
                                                                                                   use_test_ids=True),
-                                                                                          n_eval_envs=100,
-                                                                                          n_eval_episodes=1000)
+                                                                                          n_eval_envs=10,
+                                                                                          n_eval_episodes=100)
 
         # 10 independent runs of the experiment
         all_scores = defaultdict(list)
