@@ -135,7 +135,7 @@ if __name__ == "__main__":
 
         # 10 independent runs of the experiment
         all_scores = defaultdict(list)
-        n_runs = 10
+        n_runs = 30
         # Log meta data
         algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
         logs['algo'].append(algo)
