@@ -212,14 +212,15 @@ class EncoderActorCriticLSTM(nn.Module):
             high=INSULIN_ACTION_HIGH,
         )
 
-    def forward(self, x, hidden_state=None, deterministic=False):
+    def forward_lstm(self, x, hidden_state=None):
         is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
 
         if is_packed:
             # If the input is a packed sequence, apply the encoder to the data part
             encoded_data = self.encoder(x.data)
             # Create a new packed sequence with the encoded data
-            lstm_input = torch.nn.utils.rnn.PackedSequence(encoded_data, x.batch_sizes, x.sorted_indices, x.unsorted_indices)
+            lstm_input = torch.nn.utils.rnn.PackedSequence(encoded_data, x.batch_sizes, x.sorted_indices,
+                                                           x.unsorted_indices)
         else:
             # Handle non-packed sequences (e.g., during prediction/evaluation)
             batch_size, seq_len, feature_dim = x.shape
@@ -231,6 +232,11 @@ class EncoderActorCriticLSTM(nn.Module):
             lstm_input = encoded_x.reshape(batch_size, seq_len, -1)
 
         lstm_out, new_hidden = self.lstm(lstm_input, hidden_state)
+
+        return lstm_out, new_hidden, is_packed
+
+    def forward(self, x, hidden_state=None, deterministic=False):
+        lstm_out, new_hidden, is_packed = self.forward_lstm(x, hidden_state)
 
         if is_packed:
             lstm_out, lengths = torch.nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
@@ -254,6 +260,18 @@ class EncoderActorCriticLSTM(nn.Module):
         self.dist.last_sampled_action = sampled_action
 
         return dist, value, new_hidden
+
+    def evaluate_actions(self, obs, actions, hidden_state=None):
+        assert obs.ndim == 2 or (obs.ndim == 3 and obs.shape[0] == 1), \
+            "Observations must be 2D or 3D with batch size 1."
+
+        lstm_out, new_hidden, _ = self.forward_lstm(obs, hidden_state)
+        actor_out = self.actor_head(lstm_out)
+
+        dist = self.dist.proba_distribution(actor_out)
+        log_probs = dist.log_prob(actions.view(-1, self.action_dim))
+
+        return log_probs.squeeze()
 
     def init_hidden_state(self, batch_size=1):
         return torch.zeros(1, batch_size, self.hidden_dim), torch.zeros(1, batch_size, self.hidden_dim)

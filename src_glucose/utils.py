@@ -14,6 +14,7 @@ from scipy.stats import trimboth
 from simglucose.simulation.env import bg_in_range_magni, early_termination_reward
 from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
 from gymnasium.vector import AsyncVectorEnv
+from ppo_trainer import RecurrentPPO
 
 
 class RecurrentReplayBufferEnv:
@@ -390,13 +391,13 @@ class RecurrentReplayBufferEnv:
                 self.reward_mean[i] = r_mean
                 self.reward_std[i] = r_std
 
-    def set_to_tensors(self, device: str = 'cpu'):
+    def set_to_tensors(self, device: str = 'cpu', i: int = None):
         def _set_device(some_arr):
             if isinstance(some_arr, torch.Tensor):
                 return some_arr.to(device)
             return torch.from_numpy(np.array(some_arr)).to(device)
 
-        i = self.decoy_interval
+        i = self.decoy_interval if i is None else i
 
         self.observations[i] = _set_device(self.observations[i]).float()
         self.actions[i] = _set_device(self.actions[i]).float()
@@ -659,6 +660,130 @@ class ParallelEnvironmentEvaluator:
         final_rewards = all_episode_rewards[:self.n_eval_episodes]
 
         return final_rewards
+
+
+class WISOPEEvaluator:
+    """
+    Evaluates using weighted IS OPE.
+    """
+
+    def __init__(self,
+                 ppo_agent: RecurrentPPO,
+                 dataset: RecurrentReplayBufferEnv,
+                 decoy_interval: int = 0,
+                 gamma: float = 0.99,
+                 device: str = 'cpu'):
+
+        self.ppo_agent = ppo_agent
+        self.ppo_agent.ac_network.to(device)
+        self.dataset = dataset
+        self.gamma = gamma
+        self.decoy_interval = decoy_interval
+        self.device = device
+
+    def __call__(self, algo, seed=None) -> Tuple[float, float]:
+        """
+        Performs Weighted Importance Sampling (WIS) Off-Policy Evaluation (OPE).
+
+        This function iterates through all full episodes in the replay buffer,
+        computes the per-episode importance ratio (rho) and the un-normalized
+        discounted return (G), and returns the WIS estimate:
+
+        V(pi_e) = [ Sum(rho_i * G_i) ] / [ Sum(rho_i) ]
+        """
+        # Get data from buffer (will already be as tensors)
+        obs_data, act_data, rew_data, done_data, visible_data = self.unpack_dataset()
+
+        # Iterate through episodes, storing log-ratios and returns
+        log_rho_list = []
+        return_list = []
+
+        # Find all episode boundaries
+        done_indices = torch.where(done_data)[0]
+        assert done_data[-1], "The last transition must be done to ensure complete episodes."
+
+        start_idx = 0
+        with tqdm(total=len(done_indices), desc="Processing episodes for OPE", mininterval=2.0) as pbar:
+            for end_idx in done_indices:
+                # Slice the episode data
+                ep_obs = obs_data[start_idx : end_idx + 1]
+                ep_act = act_data[start_idx : end_idx + 1]
+                ep_rew = rew_data[start_idx : end_idx + 1]
+                ep_visible = visible_data[start_idx : end_idx + 1]
+
+                ep_len = len(ep_rew)
+                if ep_len == 0:
+                    start_idx = end_idx + 1
+                    continue
+
+                # Calculate the episode return (G)
+                # discounts = torch.pow(self.gamma, torch.arange(ep_len, device=self.device))
+                # ep_return = torch.sum(ep_rew * discounts)
+                ep_return = torch.sum(ep_rew)
+
+                # Calculate the episode importance ratio (rho)
+                ppo_hn, ppo_cn = self.ppo_agent.ac_network.init_hidden_state(batch_size=1)
+                ppo_h_state = (ppo_hn.to(self.device), ppo_cn.to(self.device))
+                offline_h_state = algo.get_initial_states(batch_size=1)
+                with torch.no_grad():
+                    # Get our log_probs
+                    log_prob_b = self.ppo_agent.ac_network.evaluate_actions(ep_obs.unsqueeze(0),
+                                                                            hidden_state=ppo_h_state,
+                                                                            actions=ep_act.unsqueeze(0))
+
+                    log_prob_e = algo.evaluate_actions(ep_obs.unsqueeze(0),
+                                                       hidden_state=offline_h_state,
+                                                       actions=ep_act.unsqueeze(0)).squeeze()
+
+                    # Calculate the log-ratio for the whole episode
+                    ep_log_rhos = log_prob_e - log_prob_b
+                    # - Cancel non-visible states
+                    ep_log_rhos = torch.where(ep_visible, ep_log_rhos, torch.zeros_like(ep_log_rhos))
+                    ep_log_rho = ep_log_rhos.sum()
+
+                    # Store log_rho and return
+                    log_rho_list.append(ep_log_rho)
+                    return_list.append(ep_return)
+
+                    # Update start index for next loop
+                    start_idx = end_idx + 1
+
+                pbar.update(1)
+
+        # Perform WIS calculation
+        all_log_rhos = torch.stack(log_rho_list)
+        all_returns = torch.stack(return_list)
+
+        # Find the maximum log_rho and substract for numerical stability
+        max_log_rho = torch.max(all_log_rhos)
+        stabilised_log_rhos = all_log_rhos - max_log_rho
+        stabilised_rhos = stabilised_log_rhos.exp()
+
+        numerator = (stabilised_rhos * all_returns).sum()
+        denominator = stabilised_rhos.sum()
+
+        wis_estimate = numerator / (denominator + 1e-6)
+
+        return wis_estimate.item()
+
+    def unpack_dataset(self):
+        self.dataset.set_to_tensors(self.device, self.decoy_interval)
+        obs_data = self.dataset.observations[self.decoy_interval]
+        act_data = self.dataset.actions[self.decoy_interval]
+        rew_data = self.dataset.rewards[self.decoy_interval]
+        done_data = self.dataset.dones[self.decoy_interval]
+        visible_data = self.dataset.visible_states[self.decoy_interval]
+
+        # Correct for the extra meaningless "final" obs
+        if len(obs_data) == len(act_data) + 1:
+            obs_data = obs_data[:-1]
+
+        # Get reward scaling to unnormalise the returns
+        r_mean = self.dataset.reward_mean[self.decoy_interval]
+        r_std = self.dataset.reward_std[self.decoy_interval]
+        rew_data = rew_data * (r_std + 1e-8) + r_mean
+
+        return obs_data, act_data, rew_data, done_data, visible_data
 
 
 def parse_bool(value, name: str = ''):

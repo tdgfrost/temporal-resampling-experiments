@@ -1,11 +1,11 @@
-import polars as pl
 from collections import defaultdict
 from functools import partial
+
+import polars as pl
 from scipy.stats import trim_mean
 
 from gym_wrappers import *
 from models import *
-from ppo_trainer import RecurrentPPO
 from utils import *
 
 parser = argparse.ArgumentParser()
@@ -20,6 +20,7 @@ parser.add_argument('--beta', default=10., type=float, help='Beta parameter for 
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 torch.set_float32_matmul_precision('high')
 
@@ -35,7 +36,7 @@ if __name__ == "__main__":
         "Please choose a valid offline model: 'iql' or 'cql'.")
     offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
 
-    if train_offline and not os.path.exists('./replay_buffer/COMPLETE'):
+    if train_offline:
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
         assert ppo_agent is not None, (
@@ -47,8 +48,6 @@ if __name__ == "__main__":
 
     EXPECTILE = args.expectile
     DECOY_INTERVAL = args.decoy_interval
-
-    model_loaded = False
 
     if train_ppo:
         GAMMA = 0.99
@@ -84,14 +83,13 @@ if __name__ == "__main__":
 
         # Get our PPO model
         base_env = make_glucose_env()
+        ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
 
         # Fill our replay buffer (or load pre-filled)
         dataset_size = 10_000_000
         replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
-            model = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
-            model_loaded = True
-            replay_buffer_env.fill_buffer(model=model, n_frames=dataset_size)
+            replay_buffer_env.fill_buffer(model=ppo_agent, n_frames=dataset_size)
             replay_buffer_env.save('./replay_buffer')
         else:
             print('=' * 50, '\nRe-using existing dataset...\n', '=' * 50)
@@ -103,6 +101,38 @@ if __name__ == "__main__":
               f"{replay_buffer_env.dataset_IQR_return:.2f}"
               f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
+        # Get our evaluators
+        evaluators = {}
+        # - OPE evaluation
+        for key, interval in [
+            ["wis_ope_irregular", 0],
+            ["wis_ope_interpolated", 1],
+            ["wis_ope_binned", 2]
+        ]:
+            evaluators[key] = WISOPEEvaluator(ppo_agent=ppo_agent,
+                                              dataset=replay_buffer_env,
+                                              gamma=GAMMA,
+                                              decoy_interval=interval,
+                                              device=DEVICE)
+
+        # - Online evaluation
+        for key, interval in [
+            ["online_eval_irregular", 0],
+            ["online_eval_interpolated", 1],
+        ]:
+            evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                   forced_interval=interval,
+                                                                   use_test_ids=True),
+                                                           n_eval_envs=100,
+                                                           n_eval_episodes=1000)
+
+        if DECOY_INTERVAL == 2:
+            evaluators["online_eval_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                                                  forced_interval=0,
+                                                                                                  use_test_ids=True),
+                                                                                          n_eval_envs=100,
+                                                                                          n_eval_episodes=1000)
+
         # 10 independent runs of the experiment
         all_scores = defaultdict(list)
         n_runs = 10
@@ -113,26 +143,8 @@ if __name__ == "__main__":
         logs['dataset_iqr_return'].append(replay_buffer_env.dataset_IQR_return)
         logs['dataset_iqr_std'].append(replay_buffer_env.dataset_IQR_std)
         for seed in np.arange(n_runs) * 1000:
-            # Get our evaluators
-            evaluators = {}
-            for key, interval in [
-                ["glucose_irregular", 0],
-                ["glucose_regular", 1],
-            ]:
-                evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
-                                                                       forced_interval=interval,
-                                                                       use_test_ids=True),
-                                                               n_eval_envs=100,
-                                                               n_eval_episodes=1000)
 
-            if DECOY_INTERVAL == 2:
-                evaluators["glucose_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
-                                                                                                  forced_interval=0,
-                                                                                                  use_test_ids=True),
-                                                                                          n_eval_envs=100,
-                                                                                          n_eval_episodes=1000)
-
-            # Alternately collect and training
+            # Initialise offline model
             algo = offline_model(observation_shape=base_env.observation_space.shape,
                                  action_space=base_env.action_space,
                                  hidden_dim=128,
@@ -144,7 +156,7 @@ if __name__ == "__main__":
                                  critic_lr=3e-4,
                                  beta=args.beta,
                                  seed=seed,
-                                 device='cuda' if torch.cuda.is_available() else 'cpu')
+                                 device=DEVICE)
 
             algo.compile()
 

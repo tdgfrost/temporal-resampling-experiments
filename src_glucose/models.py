@@ -787,7 +787,7 @@ class _RecurrentBase(nn.Module):
         pass
 
     def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                deterministic: bool = False) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
+                deterministic: bool = False, with_dist: bool = False) -> Tuple[Optional[CustomBetaDistribution], np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Predicts an action for a single observation and manages the recurrent state.
         Returns the action and the next hidden state.
@@ -819,7 +819,15 @@ class _RecurrentBase(nn.Module):
         else:
             action = dist.sample()
 
+        if with_dist:
+            return dist, action.squeeze(-1).cpu().numpy(), next_hidden_state
+
         return action.squeeze(-1).cpu().numpy(), next_hidden_state
+
+    def evaluate_actions(self, obs, hidden_state, actions):
+        dist, _, _ = self.predict(obs, hidden_state=hidden_state, deterministic=True, with_dist=True)
+        log_probs = dist.log_prob(actions)
+        return log_probs
 
     def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
@@ -914,6 +922,12 @@ class _RecurrentBase(nn.Module):
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
         for key in evaluators.keys():
             episodic_rewards = evaluators[key](self, seed=self._seed)
+
+            if isinstance(episodic_rewards, float):
+                # WIS estimate
+                log_rewards[key] = episodic_rewards
+                eval_str += f"\n     {key} = {episodic_rewards:.2f} (WIS estimate)"
+                continue
 
             episodic_rewards = np.array(episodic_rewards)
             log_rewards[key] = episodic_rewards.mean()
