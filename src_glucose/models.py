@@ -921,30 +921,26 @@ class _RecurrentBase(nn.Module):
         log_rewards = {}
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
         for key in evaluators.keys():
-            eval_str += "\n"
             eval_output = evaluators[key](self, seed=self._seed)
 
             if isinstance(eval_output, float):
                 # WIS estimate
                 log_rewards[key] = eval_output
-                eval_str += f"\n     {key} = {eval_output:.2f} (WIS discounted estimate)"
+                eval_str += f"\n     {key} = {eval_output:.2f} (WIS estimate)"
                 continue
 
-            episodic_rewards, discounted_episodic_rewards = eval_output
+            episodic_rewards = eval_output
 
             episodic_rewards = np.array(episodic_rewards)
-            discounted_episodic_rewards = np.array(discounted_episodic_rewards)
             log_rewards[key] = episodic_rewards.mean()
-            log_rewards[key + '_discounted'] = discounted_episodic_rewards.mean()
 
             # Get IQM for printout only
-            for arr_key, arr in [('', episodic_rewards), ('_discounted', discounted_episodic_rewards)]:
-                iqr = trimboth(arr, proportiontocut=0.25)
-                iqr_mean = np.mean(iqr)
-                iqr_std = np.std(iqr)
-                iqr_n_samples = len(iqr)
+            iqr = trimboth(episodic_rewards, proportiontocut=0.25)
+            iqr_mean = np.mean(iqr)
+            iqr_std = np.std(iqr)
+            iqr_n_samples = len(iqr)
 
-                eval_str += f"\n     {key + arr_key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
+            eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
 
         eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
         eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"

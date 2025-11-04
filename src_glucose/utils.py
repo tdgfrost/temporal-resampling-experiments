@@ -563,10 +563,7 @@ class ParallelEnvironmentEvaluator:
     def __call__(self, algo, seed=None) -> Tuple[float, float]:
         # --- 1. Setup ---
         all_episode_rewards = []
-        all_episode_disc_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
-        episode_disc_rewards = np.zeros(self.n_eval_envs)
-        episode_gammas = np.ones(self.n_eval_envs)
         seed = seed or self.seed
 
         # Create the vectorized environment
@@ -625,8 +622,6 @@ class ParallelEnvironmentEvaluator:
                 dones = terminated | truncated
 
                 episode_rewards += reward
-                episode_disc_rewards += reward * episode_gammas
-                episode_gammas *= self.gamma
 
                 # --- 3d. Handle Dones and State Updates ---
                 for i, done in enumerate(dones):
@@ -637,10 +632,7 @@ class ParallelEnvironmentEvaluator:
                     if done:
                         # An episode finished
                         all_episode_rewards.append(episode_rewards[i])
-                        all_episode_disc_rewards.append(episode_disc_rewards[i])
                         episode_rewards[i] = 0  # Reset reward accumulator
-                        episode_disc_rewards[i] = 0
-                        episode_gammas[i] = 1.0
 
                         # Update the progress bar
                         pbar.update(1)
@@ -668,9 +660,8 @@ class ParallelEnvironmentEvaluator:
 
         # Ensure we only use the requested number of episodes
         final_rewards = all_episode_rewards[:self.n_eval_episodes]
-        final_disc_rewards = all_episode_disc_rewards[:self.n_eval_episodes]
 
-        return final_rewards, final_disc_rewards
+        return final_rewards
 
 
 class WISOPEEvaluator:
@@ -774,7 +765,7 @@ class WISOPEEvaluator:
         # Calculate the WPDIS numerator and denominator
         # Numerator: sum( gamma^t * rho_0:t * r_t )
         # Denominator: sum( gamma^t * rho_0:t )
-        numerator = (stabilised_rhos * all_discounts * all_rewards).sum()
+        numerator = (stabilised_rhos * all_rewards).sum()
         denominator = stabilised_rhos.sum()
 
         wis_estimate = numerator / (denominator + 1e-6)
