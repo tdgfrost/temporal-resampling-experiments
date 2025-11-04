@@ -136,6 +136,7 @@ if __name__ == "__main__":
         n_runs = 30
         # Log meta data
         algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
+        model_save_path = f"../logs_glucose/iql_minigrid_models/{algo}"
         logs['algo'].append(algo)
         logs['decoy_interval'].append(DECOY_INTERVAL)
         logs['dataset_iqr_return'].append(replay_buffer_env.dataset_IQR_return)
@@ -178,10 +179,15 @@ if __name__ == "__main__":
             for key in evaluators.keys():
                 all_scores[key].append(log_dict[key])
 
+            # Save model state dicts in pytorch
+            current_model_path = os.path.join(model_save_path, f'seed={seed}')
+            os.makedirs(model_save_path, exist_ok=True)
+            algo.save_checkpoint(current_model_path)
+
         # Calculate our bootstrap IQM for each evaluator
         for key, scores in all_scores.items():
             scores = np.array(scores)
-            bootstrap_scores = np.random.choice(scores, size=(100_000, 10), replace=True)
+            bootstrap_scores = np.random.choice(scores, size=(100_000, n_runs), replace=True)
             bootstrap_iqm = trim_mean(bootstrap_scores, proportiontocut=0.25, axis=-1)
             bootstrap_low_q = np.percentile(bootstrap_iqm, 2.5)
             bootstrap_high_q = np.percentile(bootstrap_iqm, 97.5)

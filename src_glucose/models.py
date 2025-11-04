@@ -965,6 +965,61 @@ class _RecurrentBase(nn.Module):
             'policy_loss': deque(maxlen=100)
         }
 
+    def save_checkpoint(self, filepath: str):
+        """
+        Saves the state of all models, optimizers, and the GradScaler.
+        """
+        checkpoint = {}
+
+        # Iterate over all attributes of the instance
+        for key, value in self.__dict__.items():
+            # If it's an nn.Module, save its state_dict
+            if isinstance(value, nn.Module):
+                checkpoint[f"{key}_state_dict"] = value.state_dict()
+
+        try:
+            torch.save(checkpoint, filepath)
+            print(f"✅ Checkpoint saved successfully to {filepath}")
+        except Exception as e:
+            print(f"❌ Error saving checkpoint: {e}")
+
+    def load_checkpoint(self, filepath: str):
+        """
+        Loads the state of all models, optimizers, and the GradScaler.
+        """
+        try:
+            # Load checkpoint to the model's device
+            checkpoint = torch.load(filepath, map_location=self._device)
+        except FileNotFoundError:
+            print(f"❌ Error: No checkpoint file found at {filepath}")
+            return
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            return
+
+        loaded_keys = set()
+
+        # Iterate over all attributes of the instance
+        for key, value in self.__dict__.items():
+            state_dict_key = f"{key}_state_dict"
+
+            # If it's an nn.Module, load its state_dict
+            if isinstance(value, nn.Module) and state_dict_key in checkpoint:
+                try:
+                    value.load_state_dict(checkpoint[state_dict_key])
+                    loaded_keys.add(state_dict_key)
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not load state_dict for {key}: {e}")
+
+        print(f"✅ Checkpoint loaded from {filepath}.")
+
+        # Report on keys in checkpoint that were *not* loaded
+        all_checkpoint_keys = set(checkpoint.keys())
+        unloaded_keys = all_checkpoint_keys - loaded_keys
+        if unloaded_keys:
+            print(
+                f"ℹ️ Info: The following keys from the checkpoint were not loaded (this is often OK): {unloaded_keys}")
+
 
 class RecurrentIQL(_RecurrentBase):
     def __init__(
