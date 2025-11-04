@@ -104,12 +104,13 @@ if __name__ == "__main__":
         # Get our evaluators
         evaluators = dict()
         # - OPE evaluation
+        """
         evaluators["wis_ope"] = WISOPEEvaluator(ppo_agent=ppo_agent,
                                                 dataset=replay_buffer_env,
                                                 gamma=GAMMA,
                                                 decoy_interval=DECOY_INTERVAL,
                                                 device=DEVICE)
-
+        """
         # - Online evaluation
         for key, interval in [
             ["online_irregular", 0],
@@ -118,16 +119,16 @@ if __name__ == "__main__":
             evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                    forced_interval=interval,
                                                                    use_test_ids=True),
-                                                           n_eval_envs=10,
-                                                           n_eval_episodes=100,
+                                                           n_eval_envs=50,
+                                                           n_eval_episodes=200,
                                                            gamma=GAMMA)
 
         if DECOY_INTERVAL == 2:
             evaluators["online_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                                              forced_interval=0,
                                                                                              use_test_ids=True),
-                                                                                     n_eval_envs=10,
-                                                                                     n_eval_episodes=100,
+                                                                                     n_eval_envs=50,
+                                                                                     n_eval_episodes=200,
                                                                                      gamma=GAMMA)
 
         # 10 independent runs of the experiment
@@ -144,13 +145,14 @@ if __name__ == "__main__":
             # Initialise offline model
             algo = offline_model(observation_shape=base_env.observation_space.shape,
                                  action_space=base_env.action_space,
-                                 hidden_dim=128,
+                                 hidden_dim=32,
+                                 recurrent_hidden_size=32,
                                  batch_size=1024,
                                  expectile=EXPECTILE,
                                  gamma=GAMMA,
-                                 value_lr=3e-4,
+                                 value_lr=3e-5,
                                  policy_lr=3e-5,
-                                 critic_lr=3e-4,
+                                 critic_lr=3e-5,
                                  beta=args.beta,
                                  seed=seed,
                                  device=DEVICE)
@@ -159,7 +161,7 @@ if __name__ == "__main__":
 
             epoch_frac = 1.0
             if DECOY_INTERVAL in [0, 1]:
-                n_train_epochs = 10
+                n_train_epochs = 5
             elif DECOY_INTERVAL == 2:
                 n_train_epochs = 1000
             else:

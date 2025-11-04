@@ -417,7 +417,8 @@ class SharedRecurrentEncoder(nn.Module):
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=recurrent_hidden_size,
-            num_layers=1,
+            num_layers=2,
+            dropout=0.2,
             batch_first=True  # Crucial for easier tensor manipulation
         ).to(device)
 
@@ -759,6 +760,12 @@ class _RecurrentBase(nn.Module):
 
         return log_dict
 
+    @staticmethod
+    def add_noise(obs):
+        noise = torch.randn_like(obs) * obs.view(-1, 4).std(0)
+        obs[..., :-1] += noise[..., :-1] * 0.1
+        return obs
+
     def update_critic(self, *args):
         return torch.nan
 
@@ -913,8 +920,8 @@ class _RecurrentBase(nn.Module):
 
     def get_initial_states(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns a zero-initialized hidden state tuple for the LSTM."""
-        h_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
-        c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
+        h_0 = torch.zeros(2, batch_size, self._recurrent_hidden_size, device=self._device)
+        c_0 = torch.zeros(2, batch_size, self._recurrent_hidden_size, device=self._device)
         return h_0, c_0
 
     def _log_progress(self, epoch: int, loss_dict: dict, evaluators: dict = None):
@@ -1010,18 +1017,18 @@ class RecurrentIQL(_RecurrentBase):
 
         # --- Setup Optimizers ---
         # Shared parameters will be optimized by all three optimizers
-        self.critic_optim = torch.optim.Adam(
+        self.critic_optim = torch.optim.AdamW(
             list(self.shared_critic_encoder.parameters())
             + list(self.critic_net1.parameters())
             + list(self.critic_net2.parameters()),
             lr=self._critic_lr
         )
-        self.value_optim = torch.optim.Adam(
+        self.value_optim = torch.optim.AdamW(
             list(self.shared_critic_encoder.parameters())
             + list(self.value_net.parameters()),
             lr=self._value_lr
         )
-        self.policy_optim = torch.optim.Adam(
+        self.policy_optim = torch.optim.AdamW(
             list(self.actor_encoder.parameters())
             + list(self.policy_net.parameters()),
             lr=self._actor_lr
@@ -1083,6 +1090,10 @@ class RecurrentIQL(_RecurrentBase):
 
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                        train_mask, lengths, next_lengths):
+        # Add some noise
+        obs = self.add_noise(obs)
+        next_obs = self.add_noise(next_obs)
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, padding_mask, next_padding_mask,
                                                           train_mask, lengths, next_lengths)
@@ -1122,6 +1133,9 @@ class RecurrentIQL(_RecurrentBase):
     @torch.compile(mode='reduce-overhead')
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
+        # Add some noise
+        obs = self.add_noise(obs)
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Value function doesn't depend on actions
             lstm_out_q, _ = self.shared_critic_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
@@ -1147,19 +1161,21 @@ class RecurrentIQL(_RecurrentBase):
     def update_actor(self, *batch):
         # Scale the loss and perform the backward pass
         diff = self._batch_diff.clone() if self._batch_diff is not None else None
-        policy_loss, variance_loss = self._update_actor(*batch, diff)
-        total_loss = policy_loss + variance_loss
-        _ = self.generic_update(
-            total_loss,
+        policy_loss = self._update_actor(*batch, diff)
+        policy_loss = self.generic_update(
+            policy_loss,
             self.policy_optim,
             self.policy_net, self.actor_encoder
         )
 
-        return policy_loss.item()
+        return policy_loss
 
     @torch.compile(mode='default')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths, diff):
+        # Add some noise
+        obs = self.add_noise(obs)
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Policy doesn't depend on actions
             lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
@@ -1174,10 +1190,6 @@ class RecurrentIQL(_RecurrentBase):
             # The policy loss is the Negative Log-Likelihood (NLL)
             policy_loss_unmasked = -log_pi
 
-            # Get the variance target
-            variance = dist.variance()
-            variance_loss = (variance - 0.001) ** 2
-
             # Get the IQL weights
             weights = 1.0
             if not self._cloning_only:
@@ -1188,11 +1200,7 @@ class RecurrentIQL(_RecurrentBase):
             masked_loss = policy_loss_unmasked * weights * final_mask
             policy_loss = masked_loss.sum() / (final_mask.sum() + self._eps)
 
-            variance_loss = (variance_loss * weights * final_mask).sum() / (final_mask.sum() + self._eps)
-            # Scale to match policy loss
-            variance_loss = (policy_loss.abs() / variance_loss.abs()).detach() * variance_loss
-
-        return policy_loss, variance_loss
+        return policy_loss
 
 
 class RecurrentCQLSAC(_RecurrentBase):
@@ -1248,13 +1256,13 @@ class RecurrentCQLSAC(_RecurrentBase):
         self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
 
         # --- Setup Optimizers ---
-        self.critic_optim = torch.optim.Adam(
+        self.critic_optim = torch.optim.AdamW(
             list(self.shared_critic_encoder.parameters())
             + list(self.critic_net1.parameters())
             + list(self.critic_net2.parameters()),
             lr=self._critic_lr
         )
-        self.policy_optim = torch.optim.Adam(
+        self.policy_optim = torch.optim.AdamW(
             list(self.actor_encoder.parameters())
             + list(self.policy_net.parameters()),
             lr=self._actor_lr
@@ -1405,6 +1413,10 @@ class RecurrentCQLSAC(_RecurrentBase):
         8. Subtract the mean dataset Q from the logsumexp Q
         9. Update our Lagrangian alpha
         '''
+        # Add some noise
+        obs = self.add_noise(obs)
+        next_obs = self.add_noise(next_obs)
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1_pred, q2_pred, next_v, cql_loss = self._update_critic_inference_compiled(
                 obs, acts, next_obs, visible, padding_mask, next_padding_mask, train_mask, lengths, next_lengths
@@ -1447,6 +1459,9 @@ class RecurrentCQLSAC(_RecurrentBase):
     @torch.compile(mode='reduce-overhead')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
+        # Add some noise
+        obs = self.add_noise(obs)
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # 1. Get policy params (action-independent)
             lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,

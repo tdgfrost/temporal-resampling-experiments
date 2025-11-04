@@ -608,7 +608,7 @@ class ParallelEnvironmentEvaluator:
                     obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
                     action, hidden_state = algo.predict(obs_to_predict,
                                                         hidden_state=hidden_state,
-                                                        deterministic=False)
+                                                        deterministic=True)
 
                 # --- 3c. Step Environment ---
                 # action is a batch (B, ...), so we pass it directly
