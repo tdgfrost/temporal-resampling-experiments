@@ -106,14 +106,13 @@ class CustomBetaDistribution(nn.Module):
         :param params: Raw output from the actor head (batch_size, action_dim * 2)
         """
         # Split the output into alpha and beta parameters
-        mu_logits, kappa_logits = torch.chunk(params, 2, dim=-1)
+        alpha_logits, beta_logits = torch.chunk(params, 2, dim=-1)
 
-        self.mu = torch.sigmoid(mu_logits)
-        self.kappa = torch.exp(kappa_logits) + 1.0
+        self.alpha = F.softplus(alpha_logits) + 1.0
+        self.beta = F.softplus(beta_logits) + 1.0
 
-        # Softplus to keep alpha, beta > 1 for unimodal distribution
-        self.alpha = self.mu * self.kappa
-        self.beta = (1 - self.mu) * self.kappa
+        self.mu = self.alpha / (self.alpha + self.beta)
+        self.kappa = self.alpha + self.beta
 
         # (optional) Clamp for numerical stability
         # self.alpha = torch.clamp(self.alpha, 1.0, self.clamp_max)
@@ -175,7 +174,7 @@ class CustomBetaDistribution(nn.Module):
 
         # Account for the scaling transformation
         log_prob -= self.log_scale * self.action_dim
-        return log_prob.sum(dim=-1, keepdim=True)
+        return log_prob
 
     def sample_and_logprob(self):
         """
@@ -202,7 +201,7 @@ class CustomBetaDistribution(nn.Module):
         # log_prob(action) = log_prob(u) - log(scale)
         log_pi = log_prob_u - self.log_scale * self.action_dim
 
-        return actions, log_pi.sum(dim=-1, keepdim=True)
+        return actions, log_pi
 
     def variance(self):
         mu = self.mu.detach()
@@ -922,6 +921,7 @@ class _RecurrentBase(nn.Module):
         log_rewards = {}
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
         for key in evaluators.keys():
+            eval_str += "\n"
             eval_output = evaluators[key](self, seed=self._seed)
 
             if isinstance(eval_output, float):

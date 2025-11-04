@@ -743,7 +743,7 @@ class WISOPEEvaluator:
 
                     log_prob_e = algo.evaluate_actions(ep_obs.unsqueeze(0),
                                                        hidden_state=offline_h_state,
-                                                       actions=ep_act.unsqueeze(0)).squeeze()
+                                                       actions=ep_act.unsqueeze(0).unsqueeze(-1)).squeeze()
 
                     # Calculate the log-ratio for the whole episode
                     ep_log_rhos = log_prob_e - log_prob_b
