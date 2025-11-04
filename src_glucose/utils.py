@@ -494,40 +494,6 @@ class RecurrentReplayBufferEnv:
         self.visible_states[2] += [True for _ in range(len(dones))]
 
 
-class EnvironmentEvaluator:
-    def __init__(self, env, n_trials: int, running_average_obs: bool = False):
-        assert n_trials > 0, "n_trials must be positive"
-        # Scale rewards to [0, 1]
-        self.env = env
-        self.n_trials = n_trials
-        self.running_average_obs = running_average_obs
-
-    def __call__(self, algo) -> float:
-        mean_returns = []
-        running_average_obs = deque(maxlen=AGGREGATE_WINDOW_SIZE)
-        for _ in range(self.n_trials):
-            obs, info = self.env.reset()
-            running_average_obs.append(obs)
-            done = False
-            total_reward = 0.0
-            hidden_state = algo.get_initial_states(batch_size=1)
-
-            while not done:
-                with torch.no_grad():
-                    if self.running_average_obs:
-                        obs = np.mean(np.stack(running_average_obs), axis=0)
-                    action, hidden_state = algo.predict(np.expand_dims(obs, 0),
-                                                        hidden_state=hidden_state,
-                                                        deterministic=True)
-                obs, reward, terminated, truncated, info = self.env.step(action.item())
-                done = terminated or truncated
-                total_reward += reward
-
-            mean_returns.append(total_reward)
-
-        return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
-
-
 class ParallelEnvironmentEvaluator:
     """
     Evaluates a policy over n_eval_episodes using parallel environments.
@@ -548,7 +514,8 @@ class ParallelEnvironmentEvaluator:
                  gamma: float = 0.99,
                  running_average_obs: bool = False,
                  aggregate_window_size: int = AGGREGATE_WINDOW_SIZE,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None,
+                 verbose: bool = True):
 
         assert n_eval_episodes > 0, "n_eval_episodes must be positive"
         assert n_eval_envs > 0, "n_eval_envs must be positive"
@@ -560,15 +527,15 @@ class ParallelEnvironmentEvaluator:
         self.aggregate_window_size = aggregate_window_size
         self.seed = seed
         self.gamma = gamma
+        self.verbose = verbose
+        # Create the vectorized environment
+        self.eval_env = AsyncVectorEnv([self.env_fn for _ in range(self.n_eval_envs)])
 
     def __call__(self, algo, seed=None) -> Tuple[float, float]:
         # --- 1. Setup ---
         all_episode_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
         seed = seed or self.seed
-
-        # Create the vectorized environment
-        self.eval_env = AsyncVectorEnv([self.env_fn for _ in range(self.n_eval_envs)])
 
         running_avg_deques = None
         if self.running_average_obs:
@@ -592,7 +559,7 @@ class ParallelEnvironmentEvaluator:
         hidden_state = algo.get_initial_states(batch_size=self.n_eval_envs)
 
         # --- 3. Run Episodes ---
-        with tqdm(total=self.n_eval_episodes, desc="Evaluating Episodes", mininterval=2.0) as pbar:
+        with tqdm(total=self.n_eval_episodes, desc="Evaluating Episodes", mininterval=2.0, disable=not self.verbose) as pbar:
             while len(all_episode_rewards) < self.n_eval_episodes:
 
                 # --- 3a. Prepare Observations ---
@@ -655,9 +622,6 @@ class ParallelEnvironmentEvaluator:
 
                             # The observation for the next loop
                 obs = next_obs
-
-        # Cleanup
-        self.eval_env.close()
 
         # Ensure we only use the requested number of episodes
         final_rewards = all_episode_rewards[:self.n_eval_episodes]

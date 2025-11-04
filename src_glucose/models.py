@@ -741,11 +741,13 @@ class _RecurrentBase(nn.Module):
                     self.sync_target_networks()
 
                     pbar.update(1)
-                    pbar.set_postfix(epoch=epoch_str,
-                                     policy_loss=f"{np.mean(loss_dict['policy_loss']):.5f}",
-                                     critic_loss=f"{np.mean(loss_dict['critic_loss']):.5f}",
-                                     value_loss=f"{np.mean(loss_dict['value_loss']):.5f}",
-                                     refresh=False)
+                    pbar_dict = {'epoch': epoch_str,
+                                 'policy_loss': f"{np.mean(loss_dict['policy_loss']):.5f}",
+                                 'refresh': False}
+                    if not self._cloning_only:
+                        pbar_dict['critic_loss'] = f"{np.mean(loss_dict['critic_loss']):.5f}"
+                        pbar_dict['value_loss'] = f"{np.mean(loss_dict['value_loss']):.5f}"
+                    pbar.set_postfix(**pbar_dict)
 
                 # Logging
                 if epoch < n_epochs_train:
@@ -771,7 +773,7 @@ class _RecurrentBase(nn.Module):
                             break
 
             log_dict = self._log_progress(
-                epoch=epoch,
+                epoch="final",
                 evaluators=evaluators
             )
 
