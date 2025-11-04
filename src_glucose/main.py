@@ -87,18 +87,18 @@ if __name__ == "__main__":
 
         # Fill our replay buffer (or load pre-filled)
         dataset_size = 10_000_000
-        replay_buffer_env = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
+        dataset = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
-            replay_buffer_env.fill_buffer(model=ppo_agent, n_frames=dataset_size)
-            replay_buffer_env.save('./replay_buffer')
+            dataset.fill_buffer(model=ppo_agent, n_frames=dataset_size)
+            dataset.save('./replay_buffer')
         else:
             print('=' * 50, '\nRe-using existing dataset...\n', '=' * 50)
-            replay_buffer_env.load('./replay_buffer')
+            dataset.load('./replay_buffer')
 
-        dataset_sem = replay_buffer_env.dataset_IQR_std / np.sqrt(replay_buffer_env.dataset_IQR_n_episodes)
-        mean_ep_duration = np.array(replay_buffer_env.observations[0]).shape[0] / sum(replay_buffer_env.dones[0])
+        dataset_sem = dataset.dataset_IQR_std / np.sqrt(dataset.dataset_IQR_n_episodes)
+        mean_ep_duration = np.array(dataset.observations[0]).shape[0] / sum(dataset.dones[0])
         print(f"\n=================\nBaseline IQR return of the dataset: "
-              f"{replay_buffer_env.dataset_IQR_return:.2f}"
+              f"{dataset.dataset_IQR_return:.2f}"
               f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
         # Get our evaluators
@@ -106,7 +106,7 @@ if __name__ == "__main__":
         # - OPE evaluation
         """
         evaluators["wis_ope"] = WISOPEEvaluator(ppo_agent=ppo_agent,
-                                                dataset=replay_buffer_env,
+                                                dataset=train_dataset,
                                                 gamma=GAMMA,
                                                 decoy_interval=DECOY_INTERVAL,
                                                 device=DEVICE)
@@ -120,7 +120,7 @@ if __name__ == "__main__":
                                                                    forced_interval=interval,
                                                                    use_test_ids=True),
                                                            n_eval_envs=50,
-                                                           n_eval_episodes=200,
+                                                           n_eval_episodes=100,
                                                            gamma=GAMMA)
 
         if DECOY_INTERVAL == 2:
@@ -128,50 +128,51 @@ if __name__ == "__main__":
                                                                                              forced_interval=0,
                                                                                              use_test_ids=True),
                                                                                      n_eval_envs=50,
-                                                                                     n_eval_episodes=200,
+                                                                                     n_eval_episodes=100,
                                                                                      gamma=GAMMA)
 
         # 10 independent runs of the experiment
         all_scores = defaultdict(list)
         n_runs = 30
+        # Set training params
+        epoch_frac = 1.0
+        if DECOY_INTERVAL in [0, 1]:
+            n_train_epochs = 10
+            n_epochs_per_eval = 1
+        elif DECOY_INTERVAL == 2:
+            n_train_epochs = 1000
+            n_epochs_per_eval = 5
+        else:
+            raise ValueError("Invalid decoy interval.")
+
         # Log meta data
         algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
         model_save_path = f"../logs_glucose/iql_minigrid_models/{algo}"
         logs['algo'].append(algo)
         logs['decoy_interval'].append(DECOY_INTERVAL)
-        logs['dataset_iqr_return'].append(replay_buffer_env.dataset_IQR_return)
-        logs['dataset_iqr_std'].append(replay_buffer_env.dataset_IQR_std)
+        logs['dataset_iqr_return'].append(dataset.dataset_IQR_return)
+        logs['dataset_iqr_std'].append(dataset.dataset_IQR_std)
         for seed in np.arange(n_runs) * 1000:
 
             # Initialise offline model
             algo = offline_model(observation_shape=base_env.observation_space.shape,
                                  action_space=base_env.action_space,
-                                 hidden_dim=32,
-                                 recurrent_hidden_size=32,
+                                 hidden_dim=128,
+                                 recurrent_hidden_size=128,
                                  batch_size=1024,
                                  expectile=EXPECTILE,
                                  gamma=GAMMA,
-                                 value_lr=3e-5,
-                                 policy_lr=3e-5,
-                                 critic_lr=3e-5,
+                                 value_lr=3e-4,
+                                 policy_lr=3e-4,
+                                 critic_lr=3e-4,
                                  beta=args.beta,
                                  seed=seed,
                                  device=DEVICE)
 
-            algo.compile()
-
-            epoch_frac = 1.0
-            if DECOY_INTERVAL in [0, 1]:
-                n_train_epochs = 5
-            elif DECOY_INTERVAL == 2:
-                n_train_epochs = 1000
-            else:
-                raise ValueError("Invalid decoy interval.")
-
             log_dict = algo.fit(
-                dataset=replay_buffer_env,
+                dataset=dataset,
                 n_epochs_train=n_train_epochs,
-                n_epochs_per_eval=n_train_epochs,
+                n_epochs_per_eval=n_epochs_per_eval,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
                 dataset_kwargs={'epoch_fraction': epoch_frac},
@@ -180,7 +181,7 @@ if __name__ == "__main__":
                 all_scores[key].append(log_dict[key])
 
             # Save model state dicts in pytorch
-            current_model_path = os.path.join(model_save_path, f'seed={seed}')
+            current_model_path = os.path.join(model_save_path, f'seed={seed}.pt')
             os.makedirs(model_save_path, exist_ok=True)
             algo.save_checkpoint(current_model_path)
 

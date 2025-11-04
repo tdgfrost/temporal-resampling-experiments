@@ -9,6 +9,7 @@ from torch.distributions import Beta, Normal
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 from tqdm import tqdm
 from scipy.stats import trimboth
+from copy import deepcopy
 
 from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, set_seed
 
@@ -417,8 +418,7 @@ class SharedRecurrentEncoder(nn.Module):
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=recurrent_hidden_size,
-            num_layers=2,
-            dropout=0.2,
+            num_layers=1,
             batch_first=True  # Crucial for easier tensor manipulation
         ).to(device)
 
@@ -653,6 +653,7 @@ class _RecurrentBase(nn.Module):
         if seed is not None:
             set_seed(seed)
         super().__init__()
+        self._best_model_state = None
         self._cloning_only = False
         self._device = device
         self.decoy_interval = None
@@ -702,6 +703,7 @@ class _RecurrentBase(nn.Module):
             evaluators=None,
             show_progress: bool = True,
             decoy_interval: int = 0,
+            early_stopping_limit: int = 3,
             dataset_kwargs: Optional[Dict] = None
     ):
         self.decoy_interval = decoy_interval
@@ -712,10 +714,12 @@ class _RecurrentBase(nn.Module):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
         dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
-                                    decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
-                                    batch_size=self._batch_size, **dataset_kwargs)
+                                            decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
+                                            batch_size=self._batch_size, **dataset_kwargs)
 
         loss_dict = self._reset_loss_dict()
+        stop_early_count = 0
+        best_online_return = -1 * float('inf')
 
         # Start training
         with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0,
@@ -724,7 +728,6 @@ class _RecurrentBase(nn.Module):
                 epoch_str = f"{epoch}/{n_epochs_train}"
 
                 for batch in dataset:
-
                     # Update the networks
                     if not self._cloning_only:
                         loss_dict['critic_loss'].append(self.update_critic(*batch))
@@ -745,16 +748,30 @@ class _RecurrentBase(nn.Module):
                                      refresh=False)
 
                 # Logging
-                if epoch < n_epochs_train and epoch % n_epochs_per_eval == 0 and evaluators is not None:
-                    loss_dict, _ = self._log_progress(
-                        epoch=epoch,
-                        loss_dict=loss_dict,
-                        evaluators=evaluators
-                    )
+                if epoch < n_epochs_train:
+                    do_eval = epoch % n_epochs_per_eval == 0
+                    if do_eval:
+                        log_dict = self._log_progress(
+                            epoch=epoch,
+                            evaluators=evaluators
+                        )
 
-            _, log_dict = self._log_progress(
+                        # TBC
+                        current_return = log_dict['online_irregular']
+                        if current_return > best_online_return + 1e-4:
+                            best_online_return = current_return
+                            stop_early_count = 0
+                            self._save_best_model_state()
+                        else:
+                            stop_early_count += 1
+
+                        if stop_early_count >= early_stopping_limit:
+                            print(f"Early stopping triggered at epoch {epoch} - loading previous best state.")
+                            self._load_best_model_state()
+                            break
+
+            log_dict = self._log_progress(
                 epoch=epoch,
-                loss_dict=loss_dict,
                 evaluators=evaluators
             )
 
@@ -920,42 +937,43 @@ class _RecurrentBase(nn.Module):
 
     def get_initial_states(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns a zero-initialized hidden state tuple for the LSTM."""
-        h_0 = torch.zeros(2, batch_size, self._recurrent_hidden_size, device=self._device)
-        c_0 = torch.zeros(2, batch_size, self._recurrent_hidden_size, device=self._device)
+        h_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
+        c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
         return h_0, c_0
 
-    def _log_progress(self, epoch: int, loss_dict: dict, evaluators: dict = None):
+    def _log_progress(self, epoch: int, evaluators: dict = None):
+        assert evaluators is not None, \
+            "Evaluators must be provided for logging."
+
         log_rewards = {}
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
-        for key in evaluators.keys():
-            eval_output = evaluators[key](self, seed=self._seed)
+        if evaluators is not None:
+            for key in evaluators.keys():
+                eval_output = evaluators[key](self, seed=self._seed)
 
-            if isinstance(eval_output, float):
-                # WIS estimate
-                log_rewards[key] = eval_output
-                eval_str += f"\n     {key} = {eval_output:.2f} (WIS estimate)"
-                continue
+                if isinstance(eval_output, float):
+                    # WIS estimate
+                    log_rewards[key] = eval_output
+                    eval_str += f"\n     {key} = {eval_output:.2f} (WIS estimate)"
+                    continue
 
-            episodic_rewards = eval_output
+                episodic_rewards = eval_output
 
-            episodic_rewards = np.array(episodic_rewards)
-            log_rewards[key] = episodic_rewards.mean()
+                episodic_rewards = np.array(episodic_rewards)
+                log_rewards[key] = episodic_rewards.mean()
 
-            # Get IQM for printout only
-            iqr = trimboth(episodic_rewards, proportiontocut=0.25)
-            iqr_mean = np.mean(iqr)
-            iqr_std = np.std(iqr)
-            iqr_n_samples = len(iqr)
+                # Get IQM for printout only
+                iqr = trimboth(episodic_rewards, proportiontocut=0.25)
+                iqr_mean = np.mean(iqr)
+                iqr_std = np.std(iqr)
+                iqr_n_samples = len(iqr)
 
-            eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
+                eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
 
-        eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
-        eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"
-        eval_str += f"\n     value_loss = {np.mean(loss_dict['value_loss']):.7f}\n"
         eval_str += '=' * 40 + '\n'
         print(eval_str)
 
-        return self._reset_loss_dict(), log_rewards
+        return log_rewards
 
     @staticmethod
     def _reset_loss_dict():
@@ -965,20 +983,23 @@ class _RecurrentBase(nn.Module):
             'policy_loss': deque(maxlen=100)
         }
 
+    def _save_best_model_state(self):
+        """Saves a deep copy of all nn.Module state_dicts in memory."""
+        self._best_model_state = deepcopy(self.state_dict())
+
+    def _load_best_model_state(self):
+        """Loads the previously saved 'best' model state_dicts from memory."""
+        if not hasattr(self, '_best_model_state') or self._best_model_state is None:
+            # No state saved, nothing to do.
+            return
+        self.load_state_dict(self._best_model_state)
+
     def save_checkpoint(self, filepath: str):
         """
         Saves the state of all models, optimizers, and the GradScaler.
         """
-        checkpoint = {}
-
-        # Iterate over all attributes of the instance
-        for key, value in self.__dict__.items():
-            # If it's an nn.Module, save its state_dict
-            if isinstance(value, nn.Module):
-                checkpoint[f"{key}_state_dict"] = value.state_dict()
-
         try:
-            torch.save(checkpoint, filepath)
+            torch.save(self.state_dict(), filepath)
             print(f"✅ Checkpoint saved successfully to {filepath}")
         except Exception as e:
             print(f"❌ Error saving checkpoint: {e}")
@@ -997,28 +1018,12 @@ class _RecurrentBase(nn.Module):
             print(f"❌ Error loading checkpoint: {e}")
             return
 
-        loaded_keys = set()
-
-        # Iterate over all attributes of the instance
-        for key, value in self.__dict__.items():
-            state_dict_key = f"{key}_state_dict"
-
-            # If it's an nn.Module, load its state_dict
-            if isinstance(value, nn.Module) and state_dict_key in checkpoint:
-                try:
-                    value.load_state_dict(checkpoint[state_dict_key])
-                    loaded_keys.add(state_dict_key)
-                except Exception as e:
-                    print(f"⚠️ Warning: Could not load state_dict for {key}: {e}")
+        try:
+            self.load_state_dict(checkpoint)
+        except Exception as e:
+            print(f"⚠️ Warning: Could not load state_dict directly: {e}")
 
         print(f"✅ Checkpoint loaded from {filepath}.")
-
-        # Report on keys in checkpoint that were *not* loaded
-        all_checkpoint_keys = set(checkpoint.keys())
-        unloaded_keys = all_checkpoint_keys - loaded_keys
-        if unloaded_keys:
-            print(
-                f"ℹ️ Info: The following keys from the checkpoint were not loaded (this is often OK): {unloaded_keys}")
 
 
 class RecurrentIQL(_RecurrentBase):
@@ -1072,18 +1077,18 @@ class RecurrentIQL(_RecurrentBase):
 
         # --- Setup Optimizers ---
         # Shared parameters will be optimized by all three optimizers
-        self.critic_optim = torch.optim.AdamW(
+        self.critic_optim = torch.optim.Adam(
             list(self.shared_critic_encoder.parameters())
             + list(self.critic_net1.parameters())
             + list(self.critic_net2.parameters()),
             lr=self._critic_lr
         )
-        self.value_optim = torch.optim.AdamW(
+        self.value_optim = torch.optim.Adam(
             list(self.shared_critic_encoder.parameters())
             + list(self.value_net.parameters()),
             lr=self._value_lr
         )
-        self.policy_optim = torch.optim.AdamW(
+        self.policy_optim = torch.optim.Adam(
             list(self.actor_encoder.parameters())
             + list(self.policy_net.parameters()),
             lr=self._actor_lr
@@ -1146,8 +1151,8 @@ class RecurrentIQL(_RecurrentBase):
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                        train_mask, lengths, next_lengths):
         # Add some noise
-        obs = self.add_noise(obs)
-        next_obs = self.add_noise(next_obs)
+        # obs = self.add_noise(obs)
+        # next_obs = self.add_noise(next_obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, padding_mask, next_padding_mask,
@@ -1189,7 +1194,7 @@ class RecurrentIQL(_RecurrentBase):
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
         # Add some noise
-        obs = self.add_noise(obs)
+        # obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Value function doesn't depend on actions
@@ -1229,7 +1234,7 @@ class RecurrentIQL(_RecurrentBase):
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths, diff):
         # Add some noise
-        obs = self.add_noise(obs)
+        # obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Policy doesn't depend on actions
@@ -1311,13 +1316,13 @@ class RecurrentCQLSAC(_RecurrentBase):
         self.policy_net = RecurrentNet(output_size=2, **decoder_kwargs).to(self._device)
 
         # --- Setup Optimizers ---
-        self.critic_optim = torch.optim.AdamW(
+        self.critic_optim = torch.optim.Adam(
             list(self.shared_critic_encoder.parameters())
             + list(self.critic_net1.parameters())
             + list(self.critic_net2.parameters()),
             lr=self._critic_lr
         )
-        self.policy_optim = torch.optim.AdamW(
+        self.policy_optim = torch.optim.Adam(
             list(self.actor_encoder.parameters())
             + list(self.policy_net.parameters()),
             lr=self._actor_lr
@@ -1469,8 +1474,8 @@ class RecurrentCQLSAC(_RecurrentBase):
         9. Update our Lagrangian alpha
         '''
         # Add some noise
-        obs = self.add_noise(obs)
-        next_obs = self.add_noise(next_obs)
+        # obs = self.add_noise(obs)
+        # next_obs = self.add_noise(next_obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1_pred, q2_pred, next_v, cql_loss = self._update_critic_inference_compiled(
@@ -1515,7 +1520,7 @@ class RecurrentCQLSAC(_RecurrentBase):
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
         # Add some noise
-        obs = self.add_noise(obs)
+        # obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # 1. Get policy params (action-independent)

@@ -69,7 +69,7 @@ class T1DPatientEnv(Wrapper):
 
     def __init__(self, use_test_ids: bool = False, **kwargs):
         self.kwargs = kwargs
-        self._id_choices = [1, 2, 3, 4, 5, 6, 7, 8] # if not use_test_ids else [9, 10]
+        self._id_choices = [1, 2, 3, 4, 5, 6, 7, 8] if not use_test_ids else [9, 10]
         id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
