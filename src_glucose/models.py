@@ -1278,7 +1278,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._tau_target = tau_target
         self._target_entropy_alpha = -1
         self._target_cql_alpha_gap = 0.
-        self._entropy_alpha = torch.tensor(1.0, device=self._device)
+        self._entropy_alpha = torch.tensor(0.0, device=self._device)
         self._cql_alpha = torch.tensor(10.0, device=self._device)
         self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
                                                              device=self._device))
