@@ -783,8 +783,9 @@ class _RecurrentBase(nn.Module):
     @staticmethod
     def add_noise(obs):
         noise = torch.randn_like(obs) * obs.view(-1, 4).std(0)
-        obs[..., :-1] += noise[..., :-1] * 0.1
-        return obs
+        new_obs = obs.clone()  # necessary for cudagraphs
+        new_obs[..., :-1] = new_obs[..., :-1] + noise[..., :-1] * 0.01
+        return new_obs
 
     def update_critic(self, *args):
         return torch.nan
@@ -1154,8 +1155,8 @@ class RecurrentIQL(_RecurrentBase):
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                        train_mask, lengths, next_lengths):
         # Add some noise
-        # obs = self.add_noise(obs)
-        # next_obs = self.add_noise(next_obs)
+        obs = self.add_noise(obs)
+        next_obs = self.add_noise(next_obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, padding_mask, next_padding_mask,
@@ -1197,7 +1198,7 @@ class RecurrentIQL(_RecurrentBase):
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
         # Add some noise
-        # obs = self.add_noise(obs)
+        obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Value function doesn't depend on actions
@@ -1237,7 +1238,7 @@ class RecurrentIQL(_RecurrentBase):
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths, diff):
         # Add some noise
-        # obs = self.add_noise(obs)
+        obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Policy doesn't depend on actions
@@ -1477,8 +1478,8 @@ class RecurrentCQLSAC(_RecurrentBase):
         9. Update our Lagrangian alpha
         '''
         # Add some noise
-        # obs = self.add_noise(obs)
-        # next_obs = self.add_noise(next_obs)
+        obs = self.add_noise(obs)
+        next_obs = self.add_noise(next_obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1_pred, q2_pred, next_v, cql_loss = self._update_critic_inference_compiled(
@@ -1523,7 +1524,7 @@ class RecurrentCQLSAC(_RecurrentBase):
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, lengths, next_lengths):
         # Add some noise
-        # obs = self.add_noise(obs)
+        obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # 1. Get policy params (action-independent)
