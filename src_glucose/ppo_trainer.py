@@ -9,9 +9,7 @@ from gymnasium.vector import AsyncVectorEnv
 from torch.distributions import Beta
 from functools import partial
 import random
-
-INSULIN_ACTION_LOW = 0.0
-INSULIN_ACTION_HIGH = 0.5
+from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
 
 
 def set_seed(seed: int):

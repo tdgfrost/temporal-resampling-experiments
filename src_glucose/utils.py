@@ -339,13 +339,14 @@ class RecurrentReplayBufferEnv:
             obs, info, ep_buffer = self.reset(seed=seed)
             model.set_random_seed(seed)
             total_rewards = []
+            total_lengths = []
 
             while frame_count < n_frames:
                 done = False
                 lstm_states = model.ac_network.init_hidden_state(batch_size=1)
                 total_reward = 0
                 while not done:
-                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=True)
+                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=False)
                     obs, reward, term, trunc, info = self.env.step(action)
                     # Get the real action delivered
                     real_action = obs[1] * INSULIN_SCALE
@@ -359,16 +360,21 @@ class RecurrentReplayBufferEnv:
                         obs, info = self.env.reset(seed=seed + frame_count)
 
                     pbar.update(1)
+                    pbar_dict = {'avg_episode_reward': f"{np.mean(total_rewards):.2f}",
+                                 'avg_episode_length': f"{np.mean(total_lengths):.2f}",
+                                 'refresh': False}
+                    pbar.set_postfix(**pbar_dict)
                     frame_count += 1
                     model.set_random_seed(seed + frame_count)
+
+                # Keep track of total rewards for stats
+                total_rewards.append(total_reward)
+                total_lengths.append(len(ep_buffer['all_done']))
 
                 # Add ep_buffer to permanent buffer
                 self.update_permanent_buffer(ep_buffer)
                 # Reset ep_buffer and add 'obs' to it
                 ep_buffer = self._reset_ep_buffer(obs)
-
-                # Keep track of total rewards for stats
-                total_rewards.append(total_reward)
 
             # Add a garbage all-zeros "final obs"
             for i in range(3):

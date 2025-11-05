@@ -12,6 +12,9 @@ SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 24  # 24 * 10 minutes = 240 minutes
 TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 10 minutes)
 
+INSULIN_ACTION_LOW = 0.0
+INSULIN_ACTION_HIGH = 0.5
+
 # Scaling parameters
 INSULIN_SCALE = 30.0
 CHO_SCALE = 300.0

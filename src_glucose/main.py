@@ -36,7 +36,7 @@ if __name__ == "__main__":
         "Please choose a valid offline model: 'iql' or 'cql'.")
     offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
 
-    if train_offline:
+    if train_offline and not os.path.exists('./replay_buffer/COMPLETE'):
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
         assert ppo_agent is not None, (
@@ -83,12 +83,12 @@ if __name__ == "__main__":
 
         # Get our PPO model
         base_env = make_glucose_env()
-        ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
 
         # Fill our replay buffer (or load pre-filled)
-        dataset_size = 10_000_000
+        dataset_size = 1_000_000
         dataset = RecurrentReplayBufferEnv(base_env, buffer_size=dataset_size * 10)
         if not os.path.exists('./replay_buffer/COMPLETE'):
+            ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, base_env)
             dataset.fill_buffer(model=ppo_agent, n_frames=dataset_size)
             dataset.save('./replay_buffer')
         else:
@@ -138,12 +138,14 @@ if __name__ == "__main__":
         n_runs = 30
         # Set training params
         epoch_frac = 1.0
+        early_stopping_limit = 5
         if DECOY_INTERVAL in [0, 1]:
-            n_train_epochs = 10
+            n_train_epochs = 50
             n_epochs_per_eval = 1
         elif DECOY_INTERVAL == 2:
             n_train_epochs = 1000
-            n_epochs_per_eval = 5
+            n_epochs_per_eval = 50
+            early_stopping_limit = 10
         else:
             raise ValueError("Invalid decoy interval.")
 
@@ -177,6 +179,7 @@ if __name__ == "__main__":
                 n_epochs_per_eval=n_epochs_per_eval,
                 evaluators=evaluators,
                 decoy_interval=DECOY_INTERVAL,
+                early_stopping_limit=early_stopping_limit,
                 dataset_kwargs={'epoch_fraction': epoch_frac},
             )
             for key in evaluators.keys():

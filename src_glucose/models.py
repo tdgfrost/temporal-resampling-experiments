@@ -11,7 +11,8 @@ from tqdm import tqdm
 from scipy.stats import trimboth
 from copy import deepcopy
 
-from ppo_trainer import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, set_seed
+from ppo_trainer import set_seed
+from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
 
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
