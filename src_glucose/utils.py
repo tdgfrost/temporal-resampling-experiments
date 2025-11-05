@@ -361,6 +361,7 @@ class RecurrentReplayBufferEnv:
 
                     pbar.update(1)
                     pbar_dict = {'avg_episode_reward': f"{np.mean(total_rewards):.2f}",
+                                 'avg_episode_IQM_reward': f"{trimboth(np.array(total_rewards), proportiontocut=0.25).mean():.2f}",
                                  'avg_episode_length': f"{np.mean(total_lengths):.2f}",
                                  'refresh': False}
                     pbar.set_postfix(**pbar_dict)
