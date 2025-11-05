@@ -437,8 +437,7 @@ class RecurrentPPO:
         while len(all_episode_rewards) < n_eval_episodes:
             obs_tensor = torch.FloatTensor(obs).unsqueeze(1)
             with torch.no_grad():
-                dist, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
-                action_env = dist.last_sampled_action
+                action_env, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=True)
             obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
             dones = term | trunc
             episode_rewards += reward
