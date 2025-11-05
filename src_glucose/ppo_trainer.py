@@ -421,7 +421,7 @@ class RecurrentPPO:
 
     def _evaluate_policy(self, n_eval_envs=4, n_eval_episodes=None):
         n_eval_episodes = n_eval_episodes or self.eval_episodes
-        eval_env = AsyncVectorEnv([lambda: self.env_creator_fn() for _ in range(n_eval_envs)])
+        eval_env = AsyncVectorEnv([self.env_creator_fn for _ in range(n_eval_envs)])
         all_episode_rewards = []
         all_episode_steps = []
         episode_rewards = np.zeros(n_eval_envs)
@@ -439,7 +439,8 @@ class RecurrentPPO:
         while len(all_episode_rewards) < n_eval_episodes:
             obs_tensor = torch.FloatTensor(obs).unsqueeze(1)
             with torch.no_grad():
-                action_env, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=True)
+                dist, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
+                action_env = dist.last_sampled_action
             obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
             dones = term | trunc
             episode_rewards += reward
@@ -594,7 +595,7 @@ class RecurrentPPO:
             if self._num_timesteps >= next_eval:
                 avg_eval_reward, info = self._evaluate_policy()
                 print(f"--- EVALUATION at Timestep: {self._num_timesteps}/{target_timesteps} ---")
-                print(f"Average deterministic reward: {avg_eval_reward:.2f} | Best reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
+                print(f"Average reward: {avg_eval_reward:.2f} | Best reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
 
                 if avg_eval_reward > self.best_mean_reward:
                     self.best_mean_reward = avg_eval_reward
