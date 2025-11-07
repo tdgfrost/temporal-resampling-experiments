@@ -138,7 +138,7 @@ if __name__ == "__main__":
         n_runs = 30
         # Set training params
         epoch_frac = 1.0
-        early_stopping_limit = 5
+        early_stopping_limit = 10
         if DECOY_INTERVAL in [0, 1]:
             n_train_epochs = 50
             n_epochs_per_eval = 1
