@@ -256,7 +256,7 @@ class RecurrentReplayBufferEnv:
         if os.path.exists(path):
             print(f"Warning: Overwriting existing replay buffer at {path}")
             shutil.rmtree(path)
-        os.makedirs(path)
+        os.makedirs(path, exist_ok=True)
         for key, value in [
             ('observations', self.observations),
             ('actions', self.actions),
@@ -347,7 +347,8 @@ class RecurrentReplayBufferEnv:
                 lstm_states = model.ac_network.init_hidden_state(batch_size=1)
                 total_reward = 0
                 while not done:
-                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states, deterministic=False)
+                    action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states,
+                                                        deterministic=False)
                     obs, reward, term, trunc, info = self.env.step(action)
                     # Get the real action delivered
                     real_action = obs[1] * INSULIN_SCALE
@@ -361,11 +362,12 @@ class RecurrentReplayBufferEnv:
                         obs, info = self.env.reset(seed=seed + frame_count)
 
                     pbar.update(1)
-                    pbar_dict = {'avg_episode_reward': f"{np.mean(total_rewards):.2f}",
-                                 'avg_episode_IQM_reward': f"{trimboth(np.array(total_rewards), proportiontocut=0.25).mean():.2f}",
-                                 'avg_episode_length': f"{np.mean(total_lengths):.2f}",
-                                 'refresh': False}
-                    pbar.set_postfix(**pbar_dict)
+                    if frame_count >= 100:
+                        pbar_dict = {'avg_episode_reward': f"{np.mean(total_rewards):.2f}",
+                                     'avg_episode_IQM_reward': f"{trimboth(np.array(total_rewards), proportiontocut=0.25).mean():.2f}",
+                                     'avg_episode_length': f"{np.mean(total_lengths):.2f}",
+                                     'refresh': False}
+                        pbar.set_postfix(**pbar_dict)
                     frame_count += 1
                     model.set_random_seed(seed + frame_count)
 
@@ -594,6 +596,9 @@ class ParallelEnvironmentEvaluator:
                 except AttributeError:
                     action_np = action  # Assume it's already numpy
 
+                if action_np.ndim == 1:
+                    action_np = np.expand_dims(action_np, axis=-1)
+
                 next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
                 dones = terminated | truncated
 
@@ -637,134 +642,6 @@ class ParallelEnvironmentEvaluator:
         return final_rewards
 
 
-class WISOPEEvaluator:
-    """
-    Evaluates using weighted IS OPE.
-    """
-
-    def __init__(self,
-                 ppo_agent: RecurrentPPO,
-                 dataset: RecurrentReplayBufferEnv,
-                 decoy_interval: int = 0,
-                 gamma: float = 0.99,
-                 device: str = 'cpu'):
-
-        self.ppo_agent = ppo_agent
-        self.ppo_agent.ac_network.to(device)
-        self.dataset = dataset
-        self.gamma = gamma
-        self.decoy_interval = decoy_interval
-        self.device = device
-
-    def __call__(self, algo, seed=None) -> Tuple[float, float]:
-        """
-        Performs Weighted Importance Sampling (WIS) Off-Policy Evaluation (OPE).
-
-        This function iterates through all full episodes in the replay buffer,
-        computes the per-episode importance ratio (rho) and the un-normalized
-        discounted return (G), and returns the WIS estimate:
-
-        V(pi_e) = [ Sum(rho_i * G_i) ] / [ Sum(rho_i) ]
-        """
-        # Get data from buffer (will already be as tensors)
-        obs_data, act_data, rew_data, done_data, visible_data = self.unpack_dataset()
-
-        # Iterate through episodes, storing log-ratios and returns
-        all_seq_log_rhos = []
-        all_rewards = []
-        all_discounts = []
-
-        # Find all episode boundaries
-        done_indices = torch.where(done_data)[0]
-        assert done_data[-1], "The last transition must be done to ensure complete episodes."
-
-        start_idx = 0
-        with tqdm(total=len(done_indices), desc="Processing episodes for OPE", mininterval=2.0) as pbar:
-            for end_idx in done_indices:
-                # Slice the episode data
-                ep_obs = obs_data[start_idx : end_idx + 1]
-                ep_act = act_data[start_idx : end_idx + 1]
-                ep_rew = rew_data[start_idx : end_idx + 1]
-                ep_visible = visible_data[start_idx : end_idx + 1]
-
-                ep_len = len(ep_rew)
-                if ep_len == 0:
-                    start_idx = end_idx + 1
-                    continue
-
-                # Calculate the episode return (G)
-                discounts = torch.pow(self.gamma, torch.arange(ep_len, device=self.device))
-
-                # Calculate the episode importance ratio (rho)
-                ppo_hn, ppo_cn = self.ppo_agent.ac_network.init_hidden_state(batch_size=1)
-                ppo_h_state = (ppo_hn.to(self.device), ppo_cn.to(self.device))
-                offline_h_state = algo.get_initial_states(batch_size=1)
-                with torch.no_grad():
-                    # Get our log_probs
-                    log_prob_b = self.ppo_agent.ac_network.evaluate_actions(ep_obs.unsqueeze(0),
-                                                                            hidden_state=ppo_h_state,
-                                                                            actions=ep_act.unsqueeze(0))
-
-                    log_prob_e = algo.evaluate_actions(ep_obs.unsqueeze(0),
-                                                       hidden_state=offline_h_state,
-                                                       actions=ep_act.unsqueeze(0).unsqueeze(-1)).squeeze()
-
-                    # Calculate the log-ratio for the whole episode
-                    ep_log_rhos = log_prob_e - log_prob_b
-                    # - Cancel non-visible states
-                    ep_log_rhos = torch.where(ep_visible, ep_log_rhos, torch.zeros_like(ep_log_rhos))
-                    seq_log_rhos = torch.cumsum(ep_log_rhos, dim=0)
-
-                    # Store seq_log_rhos and return
-                    all_seq_log_rhos.append(seq_log_rhos)
-                    all_rewards.append(ep_rew)
-                    all_discounts.append(discounts)
-
-                    # Update start index for next loop
-                    start_idx = end_idx + 1
-
-                pbar.update(1)
-
-        # Perform WIS calculation
-        all_seq_log_rhos = torch.cat(all_seq_log_rhos)
-        all_rewards = torch.cat(all_rewards)
-        all_discounts = torch.cat(all_discounts)
-
-        # Find the maximum log_rho and substract for numerical stability
-        max_log_rho = torch.max(all_seq_log_rhos)
-        stabilised_log_rhos = all_seq_log_rhos - max_log_rho
-        stabilised_rhos = stabilised_log_rhos.exp()
-
-        # Calculate the WPDIS numerator and denominator
-        # Numerator: sum( gamma^t * rho_0:t * r_t )
-        # Denominator: sum( gamma^t * rho_0:t )
-        numerator = (stabilised_rhos * all_rewards).sum()
-        denominator = stabilised_rhos.sum()
-
-        wis_estimate = numerator / (denominator + 1e-6)
-
-        return wis_estimate.item()
-
-    def unpack_dataset(self):
-        self.dataset.set_to_tensors(self.device, self.decoy_interval)
-        obs_data = self.dataset.observations[self.decoy_interval]
-        act_data = self.dataset.actions[self.decoy_interval]
-        rew_data = self.dataset.rewards[self.decoy_interval]
-        done_data = self.dataset.dones[self.decoy_interval]
-        visible_data = self.dataset.visible_states[self.decoy_interval]
-
-        # Correct for the extra meaningless "final" obs
-        if len(obs_data) == len(act_data) + 1:
-            obs_data = obs_data[:-1]
-
-        # Get reward scaling to unnormalise the returns
-        r_mean = self.dataset.reward_mean[self.decoy_interval]
-        r_std = self.dataset.reward_std[self.decoy_interval]
-        rew_data = rew_data * (r_std + 1e-8) + r_mean
-
-        return obs_data, act_data, rew_data, done_data, visible_data
-
-
 def parse_bool(value, name: str = ''):
     if isinstance(value, str) and value.lower() in ['true', 'false']:
         return value.lower() == "true"
@@ -780,10 +657,10 @@ def parse_bool(value, name: str = ''):
 def choose_ppo_agent():
     # Use inquirer to let the user select a folder
     message = "Please select PPO agent using UP/DOWN/ENTER."
-    options = os.listdir("../logs/ppo_minigrid_logs/historic_bests")
+    options = os.listdir("../logs_glucose/ppo_logs")
     options = [i for i in options if i.endswith('.zip')]
     question = [inquirer.List('option',
                               message=message,
                               choices=options)]
     answer = inquirer.prompt(question)
-    return f"../logs/ppo_minigrid_logs/historic_bests/{answer['option']}"
+    return {answer['option']}

@@ -721,6 +721,7 @@ class _RecurrentBase(nn.Module):
         loss_dict = self._reset_loss_dict()
         stop_early_count = 0
         best_online_return = -1 * float('inf')
+        best_log_dict = None
 
         # Start training
         with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0,
@@ -742,13 +743,15 @@ class _RecurrentBase(nn.Module):
                     self.sync_target_networks()
 
                     pbar.update(1)
-                    pbar_dict = {'epoch': epoch_str,
-                                 'policy_loss': f"{np.mean(loss_dict['policy_loss']):.5f}",
-                                 'refresh': False}
-                    if not self._cloning_only:
-                        pbar_dict['critic_loss'] = f"{np.mean(loss_dict['critic_loss']):.5f}"
-                        pbar_dict['value_loss'] = f"{np.mean(loss_dict['value_loss']):.5f}"
-                    pbar.set_postfix(**pbar_dict)
+                    if len(loss_dict['policy_loss'] > 1):
+                        pbar_dict = {'epoch': epoch_str,
+                                     'policy_loss': f"{np.mean(loss_dict['policy_loss']):.5f}",
+                                     'refresh': False}
+                        if not self._cloning_only:
+                            pbar_dict['critic_loss'] = f"{np.mean(loss_dict['critic_loss']):.5f}"
+                            pbar_dict['value_loss'] = f"{np.mean(loss_dict['value_loss']):.5f}"
+
+                        pbar.set_postfix(**pbar_dict)
 
                 # Logging
                 if epoch < n_epochs_train:
@@ -763,6 +766,7 @@ class _RecurrentBase(nn.Module):
                         current_return = log_dict['online_irregular']
                         if current_return > best_online_return + 1e-4:
                             best_online_return = current_return
+                            best_log_dict = log_dict
                             stop_early_count = 0
                             self._save_best_model_state()
                         else:
@@ -773,12 +777,13 @@ class _RecurrentBase(nn.Module):
                             self._load_best_model_state()
                             break
 
-            log_dict = self._log_progress(
-                epoch="final",
-                evaluators=evaluators
-            )
+            if best_log_dict is None:
+                best_log_dict = self._log_progress(
+                    epoch="final",
+                    evaluators=evaluators
+                )
 
-        return log_dict
+        return best_log_dict
 
     @staticmethod
     def add_noise(obs):
@@ -953,15 +958,7 @@ class _RecurrentBase(nn.Module):
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
         if evaluators is not None:
             for key in evaluators.keys():
-                eval_output = evaluators[key](self, seed=self._seed)
-
-                if isinstance(eval_output, float):
-                    # WIS estimate
-                    log_rewards[key] = eval_output
-                    eval_str += f"\n     {key} = {eval_output:.2f} (WIS estimate)"
-                    continue
-
-                episodic_rewards = eval_output
+                episodic_rewards = evaluators[key](self, seed=self._seed)
 
                 episodic_rewards = np.array(episodic_rewards)
                 log_rewards[key] = episodic_rewards.mean()

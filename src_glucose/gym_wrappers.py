@@ -1,4 +1,5 @@
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
+from collections.abc import Iterable
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces, ObservationWrapper
@@ -16,7 +17,7 @@ INSULIN_ACTION_LOW = 0.0
 INSULIN_ACTION_HIGH = 0.5
 
 # Scaling parameters
-INSULIN_SCALE = 30.0
+INSULIN_SCALE = 1.0
 CHO_SCALE = 300.0
 
 # Get our adult patients
@@ -70,9 +71,16 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
 
 class T1DPatientEnv(Wrapper):
 
-    def __init__(self, use_test_ids: bool = False, **kwargs):
+    def __init__(self, test_ids: List[int], use_test_ids: bool = False, **kwargs):
         self.kwargs = kwargs
-        self._id_choices = [1, 2, 3, 4, 5, 6, 7, 8] if not use_test_ids else [9, 10]
+        if not isinstance(test_ids, Iterable):
+            test_ids = [test_ids]
+
+        # Offline ID range (1-5)
+        all_train_ids = [1, 2, 3, 4, 5]
+        self._id_choices = test_ids if use_test_ids else [t_id for t_id in all_train_ids if t_id not in test_ids]
+
+        # Pick a random patient at initialization
         id_choice = np.random.choice(self._id_choices)
         identity = f"simglucose/adult{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
@@ -109,9 +117,6 @@ class FixedScaler(ObservationWrapper):
         )
 
     def observation(self, obs):
-        # Max BG = 600, min BG = 10
-        # Max insulin = 30, min insulin = 0
-        # Max CHO = 300, min = 0
         obs[0] = (obs[0] - 10) / (600 - 10)  # BG
         obs[1] = obs[1] / INSULIN_SCALE  # insulin
         obs[2] = obs[2] / CHO_SCALE  # CHO
@@ -253,9 +258,9 @@ class EnforcePPOWrapper(Wrapper):
         return obs, reward, term, trunc, info
 
 
-def make_glucose_env(*, use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
+def make_glucose_env(*, test_ids: List[int], use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
                      forced_interval: int = 0, use_scaling: bool = False, **kwargs):
-    env = T1DPatientEnv(use_test_ids, **kwargs)
+    env = T1DPatientEnv(test_ids=test_ids, use_test_ids=use_test_ids, **kwargs)
     env = SampleTimeWrapper(env)
     if use_scaling:
         env = NormalizeReward(env, gamma=gamma)

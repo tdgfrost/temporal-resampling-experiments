@@ -285,6 +285,8 @@ class RecurrentPPO:
         self.env = env
         self.env_name = env_name
         self.env_creator_fn = env_creator_fn if env_creator_fn is not None else partial(gym.make, env_name)
+        self.n_eval_envs = 16
+        self.eval_env = AsyncVectorEnv([self.env_creator_fn for _ in range(self.n_eval_envs)])
         self.input_dim = env.observation_space.shape[-1]
         self.action_dim = env.action_space.shape[0]
         self.hidden_dim = hidden_dim
@@ -332,6 +334,10 @@ class RecurrentPPO:
         action, lstm_states = self.predict(obs, deterministic=deterministic, *args, **kwargs)
         return action, lstm_states
 
+    def get_initial_states(self, batch_size: int):
+        """Returns a zero-initialized hidden state tuple for the LSTM."""
+        return self.ac_network.init_hidden_state(batch_size)
+
     def set_random_seed(self, seed):
         """Sets the random seed for reproducibility."""
         self.seed = seed
@@ -365,7 +371,7 @@ class RecurrentPPO:
         new_agent.best_mean_reward = checkpoint.get('best_mean_reward', -np.inf)
         new_agent.mean_ep_length = checkpoint.get('mean_ep_length', 0.0)
         print(
-            f"Checkpoint loaded from {path}. Resuming at timestep {new_agent._num_timesteps} with best reward {new_agent.best_mean_reward:.2f} and mean length {new_agent.mean_ep_length:.2f}.")
+            f"Checkpoint loaded from {path}. Resuming at timestep {new_agent._num_timesteps} with best IQM reward {new_agent.best_mean_reward:.2f} and mean length {new_agent.mean_ep_length:.2f}.")
 
         return new_agent
 
@@ -380,7 +386,9 @@ class RecurrentPPO:
         """
         # obs is expected to be of shape (seq_len, features)
         # Add a batch dimension -> (1, seq_len, features)
-        obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+        obs_tensor = torch.FloatTensor(obs)
+        if obs_tensor.ndim == 2:
+            obs_tensor = obs_tensor.unsqueeze(0)
 
         with torch.no_grad():
             if deterministic:
@@ -417,28 +425,28 @@ class RecurrentPPO:
         returns = advantages + values
         return advantages, returns
 
-    def _evaluate_policy(self, n_eval_envs=4, n_eval_episodes=None):
+    def _evaluate_policy(self, n_eval_episodes=None):
         n_eval_episodes = n_eval_episodes or self.eval_episodes
-        eval_env = AsyncVectorEnv([self.env_creator_fn for _ in range(n_eval_envs)])
         all_episode_rewards = []
         all_episode_steps = []
-        episode_rewards = np.zeros(n_eval_envs)
-        episode_steps = np.zeros(n_eval_envs)
+        episode_rewards = np.zeros(self.n_eval_envs)
+        episode_steps = np.zeros(self.n_eval_envs)
 
         # Seed each parallel environment with a unique, deterministic seed
         if self.seed is not None:
-            eval_seeds = [self.seed + i for i in range(n_eval_envs)]
-            obs, _ = eval_env.reset(seed=eval_seeds)
+            eval_seeds = [self.seed ** i for i in range(self.n_eval_envs)]
+            obs, _ = self.eval_env.reset(seed=eval_seeds)
         else:
-            obs, _ = eval_env.reset()
+            obs, _ = self.eval_env.reset()
 
-        hidden_state = self.ac_network.init_hidden_state(batch_size=n_eval_envs)
+        hidden_state = self.ac_network.init_hidden_state(batch_size=self.n_eval_envs)
 
         while len(all_episode_rewards) < n_eval_episodes:
             obs_tensor = torch.FloatTensor(obs).unsqueeze(1)
             with torch.no_grad():
-                action_env, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=True)
-            obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
+                dist, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
+                action_env = dist.last_sampled_action
+            obs, reward, term, trunc, _ = self.eval_env.step(action_env.numpy())
             dones = term | trunc
             episode_rewards += reward
             episode_steps += 1
@@ -450,9 +458,18 @@ class RecurrentPPO:
                     episode_steps[i] = 0
                     hidden_state[0][:, i, :] = 0
                     hidden_state[1][:, i, :] = 0
-        eval_env.close()
-        return (np.mean(all_episode_rewards[:n_eval_episodes]),
-                {'ep_length': np.mean(all_episode_steps[:n_eval_episodes])})
+
+        # Calculate the IQM return
+        ep_reward_array = np.array(all_episode_rewards[:n_eval_episodes])
+        steps_array = np.array(all_episode_steps[:n_eval_episodes])
+
+        q1_r, q3_r = np.percentile(ep_reward_array, [25, 75])
+        iqr_mask = (ep_reward_array >= q1_r) & (ep_reward_array <= q3_r)
+
+        IQM_return = ep_reward_array[iqr_mask].mean()
+        IQM_steps = steps_array[iqr_mask].mean()
+
+        return IQM_return, {'ep_length': IQM_steps}
 
     def fit(self, total_timesteps):
         if self.seed is not None:
@@ -592,7 +609,7 @@ class RecurrentPPO:
             if self._num_timesteps >= next_eval:
                 avg_eval_reward, info = self._evaluate_policy()
                 print(f"--- EVALUATION at Timestep: {self._num_timesteps}/{target_timesteps} ---")
-                print(f"Average reward: {avg_eval_reward:.2f} | Best reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
+                print(f"Average reward: {avg_eval_reward:.2f} | Best IQM reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
 
                 if avg_eval_reward > self.best_mean_reward:
                     self.best_mean_reward = avg_eval_reward
@@ -601,10 +618,12 @@ class RecurrentPPO:
                         save_path = os.path.join(self.log_dir,
                                                  f"best_model{model_save_num:02d}_{avg_eval_reward:.2f}.pth")
                         self.save_checkpoint(save_path)
-                        print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} and episode length {self.mean_ep_length:.2f} ***\n")
+                        print(f"*** New best model found and saved with reward: {self.best_mean_reward:.2f} "
+                              f"and episode length {self.mean_ep_length:.2f} ***\n")
                         model_save_num += 1
 
                 next_eval += self.eval_freq
 
         self.env.close()
+        self.eval_env.close()
 
