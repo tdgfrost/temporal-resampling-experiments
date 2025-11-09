@@ -8,6 +8,7 @@ from tqdm import tqdm
 from gym_wrappers import *
 from models import *
 from utils import *
+from ppo_trainer import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
@@ -17,7 +18,7 @@ parser.add_argument('--train_offline', default=False, type=parse_bool, help='Tra
 
 parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo'],
                     help='Type of offline RL model to train (iql or cql)')
-parser.add_argument('--target_ppo_agent', default="best_model09_8144.51.pth", type=str,
+parser.add_argument('--target_ppo_agent', default="best_model20_5217.99.pth", type=str,
                     help='Path to target PPO agent for dataset generation')
 
 parser.add_argument('--expectile', default=0.9, type=float, help='Expectile value for IQL training (0.5 is BC)')
@@ -26,7 +27,6 @@ parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interva
 
 GAMMA = 0.99
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-MASTER_SEED = 123
 
 torch.set_float32_matmul_precision('high')
 
@@ -57,10 +57,10 @@ if __name__ == "__main__":
 
         base_env = make_glucose_env(use_scaling=True, test_ids=train_ids, use_test_ids=True)
         env = EnforcePPOWrapper(base_env, gamma=GAMMA)
-        env_creator_fn = partial(make_glucose_env, test_ids=test_ids, use_test_ids=True)
 
         # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
-        agent = RecurrentPPO(env, env_creator_fn=env_creator_fn, gamma=GAMMA,
+        agent = RecurrentPPO(env, env_creator_fn=make_glucose_env, gamma=GAMMA,
+                             test_ids=test_ids,
                              n_steps=1024,  # More data per update
                              entropy_coef=0.01,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
@@ -68,7 +68,7 @@ if __name__ == "__main__":
                              gae_lambda=0.95,
                              n_epochs=5,  # Fewer epochs
                              hidden_dim=128,
-                             seed=123,
+                             seed=MASTER_SEED,
                              learning_rate=3e-4,  # Standard learning rate
                              eval_freq=50_000,
                              eval_episodes=500)
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     if train_offline:
         EXPECTILE = args.expectile
         DECOY_INTERVAL = args.decoy_interval
-        algo = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
+        algo_name = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
 
         if is_iql:
             print(f"\n=====\nDECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {args.beta}\n=====\n")
@@ -114,7 +114,7 @@ if __name__ == "__main__":
         logs = defaultdict(list)
         all_scores = defaultdict(list)
 
-        logs['algo'].append(algo)
+        logs['algo'].append(algo_name)
         if not is_ppo:
             logs['decoy_interval'].append(DECOY_INTERVAL)
 
@@ -122,7 +122,7 @@ if __name__ == "__main__":
         for test_id in [6, 7, 8, 9, 10]:
             # Create our random seeds
             rng = np.random.default_rng(MASTER_SEED ** test_id)
-            n_runs = 30
+            n_runs = 20
             experiment_seeds = rng.integers(low=0, high=2**32 - 1, size=n_runs)
 
             # Establish our test id setup
@@ -140,8 +140,8 @@ if __name__ == "__main__":
                 evaluators[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env_custom,
                                                                        forced_interval=interval,
                                                                        use_test_ids=True),
-                                                               n_eval_envs=100,
-                                                               n_eval_episodes=200,
+                                                               n_eval_envs=20,
+                                                               n_eval_episodes=100,
                                                                gamma=GAMMA,
                                                                verbose=False)
 
@@ -149,8 +149,8 @@ if __name__ == "__main__":
                 evaluators["online_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env_custom,
                                                                                                  forced_interval=0,
                                                                                                  use_test_ids=True),
-                                                                                         n_eval_envs=100,
-                                                                                         n_eval_episodes=200,
+                                                                                         n_eval_envs=20,
+                                                                                         n_eval_episodes=100,
                                                                                          gamma=GAMMA,
                                                                                          verbose=False)
 
@@ -209,7 +209,7 @@ if __name__ == "__main__":
                 raise ValueError("Invalid decoy interval.")
 
             # Log meta data
-            model_save_path = f"../logs_glucose/iql_models/test_id_{test_id}/{algo}"
+            model_save_path = f"../logs_glucose/iql_models/test_id_{test_id}/{algo_name}"
 
             print(f'\n=== Training offline for test_id {test_id} ===\n')
             for seed in experiment_seeds:

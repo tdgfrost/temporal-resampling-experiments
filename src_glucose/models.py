@@ -743,7 +743,7 @@ class _RecurrentBase(nn.Module):
                     self.sync_target_networks()
 
                     pbar.update(1)
-                    if len(loss_dict['policy_loss'] > 1):
+                    if len(loss_dict['policy_loss']) > 1:
                         pbar_dict = {'epoch': epoch_str,
                                      'policy_loss': f"{np.mean(loss_dict['policy_loss']):.5f}",
                                      'refresh': False}

@@ -20,6 +20,9 @@ INSULIN_ACTION_HIGH = 0.5
 INSULIN_SCALE = 1.0
 CHO_SCALE = 300.0
 
+# Seed
+MASTER_SEED = 123
+
 # Get our adult patients
 for i in range(1, 11):
     register(

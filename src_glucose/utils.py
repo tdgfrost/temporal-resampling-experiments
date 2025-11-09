@@ -11,10 +11,8 @@ import os
 import shutil
 from scipy.stats import trimboth
 
-from simglucose.simulation.env import bg_in_range_magni, early_termination_reward
-from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, SAMPLE_TIME
+from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, MASTER_SEED
 from gymnasium.vector import AsyncVectorEnv
-from ppo_trainer import RecurrentPPO
 
 
 class RecurrentReplayBufferEnv:
@@ -362,7 +360,7 @@ class RecurrentReplayBufferEnv:
                         obs, info = self.env.reset(seed=seed + frame_count)
 
                     pbar.update(1)
-                    if frame_count >= 100:
+                    if len(total_rewards) >= 1:
                         pbar_dict = {'avg_episode_reward': f"{np.mean(total_rewards):.2f}",
                                      'avg_episode_IQM_reward': f"{trimboth(np.array(total_rewards), proportiontocut=0.25).mean():.2f}",
                                      'avg_episode_length': f"{np.mean(total_lengths):.2f}",
@@ -476,23 +474,6 @@ class RecurrentReplayBufferEnv:
         dones = [np.any(chunk) for chunk in done_splits if chunk.size > 0]
         rewards = [np.mean(chunk) for chunk in reward_splits if chunk.size > 0]
 
-        """
-        # Calculate early terminations for the additional reward component
-        terms = [
-            np.any(ep_buffer['all_term'][idx: idx + agg_window])
-            for idx in range(agg_window, len(ep_buffer['all_term']), agg_window)
-        ]
-
-        # Manually calculate reward
-        bg_levels = np.array([
-            np.mean(ep_buffer['all_obs'][idx: idx + agg_window], 0)[-3]
-            for idx in range(agg_window, len(ep_buffer['all_obs']), agg_window)
-        ]) * (600 - 10) + 10  # Scale back to real bg levels
-
-        rewards = [bg_in_range_magni([i]) * SAMPLE_TIME for i in bg_levels]
-        rewards[-1] += early_termination_reward(terms[-1])
-        """
-
         if not dones or not dones[-1]:
             # Skip this episode - too short
             return
@@ -555,7 +536,8 @@ class ParallelEnvironmentEvaluator:
         # --- 2. Reset Envs ---
         if seed is not None:
             # Seed each parallel environment deterministically
-            eval_seeds = [int(seed + i) for i in range(self.n_eval_envs)]
+            rng = np.random.default_rng(MASTER_SEED)
+            eval_seeds = rng.integers(low=0, high=2 ** 32 - 1, size=self.n_eval_envs).tolist()
             obs, info = self.eval_env.reset(seed=eval_seeds)
         else:
             obs, info = self.eval_env.reset()

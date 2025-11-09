@@ -9,7 +9,7 @@ from gymnasium.vector import AsyncVectorEnv
 from torch.distributions import Beta
 from functools import partial
 import random
-from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
+from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, MASTER_SEED
 
 
 def set_seed(seed: int):
@@ -277,7 +277,7 @@ class EncoderActorCriticLSTM(nn.Module):
 
 class RecurrentPPO:
     def __init__(self, env, env_name=None, hidden_dim=128, learning_rate=3e-4, gamma=0.99, gae_lambda=0.95,
-                 entropy_coef=0.01, vf_coef=0.5, clip_range=0.2, seed=None,
+                 entropy_coef=0.01, vf_coef=0.5, clip_range=0.2, seed=None, test_ids=None,
                  batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000, eval_episodes=500,
                  log_dir="../logs_glucose/ppo_logs", env_creator_fn=None):
         assert isinstance(env.action_space, gym.spaces.Box), "Continuous action spaces only."
@@ -285,8 +285,15 @@ class RecurrentPPO:
         self.env = env
         self.env_name = env_name
         self.env_creator_fn = env_creator_fn if env_creator_fn is not None else partial(gym.make, env_name)
-        self.n_eval_envs = 16
-        self.eval_env = AsyncVectorEnv([self.env_creator_fn for _ in range(self.n_eval_envs)])
+        self.n_eval_envs = 20
+        if test_ids is not None:
+            assert self.n_eval_envs % len(test_ids) == 0, "n_eval_envs must be a multiple of the number of test_ids."
+            self.eval_env = AsyncVectorEnv([partial(self.env_creator_fn,
+                                                    test_ids=test_ids[i * len(test_ids) // self.n_eval_envs],
+                                                    use_test_ids=True)
+                                            for i in range(self.n_eval_envs)])
+        else:
+            self.eval_env = None
         self.input_dim = env.observation_space.shape[-1]
         self.action_dim = env.action_space.shape[0]
         self.hidden_dim = hidden_dim
@@ -425,7 +432,12 @@ class RecurrentPPO:
         returns = advantages + values
         return advantages, returns
 
-    def _evaluate_policy(self, n_eval_episodes=None):
+    def _evaluate_policy(self, n_eval_episodes=None, env_creator_fn=None):
+        if self.eval_env is None:
+            if env_creator_fn is None:
+                print('No test IDs set or env_creator_fn provided; using default env_creator_fn...')
+                env_creator_fn = self.env_creator_fn
+            self.eval_env = AsyncVectorEnv([env_creator_fn for _ in range(self.n_eval_envs)])
         n_eval_episodes = n_eval_episodes or self.eval_episodes
         all_episode_rewards = []
         all_episode_steps = []
@@ -434,7 +446,8 @@ class RecurrentPPO:
 
         # Seed each parallel environment with a unique, deterministic seed
         if self.seed is not None:
-            eval_seeds = [self.seed ** i for i in range(self.n_eval_envs)]
+            rng = np.random.default_rng(MASTER_SEED)
+            eval_seeds = rng.integers(low=0, high=2 ** 32 - 1, size=self.n_eval_envs).tolist()
             obs, _ = self.eval_env.reset(seed=eval_seeds)
         else:
             obs, _ = self.eval_env.reset()
