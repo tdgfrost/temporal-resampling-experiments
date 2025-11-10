@@ -934,8 +934,11 @@ class _RecurrentBase(nn.Module):
         new_tensors = []
         for arr in arrays:
             if not isinstance(arr, torch.Tensor):
-                arr = torch.tensor(arr, dtype=torch.float32)
-            new_tensors.append(arr.to(self._device))
+                try:
+                    arr = torch.from_numpy(arr)
+                except:
+                    arr = torch.tensor(arr)
+            new_tensors.append(arr.to(self._device).to(torch.float32))
         return new_tensors
 
     def get_initial_states(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
