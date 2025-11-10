@@ -127,6 +127,9 @@ class RecurrentReplayBufferEnv:
                 for seq_start in range(last_ep_start_idx, last_possible_start + 1):
                     self.sequence_info[self.decoy_interval].append((seq_start, self.max_sequence_length, ep_start_idx))
 
+        # Set sequence info to numpy
+        self.sequence_info[self.decoy_interval] = np.array(self.sequence_info[self.decoy_interval])
+
         # n_samples is now the number of sequences in the buffer
         self.n_samples = len(self.sequence_info[self.decoy_interval])
         if self.n_samples == 0:
@@ -146,7 +149,8 @@ class RecurrentReplayBufferEnv:
             print(f"Warning: Not enough episodes for sampling. "
                   f"Found {self.n_samples} episodes but batch size is {self.batch_size}.")
 
-        self.set_to_tensors(device)
+        # Record the device for later
+        self._device = device
 
     def generate(self):
         """
@@ -161,18 +165,14 @@ class RecurrentReplayBufferEnv:
             replace=False
         )
 
-        idxs_tensor = torch.tensor(episode_indices, dtype=torch.long, device=self._device)
-
-        for batch_of_episode_indices in idxs_tensor:
+        for batch_of_episode_indices in episode_indices:
             yield self.fetch_transition_batch(idxs=batch_of_episode_indices, decoy_interval=self.decoy_interval)
 
-    def fetch_transition_batch(self, idxs: torch.Tensor, decoy_interval: int = 0):
+    def fetch_transition_batch(self, idxs: np.ndarray, decoy_interval: int = 0):
         """
         Fetches data for a batch of sequences, pads them to max_sequence_length,
         and returns the padded tensors along with a mask.
         """
-        assert self._tensors_set, "Replay buffer must be set to tensors first."
-
         batch_size = len(idxs)
         # NEW: Total length is burn-in + max sequence length
         max_train_len = self.max_sequence_length
@@ -182,12 +182,12 @@ class RecurrentReplayBufferEnv:
         obs_shape = self.observations[decoy_interval][0].shape
 
         # Create buffers with the new max_fetch_len
-        obs_batch = torch.zeros((batch_size, max_fetch_len, *obs_shape), dtype=torch.float32, device=self._device)
-        next_obs_batch = torch.zeros_like(obs_batch)
-        action_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.float32, device=self._device)
-        reward_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.float32, device=self._device)
-        done_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.bool, device=self._device)
-        visible_batch = torch.zeros((batch_size, max_fetch_len, 1), dtype=torch.bool, device=self._device)
+        obs_batch_np = np.empty((batch_size, max_fetch_len, *obs_shape), dtype=np.float32)
+        next_obs_batch_np = np.empty_like(obs_batch_np)
+        action_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.float32)
+        reward_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.float32)
+        done_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.bool)
+        visible_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.bool)
 
         # 1. Get info from the sampled indices
         seq_info_batch = self.sequence_info[decoy_interval][idxs]
@@ -197,53 +197,57 @@ class RecurrentReplayBufferEnv:
 
         # 2. Calculate burn-in and fetch indices
         # Find the real start of data to fetch (clipping at episode start)
-        fetch_starts = torch.max(ep_starts, train_starts - burn_in_len)
+        fetch_starts = np.maximum(ep_starts, train_starts - burn_in_len)
         # Calculate how many burn-in steps we *actually* got
-        actual_burn_in_lens = (train_starts - fetch_starts).long()
+        actual_burn_in_lens = train_starts - fetch_starts
         # Calculate total length of data to fetch
         total_fetch_lens = actual_burn_in_lens + actual_train_lens
 
         # 3. Create index grids. We will right-align all sequences.
-        base_indices = torch.arange(max_fetch_len, device=self._device).unsqueeze(0)
+        base_indices = np.expand_dims(np.arange(max_fetch_len), 0)
         # Mask for all valid data (burn-in + train)
         # Data is valid from index 0 up to total_fetch_lens
-        padding_mask = base_indices < total_fetch_lens.unsqueeze(1)
+        padding_mask_np = base_indices < np.expand_dims(total_fetch_lens, 1)
 
         # 4. Create index grids for fetching all data in one go
         # This calculates the buffer index for each position in the output tensor
-        indices = (fetch_starts.unsqueeze(1) + base_indices)
-        next_indices = indices + 1
+        indices_np = np.expand_dims(fetch_starts, 1) + base_indices
+        next_indices_np = indices_np + 1
 
         # 5. Fetch all data using the masks and indices
-        obs_batch[padding_mask] = self.observations[decoy_interval][indices[padding_mask]]
-        action_batch[padding_mask] = self.actions[decoy_interval][indices[padding_mask]].unsqueeze(-1)
-        reward_batch[padding_mask] = self.rewards[decoy_interval][indices[padding_mask]].unsqueeze(-1)
-        done_batch[padding_mask] = self.dones[decoy_interval][indices[padding_mask]].unsqueeze(-1)
-        visible_batch[padding_mask] = self.visible_states[decoy_interval][indices[padding_mask]].unsqueeze(-1)
-
-        # 6. --- CORRECTED NEXT_OBS LOGIC ---
-        next_obs_batch[padding_mask] = self.observations[decoy_interval][next_indices[padding_mask]]
+        obs_batch_np[padding_mask_np] = self.observations[decoy_interval][indices_np[padding_mask_np]]
+        action_batch_np[padding_mask_np] = np.expand_dims(self.actions[decoy_interval][indices_np[padding_mask_np]], -1)
+        reward_batch_np[padding_mask_np] = np.expand_dims(self.rewards[decoy_interval][indices_np[padding_mask_np]], -1)
+        done_batch_np[padding_mask_np] = np.expand_dims(self.dones[decoy_interval][indices_np[padding_mask_np]], -1)
+        visible_batch_np[padding_mask_np] = np.expand_dims(self.visible_states[decoy_interval][indices_np[padding_mask_np]], -1)
+        next_obs_batch_np[padding_mask_np] = self.observations[decoy_interval][next_indices_np[padding_mask_np]]
 
         # 7. Create the TRAINING mask (excludes padding AND burn-in)
         # Training data starts *after* the actual burn-in
-        train_mask_start_idx = actual_burn_in_lens.unsqueeze(1)
+        train_mask_start_idx = np.expand_dims(actual_burn_in_lens, -1)
         # Mask is True from the start index up to the end of valid data (handled by padding_mask)
-        train_mask_bool = (base_indices >= train_mask_start_idx) & padding_mask
+        train_mask_bool = (base_indices >= train_mask_start_idx) & padding_mask_np
 
         # Add dimension to masks to match data [B, S, 1]
-        padding_mask = padding_mask.unsqueeze(-1)
-        train_mask = train_mask_bool.unsqueeze(-1)
+        padding_mask_np = np.expand_dims(padding_mask_np, -1)
+        train_mask_np = np.expand_dims(train_mask_bool, -1)
 
         # Get the next_padding_mask for next_obs
-        next_padding_mask = torch.roll(padding_mask, shifts=-1, dims=1)
-        next_padding_mask[:, -1, :] = False  # Last step does not have a next step
+        next_padding_mask_np = np.roll(padding_mask_np, shift=-1, axis=1)
+        next_padding_mask_np[:, -1, :] = False  # Last step does not have a next step
 
         # This can be derived from the visible_batch after fetching
-        next_visible_batch = torch.roll(visible_batch, shifts=-1, dims=1)
-        next_visible_batch[:, -1] = False  # Last step does not have a next step
+        next_visible_batch_np = np.roll(visible_batch_np, shift=-1, axis=1)
+        next_visible_batch_np[:, -1] = False  # Last step does not have a next step
 
-        return (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch,
-                visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask)
+        # Set tensors to correct device
+        all_arrs = (obs_batch_np, action_batch_np, reward_batch_np, next_obs_batch_np, done_batch_np,
+                       visible_batch_np, next_visible_batch_np, padding_mask_np, next_padding_mask_np, train_mask_np)
+        all_tensors_set = []
+        for some_arr in all_arrs:
+            all_tensors_set.append(torch.from_numpy(some_arr).to(self._device, non_blocking=True))
+
+        return tuple(all_tensors_set)
 
     def save(self, path: str):
         if os.path.exists(path):
@@ -284,7 +288,7 @@ class RecurrentReplayBufferEnv:
         ]:
             loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
             for k in loaded.files:
-                value[int(k)] = deque(loaded[k], maxlen=self.buffer_size)
+                value[int(k)] = loaded[k]
 
         # Load dataset IQR return and scaling
         loaded_scale = np.load(os.path.join(path, 'rewards_scale.npz'), allow_pickle=True)
@@ -395,10 +399,10 @@ class RecurrentReplayBufferEnv:
                 self.reward_mean[i] = r_mean
                 self.reward_std[i] = r_std
 
-    def set_to_tensors(self, device: str = 'cpu', i: int = None):
+    def set_to_tensors(self, device: str = 'cpu', i: int = None, *args):
         def _set_device(some_arr):
             if isinstance(some_arr, torch.Tensor):
-                return some_arr.to(device)
+                return some_arr.to(device, non_blocking=True)
             return torch.from_numpy(np.array(some_arr)).to(device)
 
         i = self.decoy_interval if i is None else i

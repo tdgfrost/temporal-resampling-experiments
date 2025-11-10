@@ -1,20 +1,86 @@
+import queue
+import threading
 from collections import deque
-from typing import Tuple, Dict, Optional, List
+from copy import deepcopy
+from typing import Tuple, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Beta, Normal
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
-from tqdm import tqdm
 from scipy.stats import trimboth
-from copy import deepcopy
+from torch.distributions import Beta, Normal
+from tqdm import tqdm
 
-from ppo_trainer import set_seed
 from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
+from ppo_trainer import set_seed
 
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
+
+
+class DataPrefetcher:
+    """A simple prefetcher for custom dataset iterators."""
+
+    def __init__(self, dataset, prefetch_count: int = 2):
+        self.dataset_iter = iter(dataset)
+        self.prefetch_count = prefetch_count
+        # The queue will store batches that are *already on the GPU*.
+        self.queue = queue.Queue(maxsize=self.prefetch_count)
+
+        # Start the background thread
+        self.thread = threading.Thread(target=self._preload, daemon=True)
+        self.stopped = False
+        self.thread.start()
+
+    def _preload(self):
+        """Runs in the background thread."""
+        try:
+            while not self.stopped:
+                # 1. Get batch from the original dataset (CPU NumPy arrays)
+                #    This is where fetch_transition_batch() is called
+                batch = next(self.dataset_iter)
+
+                # 2. Put the batch into the queue.
+                #    The main thread will pull from this.
+                self.queue.put(batch)
+
+        except StopIteration:
+            self.queue.put(None)  # Send a "done" signal
+        except Exception as e:
+            print(f"Data prefetcher error: {e}")
+            self.queue.put(e)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Called by the main training loop `for batch in ...`."""
+        if self.stopped:
+            raise StopIteration
+
+        # Get the next batch from the queue (blocks if empty)
+        batch = self.queue.get()
+
+        if batch is None:
+            # Reached the end of the dataset
+            self.stop()
+            raise StopIteration
+        if isinstance(batch, Exception):
+            # An error occurred in the background thread
+            self.stop()
+            raise batch
+
+        return batch
+
+    def stop(self):
+        """Signal the thread to stop."""
+        self.stopped = True
+        # Clear the queue to unblock the thread if it's waiting
+        try:
+            while True:
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
 
 
 class FeatureEncoder(nn.Module):
@@ -121,7 +187,7 @@ class CustomBetaDistribution(nn.Module):
         # self.beta = torch.clamp(self.beta, 1.0, self.clamp_max)
 
         # Create the underlying Beta distribution
-        self.distribution = Beta(self.alpha, self.beta)
+        self.distribution = Beta(self.alpha, self.beta, validate_args=False)
         return self
 
     def entropy(self) -> torch.Tensor:
@@ -207,7 +273,7 @@ class CustomBetaDistribution(nn.Module):
 
     def variance(self):
         mu = self.mu.detach()
-        variance = (mu * (1-mu)) / (self.kappa + 1)
+        variance = (mu * (1 - mu)) / (self.kappa + 1)
         return variance
 
 
@@ -266,7 +332,7 @@ class SquashedGaussianDistribution(nn.Module):
         self.std = log_std.exp()
 
         # Create the underlying Normal (Gaussian) distribution
-        self.distribution = Normal(self.mu, self.std)
+        self.distribution = Normal(self.mu, self.std, validate_args=False)
         return self
 
     def entropy(self) -> torch.Tensor:
@@ -597,7 +663,8 @@ class _RecurrentBase(nn.Module):
         self._hidden_dim = hidden_dim
         self._recurrent_hidden_size = self._hidden_dim if recurrent_hidden_size is None else recurrent_hidden_size
         self._batch_size = batch_size
-        self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
+        self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(
+            self._device)
         # self.dist = SquashedGaussianDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
         self._eps = 1e-5
         self._tanh_scale = 1.0
@@ -644,8 +711,9 @@ class _RecurrentBase(nn.Module):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
         dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
-                                            decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
-                                            batch_size=self._batch_size, **dataset_kwargs)
+                                    decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
+                                    batch_size=self._batch_size, **dataset_kwargs)
+        dataloader = DataPrefetcher(dataset, prefetch_count=5)
 
         loss_dict = self._reset_loss_dict()
         stop_early_count = 0
@@ -658,7 +726,7 @@ class _RecurrentBase(nn.Module):
             for epoch in range(1, n_epochs_train + 1):
                 epoch_str = f"{epoch}/{n_epochs_train}"
 
-                for batch in dataset:
+                for batch in dataloader:
                     # Update the networks
                     if not self._cloning_only:
                         loss_dict['critic_loss'].append(self.update_critic(*batch))
@@ -677,7 +745,8 @@ class _RecurrentBase(nn.Module):
                                      'policy_loss': f"{torch.stack(list(loss_dict['policy_loss'])).mean().item():.5f}",
                                      'refresh': False}
                         if not self._cloning_only:
-                            pbar_dict['critic_loss'] = f"{torch.stack(list(loss_dict['critic_loss'])).mean().item():.5f}"
+                            pbar_dict[
+                                'critic_loss'] = f"{torch.stack(list(loss_dict['critic_loss'])).mean().item():.5f}"
                             pbar_dict['value_loss'] = f"{torch.stack(list(loss_dict['value_loss'])).mean().item():.5f}"
 
                         pbar.set_postfix(**pbar_dict)
@@ -749,7 +818,8 @@ class _RecurrentBase(nn.Module):
         pass
 
     def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                deterministic: bool = False, with_dist: bool = False) -> Tuple[Optional[CustomBetaDistribution], np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
+                deterministic: bool = False, with_dist: bool = False) -> Tuple[
+        Optional[CustomBetaDistribution], np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Predicts an action for a single observation and manages the recurrent state.
         Returns the action and the next hidden state.
@@ -1054,7 +1124,7 @@ class RecurrentIQL(_RecurrentBase):
 
         return critic_loss
 
-    #@torch.compile(mode='default')  # reduce-overhead leads to NaNs here
+    @torch.compile(mode='default')  # reduce-overhead leads to NaNs here
     def _update_critic_compiled(self, obs, acts, next_obs, train_mask):
         # We only need the network output, not the final hidden state for training
         lstm_out_q, hidden_state = self.shared_critic_encoder(obs, train_mask=train_mask)
@@ -1109,7 +1179,7 @@ class RecurrentIQL(_RecurrentBase):
 
         return value_loss
 
-    #@torch.compile(mode='reduce-overhead')
+    @torch.compile(mode='reduce-overhead')
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask):
         # Add some noise
@@ -1148,7 +1218,7 @@ class RecurrentIQL(_RecurrentBase):
 
         return policy_loss
 
-    #@torch.compile(mode='default')
+    @torch.compile(mode='default')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask, diff):
         # Add some noise
@@ -1269,7 +1339,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         )
         return critic_loss
 
-    #@torch.compile(mode='default')
+    @torch.compile(mode='default')
     def _update_critic_inference_compiled(self, obs, acts, next_obs, visible, train_mask):
         # -- Inference for Bellman loss -- #
         lstm_out_q, _ = self.shared_critic_encoder(obs, train_mask=train_mask)
@@ -1428,7 +1498,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         )
         return policy_loss
 
-    #@torch.compile(mode='reduce-overhead')
+    @torch.compile(mode='reduce-overhead')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                       train_mask):
         # Add some noise

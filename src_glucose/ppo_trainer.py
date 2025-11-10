@@ -128,7 +128,7 @@ class CustomBetaDistribution(nn.Module):
         self.beta = F.softplus(beta) + 1.0
 
         # Create the underlying Beta distribution
-        self.distribution = Beta(self.alpha, self.beta)
+        self.distribution = Beta(self.alpha, self.beta, validate_args=False)
         return self
 
     def entropy(self) -> torch.Tensor:
