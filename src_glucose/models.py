@@ -726,7 +726,7 @@ class _RecurrentBase(nn.Module):
             for epoch in range(1, n_epochs_train + 1):
                 epoch_str = f"{epoch}/{n_epochs_train}"
 
-                for batch in dataloader:
+                for batch_num, batch in enumerate(dataloader):
                     # Update the networks
                     if not self._cloning_only:
                         loss_dict['critic_loss'].append(self.update_critic(*batch))
@@ -740,7 +740,7 @@ class _RecurrentBase(nn.Module):
                     self.sync_target_networks()
 
                     pbar.update(1)
-                    if len(loss_dict['policy_loss']) > 1:
+                    if (batch_num + 1) % 50 == 0:
                         pbar_dict = {'epoch': epoch_str,
                                      'policy_loss': f"{torch.stack(list(loss_dict['policy_loss'])).mean().item():.5f}",
                                      'refresh': False}

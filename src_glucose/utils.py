@@ -299,18 +299,18 @@ class RecurrentReplayBufferEnv:
             self.reward_mean[i] = float(loaded_scale[f'reward_mean_{i}'])
             self.reward_std[i] = float(loaded_scale[f'reward_std_{i}'])
 
-        # Tweak to shorten to 1M steps if needed
-        """
+        # Tweak to shorten from 1M to 500k steps (if needed)
         print(f"Trimming 1M to ~500k steps for dataset...")
         for i in range(3):
-            n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 2
+            done_indices = np.where(self.dones[i])[0]
+            n_episodes = done_indices.shape[0] // 2
             start_idx = 0
-            end_idx = np.where(np.array(self.dones[i]))[0][n_episodes] + 1
-            self.observations[i] = deque(list(self.observations[i])[start_idx:end_idx + 1], maxlen=self.buffer_size)
+            end_idx = done_indices[n_episodes] + 1
+            self.observations[i] = self.observations[i][start_idx:end_idx + 1]
             for arr in [self.actions, self.rewards, self.dones,
                         self.sample_bool, self.visible_states]:
-                arr[i] = deque(list(arr[i])[start_idx:end_idx], maxlen=self.buffer_size)
-        """
+                arr[i] = arr[i][start_idx:end_idx]
+
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
         ep_buffer = self._reset_ep_buffer(obs)
