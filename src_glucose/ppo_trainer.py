@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence, PackedSequence
 import gymnasium as gym
 import numpy as np
 import os
@@ -200,6 +201,7 @@ class EncoderActorCriticLSTM(nn.Module):
         self.encoder = encoder
 
         # The LSTM now takes the output of the encoder as its input
+        # - num layers in LSTM MUST be left as 1.
         self.lstm = nn.LSTM(encoder_output_dim, hidden_dim, batch_first=True)
         self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
         self.critic_head = nn.Linear(hidden_dim, 1)
@@ -211,14 +213,15 @@ class EncoderActorCriticLSTM(nn.Module):
         )
 
     def forward_lstm(self, x, hidden_state=None):
-        is_packed = isinstance(x, torch.nn.utils.rnn.PackedSequence)
+        # Need to use packed sequence for PPO because c_n must be accurate (as it gets re-used with each new step)
+        # - doesn't apply for offline learning because we never need to re-use hidden states.
+        is_packed = isinstance(x, PackedSequence)
 
         if is_packed:
             # If the input is a packed sequence, apply the encoder to the data part
             encoded_data = self.encoder(x.data)
             # Create a new packed sequence with the encoded data
-            lstm_input = torch.nn.utils.rnn.PackedSequence(encoded_data, x.batch_sizes, x.sorted_indices,
-                                                           x.unsorted_indices)
+            lstm_input = PackedSequence(encoded_data, x.batch_sizes, x.sorted_indices, x.unsorted_indices)
         else:
             # Handle non-packed sequences (e.g., during prediction/evaluation)
             batch_size, seq_len, feature_dim = x.shape
@@ -237,7 +240,7 @@ class EncoderActorCriticLSTM(nn.Module):
         lstm_out, new_hidden, is_packed = self.forward_lstm(x, hidden_state)
 
         if is_packed:
-            lstm_out, lengths = torch.nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+            lstm_out, lengths = pad_packed_sequence(lstm_out, batch_first=True)
             batch_size = lstm_out.size(0)
             last_step_indices = lengths.long() - 1
             last_outputs = lstm_out[torch.arange(batch_size), last_step_indices, :]
@@ -276,35 +279,39 @@ class EncoderActorCriticLSTM(nn.Module):
 
 
 class RecurrentPPO:
-    def __init__(self, env, env_name=None, hidden_dim=128, learning_rate=3e-4, gamma=0.99, gae_lambda=0.95,
-                 entropy_coef=0.01, vf_coef=0.5, clip_range=0.2, seed=None, test_ids=None,
-                 batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000, eval_episodes=500,
-                 log_dir="../logs_glucose/ppo_logs", env_creator_fn=None):
-        assert isinstance(env.action_space, gym.spaces.Box), "Continuous action spaces only."
-
-        self.env = env
-        self.env_name = env_name
-        self.env_creator_fn = env_creator_fn if env_creator_fn is not None else partial(gym.make, env_name)
-        self.n_eval_envs = 20
-        if test_ids is not None:
-            assert self.n_eval_envs % len(test_ids) == 0, "n_eval_envs must be a multiple of the number of test_ids."
-            self.eval_env = AsyncVectorEnv([partial(self.env_creator_fn,
-                                                    test_ids=test_ids[i * len(test_ids) // self.n_eval_envs],
-                                                    use_test_ids=True)
-                                            for i in range(self.n_eval_envs)])
-        else:
-            self.eval_env = None
-        self.input_dim = env.observation_space.shape[-1]
-        self.action_dim = env.action_space.shape[0]
-        self.hidden_dim = hidden_dim
-
+    def __init__(self, train_env, env_creator_fn, test_ids, hidden_dim=128, learning_rate=3e-4, gamma=0.99,
+                 eval_envs_per_id: int = 1, gae_lambda=0.95, entropy_coef=0.01, vf_coef=0.5,
+                 clip_range=0.2, seed=None, batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000,
+                 eval_episodes=500, log_dir="../logs_glucose/ppo_logs"):
+        # Set the seed
         self.seed = seed
         if seed is not None:
             self.set_random_seed(seed)
 
-        self.action_scale = torch.FloatTensor((env.action_space.high - env.action_space.low) / 2.)
-        self.action_bias = torch.FloatTensor((env.action_space.high + env.action_space.low) / 2.)
+        # Save the patient IDs and env_creator functions
+        self.test_ids = test_ids
 
+        self.eval_envs_per_id = eval_envs_per_id
+        self.n_eval_envs = len(self.test_ids) * eval_envs_per_id
+
+        self.eval_env_creator_fn = partial(env_creator_fn, gamma=gamma)
+
+        # Save our env parameters
+        assert isinstance(train_env.action_space, gym.spaces.Box), "Continuous action spaces only."
+
+        self.train_env = train_env
+        self.input_dim = train_env.observation_space.shape[-1]
+        self.action_dim = train_env.action_space.shape[0]
+        self.action_scale = torch.FloatTensor((train_env.action_space.high - train_env.action_space.low) / 2.)
+        self.action_bias = torch.FloatTensor((train_env.action_space.high + train_env.action_space.low) / 2.)
+        self.hidden_dim = hidden_dim
+
+        # Create our vectorised evaluation environments
+        self.eval_env, self.eval_env_id_map = self._build_parallel_env(self.eval_env_creator_fn,
+                                                                       self.test_ids,
+                                                                       self.eval_envs_per_id)
+
+        # Save the rest of our training parameters
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -317,7 +324,7 @@ class RecurrentPPO:
         self.eval_freq = eval_freq
         self.eval_episodes = eval_episodes
         self.log_dir = log_dir
-        self.last_obs = None
+        self.last_obs_tensor = None
         self.last_hidden_state = None
 
         self._num_timesteps = 0
@@ -340,6 +347,21 @@ class RecurrentPPO:
     def __call__(self, obs, deterministic=True, *args, **kwargs):
         action, lstm_states = self.predict(obs, deterministic=deterministic, *args, **kwargs)
         return action, lstm_states
+
+    @staticmethod
+    def _build_parallel_env(env_creator_fn, patient_ids, envs_per_id):
+        # Create the vectorized environment
+        parallel_env = AsyncVectorEnv([
+            partial(env_creator_fn, patient_ids=pid)
+            for pid in patient_ids
+            for _ in range(envs_per_id)
+        ])
+        # Create the mapping: [0] -> 'id_A', [1] -> 'id_A', ..., [7] -> 'id_A', [8] -> 'id_B', ...
+        id_map = [
+            pid for pid in patient_ids
+            for _ in range(envs_per_id)
+        ]
+        return parallel_env, id_map
 
     def get_initial_states(self, batch_size: int):
         """Returns a zero-initialized hidden state tuple for the LSTM."""
@@ -416,8 +438,7 @@ class RecurrentPPO:
         last_advantage = 0
 
         with torch.no_grad():
-            last_obs_tensor = torch.FloatTensor(self.last_obs).unsqueeze(0)
-            _, last_value, _ = self.ac_network(last_obs_tensor, self.last_hidden_state)
+            _, last_value, _ = self.ac_network(self.last_obs_tensor, self.last_hidden_state)
 
         last_value = last_value.item()
 
@@ -432,69 +453,134 @@ class RecurrentPPO:
         returns = advantages + values
         return advantages, returns
 
-    def _evaluate_policy(self, n_eval_episodes=None, env_creator_fn=None):
-        if self.eval_env is None:
-            if env_creator_fn is None:
-                print('No test IDs set or env_creator_fn provided; using default env_creator_fn...')
-                env_creator_fn = self.env_creator_fn
-            self.eval_env = AsyncVectorEnv([env_creator_fn for _ in range(self.n_eval_envs)])
+    def _evaluate_policy(self, n_eval_episodes=None, env_creator_fn=None, test_ids=None):
+        # (optional) Rebuild eval envs if a custom env_creator_fn or test_ids are provided
+        if env_creator_fn is not None or test_ids is not None:
+            if env_creator_fn is not None:
+                print('Overriding default env_creator_fn with provided env_creator_fn.')
+
+            eval_env_creator_fn = env_creator_fn or self.eval_env_creator_fn
+
+            if test_ids is not None:
+                print('Overriding default test_ids with provided test_ids.')
+
+            test_ids = test_ids or self.test_ids
+            n_eval_envs = len(test_ids) * self.eval_envs_per_id
+
+            eval_env, eval_env_id_map = self._build_parallel_env(eval_env_creator_fn,
+                                                                 test_ids,
+                                                                 self.eval_envs_per_id)
+        else:
+            test_ids = self.test_ids
+            eval_env = self.eval_env
+            eval_env_id_map = self.eval_env_id_map
+            n_eval_envs = self.n_eval_envs
+
         n_eval_episodes = n_eval_episodes or self.eval_episodes
-        all_episode_rewards = []
-        all_episode_steps = []
-        episode_rewards = np.zeros(self.n_eval_envs)
-        episode_steps = np.zeros(self.n_eval_envs)
+
+        # --- Branch for BALANCED evaluation ---
+        n_ids = len(test_ids)
+        # Calculate how many episodes to get from each ID
+        # We use max(1, ...) to ensure we get at least one episode even if n_eval_episodes < n_ids
+        target_episodes_per_id = max(1, n_eval_episodes // n_ids)
+        total_target_episodes = target_episodes_per_id * n_ids
+
+        print(f"\n--- Starting balanced evaluation for {n_ids} test IDs ---")
+        print(f"--- Collecting {target_episodes_per_id} episodes per ID (Total: {total_target_episodes}) ---")
+
+        # Dictionaries to store results per ID
+        rewards_per_id = {pid: [] for pid in test_ids}
+        steps_per_id = {pid: [] for pid in test_ids}
+
+        # Trackers for in-progress episodes
+        episode_rewards = np.zeros(n_eval_envs)
+        episode_steps = np.zeros(n_eval_envs)
 
         # Seed each parallel environment with a unique, deterministic seed
         if self.seed is not None:
             rng = np.random.default_rng(MASTER_SEED)
-            eval_seeds = rng.integers(low=0, high=2 ** 32 - 1, size=self.n_eval_envs).tolist()
-            obs, _ = self.eval_env.reset(seed=eval_seeds)
+            eval_seeds = rng.integers(low=0, high=2 ** 32 - 1, size=n_eval_envs).tolist()
+            obs, _ = eval_env.reset(seed=eval_seeds)
         else:
-            obs, _ = self.eval_env.reset()
+            obs, _ = eval_env.reset()
 
-        hidden_state = self.ac_network.init_hidden_state(batch_size=self.n_eval_envs)
+        hidden_state = self.ac_network.init_hidden_state(batch_size=n_eval_envs)
 
-        while len(all_episode_rewards) < n_eval_episodes:
+        # --- Define Loop Condition ---
+        def is_evaluation_done():
+            # Loop until ALL test IDs have reached their target
+            return all(len(rewards_per_id[pid]) >= target_episodes_per_id for pid in test_ids)
+
+        # --- Main Evaluation Loop ---
+        while not is_evaluation_done():
             obs_tensor = torch.FloatTensor(obs).unsqueeze(1)
             with torch.no_grad():
+                # Use stochastic actions for evaluation
                 dist, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
                 action_env = dist.last_sampled_action
-            obs, reward, term, trunc, _ = self.eval_env.step(action_env.numpy())
+
+            obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
             dones = term | trunc
             episode_rewards += reward
             episode_steps += 1
+
             for i, done in enumerate(dones):
                 if done:
-                    all_episode_rewards.append(episode_rewards[i])
-                    all_episode_steps.append(episode_steps[i])
+                    # --- Balanced Logic: Add to the correct dictionary list ---
+                    current_id = eval_env_id_map[i]
+
+                    # Only add if this ID still needs episodes
+                    if len(rewards_per_id[current_id]) < target_episodes_per_id:
+                        rewards_per_id[current_id].append(episode_rewards[i])
+                        steps_per_id[current_id].append(episode_steps[i])
+
+                    # Reset this env's trackers
                     episode_rewards[i] = 0
                     episode_steps[i] = 0
                     hidden_state[0][:, i, :] = 0
                     hidden_state[1][:, i, :] = 0
 
+        # --- Post-Loop: Combine results if we were in balanced mode ---
+        all_episode_rewards = []
+        all_episode_steps = []
+        for pid in test_ids:
+            # This guarantees an equal number of episodes from each ID
+            all_episode_rewards.extend(rewards_per_id[pid])
+            all_episode_steps.extend(steps_per_id[pid])
+        print(f"--- Evaluation finished. Collected {len(all_episode_rewards)} total episodes. ---")
+
         # Calculate the IQM return
-        ep_reward_array = np.array(all_episode_rewards[:n_eval_episodes])
-        steps_array = np.array(all_episode_steps[:n_eval_episodes])
+        ep_reward_array = np.array(all_episode_rewards[:total_target_episodes])
+        steps_array = np.array(all_episode_steps[:total_target_episodes])
 
         q1_r, q3_r = np.percentile(ep_reward_array, [25, 75])
         iqr_mask = (ep_reward_array >= q1_r) & (ep_reward_array <= q3_r)
 
-        IQM_return = ep_reward_array[iqr_mask].mean()
-        IQM_steps = steps_array[iqr_mask].mean()
+        # Handle edge case where all rewards are identical (mask is all False)
+        if not iqr_mask.any():
+            IQM_return = ep_reward_array.mean()
+            IQM_steps = steps_array.mean()
+        else:
+            IQM_return = ep_reward_array[iqr_mask].mean()
+            IQM_steps = steps_array[iqr_mask].mean()
 
         return IQM_return, {'ep_length': IQM_steps}
 
     def fit(self, total_timesteps):
+        # Set up our initial obs
         if self.seed is not None:
-            obs, _ = self.env.reset(seed=self.seed)
+            obs, _ = self.train_env.reset(seed=self.seed)
         else:
-            obs, _ = self.env.reset()
+            obs, _ = self.train_env.reset()
 
-        hidden_state = self.ac_network.init_hidden_state()
+        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
 
+        # Get our initial hidden state
+        hidden_state = self.get_initial_states(batch_size=1)
+
+        # Define our training/eval epoch parameters
         start_timesteps = self._num_timesteps
         target_timesteps = start_timesteps + total_timesteps
-
         updates = 0
         model_save_num = 1
         next_eval = (start_timesteps // self.eval_freq + 1) * self.eval_freq
@@ -512,41 +598,45 @@ class RecurrentPPO:
             ep_lengths_this_rollout = []
 
             for _ in range(self.n_steps):
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
                 h_x, c_x = hidden_state
                 rollout_h_states.append(h_x.detach().squeeze())
                 rollout_c_states.append(c_x.detach().squeeze())
                 with torch.no_grad():
                     dist, value, hidden_state = self.ac_network(obs_tensor, hidden_state)
 
-                action_env = dist.last_sampled_action
-                log_prob = dist.log_prob(action_env).sum(axis=-1)
+                sampled_actions = dist.last_sampled_action
+                sampled_actions_np = sampled_actions.numpy().flatten()
+                log_prob = dist.log_prob(sampled_actions)
 
-                # action_env = dist.sample()
-                # log_prob = dist.log_prob(action_env, gaussian_actions=dist.gaussian_actions).sum(axis=-1)
-                new_obs, reward, term, trunc, info = self.env.step(action_env.numpy().flatten())
+                new_obs, reward, term, trunc, info = self.train_env.step(sampled_actions_np)
                 done = term or trunc
                 steps_taken = info.get('steps_taken', 1)
+
                 self._num_timesteps += steps_taken
+
                 current_episode_reward += reward
                 current_episode_length += steps_taken
+
+                # Store rollout data
                 rollout_obs.append(obs)
-                rollout_actions.append(action_env.numpy().flatten())
+                rollout_actions.append(sampled_actions_np)
                 rollout_rewards.append(reward)
                 rollout_dones.append(done)
                 rollout_log_probs.append(log_prob.item())
                 rollout_values.append(value.item())
                 rollout_steps_taken.append(steps_taken)
+
                 obs = new_obs
+                obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
                 if done:
                     ep_rewards_this_rollout.append(current_episode_reward)
                     ep_lengths_this_rollout.append(current_episode_length)
                     current_episode_reward = 0
                     current_episode_length = 0
-                    obs, _ = self.env.reset()
+                    obs, _ = self.train_env.reset()
                     hidden_state = self.ac_network.init_hidden_state()
 
-            self.last_obs = obs
+            self.last_obs_tensor = obs_tensor
             self.last_hidden_state = hidden_state
 
             advantages, returns = self._compute_advantages_and_returns(rollout_rewards, rollout_values, rollout_dones,
@@ -555,10 +645,10 @@ class RecurrentPPO:
             # *** KEY CHANGE: NORMALIZE ADVANTAGES ***
             advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
 
-            flat_advantages = torch.FloatTensor(advantages)
-            flat_returns = torch.FloatTensor(returns)
-            flat_actions = torch.FloatTensor(np.array(rollout_actions))
-            flat_log_probs = torch.FloatTensor(np.array(rollout_log_probs))
+            flat_advantages = torch.from_numpy(advantages).float()
+            flat_returns = torch.from_numpy(returns).float()
+            flat_actions = torch.from_numpy(np.array(rollout_actions)).float()
+            flat_log_probs = torch.from_numpy(np.array(rollout_log_probs)).float()
             flat_h_states = torch.stack(rollout_h_states)
             flat_c_states = torch.stack(rollout_c_states)
             total_transitions = self.n_steps
@@ -569,6 +659,7 @@ class RecurrentPPO:
                 np.random.shuffle(indices)
                 for start in range(0, total_transitions, self.batch_size):
                     end = start + self.batch_size
+                    # Get our batch data
                     batch_indices = indices[start:end]
                     batch_obs_seqs = [rollout_obs[i] for i in batch_indices]
                     batch_actions = flat_actions[batch_indices]
@@ -577,22 +668,30 @@ class RecurrentPPO:
                     batch_returns = flat_returns[batch_indices]
                     batch_h_state = flat_h_states[batch_indices].unsqueeze(0)
                     batch_c_state = flat_c_states[batch_indices].unsqueeze(0)
+
+                    # Pack the observation sequences
                     lengths = torch.LongTensor([len(o) for o in batch_obs_seqs])
                     sorted_lengths, sorted_idx = lengths.sort(descending=True)
-                    padded_obs = torch.nn.utils.rnn.pad_sequence(
-                        [torch.FloatTensor(batch_obs_seqs[i]) for i in sorted_idx], batch_first=True)
-                    packed_obs = torch.nn.utils.rnn.pack_padded_sequence(padded_obs, sorted_lengths, batch_first=True,
-                                                                         enforce_sorted=True)
+                    padded_obs = pad_sequence(
+                        [torch.from_numpy(batch_obs_seqs[i]).float() for i in sorted_idx], batch_first=True)
+                    packed_obs = pack_padded_sequence(padded_obs, sorted_lengths, batch_first=True, enforce_sorted=True)
+
+                    # Sort the rest of the batch according to the packed lengths
                     sorted_actions = batch_actions[sorted_idx]
                     sorted_log_probs = batch_log_probs[sorted_idx]
                     sorted_advantages = batch_advantages[sorted_idx]
                     sorted_returns = batch_returns[sorted_idx]
                     sorted_h_state = batch_h_state[:, sorted_idx, :]
                     sorted_c_state = batch_c_state[:, sorted_idx, :]
+
+                    # Forward pass
                     new_dist, new_values, _ = self.ac_network(packed_obs, (sorted_h_state, sorted_c_state))
                     new_values = new_values.squeeze()
-                    new_log_probs = new_dist.log_prob(sorted_actions).sum(-1)
-                    ratio = (new_log_probs - sorted_log_probs).exp()
+                    new_log_probs = new_dist.log_prob(sorted_actions).squeeze(-1)
+
+                    # Get PPO ratio and losses
+                    log_ratio = new_log_probs - sorted_log_probs
+                    ratio = log_ratio.exp()
                     surr1 = ratio * sorted_advantages
                     surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * sorted_advantages
                     policy_loss = -torch.min(surr1, surr2).mean()
@@ -637,6 +736,5 @@ class RecurrentPPO:
 
                 next_eval += self.eval_freq
 
-        self.env.close()
+        self.train_env.close()
         self.eval_env.close()
-

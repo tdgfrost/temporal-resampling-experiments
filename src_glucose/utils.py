@@ -1,4 +1,5 @@
-from typing import Union, Callable, Optional, Tuple
+from functools import partial
+from typing import Union, Callable, Optional, Tuple, List
 import numpy as np
 import torch
 from pathlib import Path
@@ -498,9 +499,10 @@ class ParallelEnvironmentEvaluator:
     """
 
     def __init__(self,
-                 env_fn: Callable,
+                 env_creator_fn: Callable,
                  n_eval_episodes: int,
                  n_eval_envs: int,
+                 test_ids: Optional[List[str]] = None,
                  gamma: float = 0.99,
                  running_average_obs: bool = False,
                  aggregate_window_size: int = AGGREGATE_WINDOW_SIZE,
@@ -510,7 +512,7 @@ class ParallelEnvironmentEvaluator:
         assert n_eval_episodes > 0, "n_eval_episodes must be positive"
         assert n_eval_envs > 0, "n_eval_envs must be positive"
 
-        self.env_fn = env_fn
+        self.env_creator_fn = env_creator_fn
         self.n_eval_episodes = n_eval_episodes
         self.n_eval_envs = n_eval_envs
         self.running_average_obs = running_average_obs
@@ -518,17 +520,59 @@ class ParallelEnvironmentEvaluator:
         self.seed = seed
         self.gamma = gamma
         self.verbose = verbose
-        # Create the vectorized environment
-        self.eval_env = AsyncVectorEnv([self.env_fn for _ in range(self.n_eval_envs)])
+
+        self.test_ids = test_ids
+        self.env_id_map = None
+        self.target_episodes_per_id = 0
+        self.total_target_episodes = self.n_eval_episodes
+
+        if test_ids is not None:
+            assert n_eval_envs % len(test_ids) == 0, \
+                "n_eval_envs must be a multiple of the number of test_ids."
+            self.n_ids = len(test_ids)
+            self.envs_per_id = n_eval_envs // self.n_ids
+
+            # Calculate target episodes
+            self.target_episodes_per_id = max(1, self.n_eval_episodes // self.n_ids)
+            self.total_target_episodes = self.target_episodes_per_id * self.n_ids
+
+            self.eval_env = AsyncVectorEnv([
+                # Assign patient IDs in blocks
+                partial(self.env_creator_fn, patient_ids=test_ids[i // self.envs_per_id])
+                for i in range(self.n_eval_envs)
+            ])
+            # Create the mapping: [0] -> 'id_A', [1] -> 'id_A', ..., [7] -> 'id_A', [8] -> 'id_B', ...
+            self.env_id_map = [test_ids[i // self.envs_per_id] for i in range(self.n_eval_envs)]
+
+            if self.verbose:
+                print(f"--- Evaluator: Running balanced evaluation for {self.n_ids} IDs ---")
+                print(
+                    f"--- Collecting {self.target_episodes_per_id} episodes per ID (Total: {self.total_target_episodes}) ---")
+        else:
+            # Original (unbalanced) setup
+            self.eval_env = AsyncVectorEnv([self.env_creator_fn for _ in range(self.n_eval_envs)])
+            if self.verbose:
+                print(f"--- Evaluator: Running (unbalanced) evaluation for {self.n_eval_episodes} episodes ---")
 
     def __call__(self, algo, seed=None) -> Tuple[float, float]:
         # --- 1. Setup ---
-        all_episode_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
         seed = seed or self.seed
-        original_device = algo._device
-        algo.to('cpu')
-        algo._device = 'cpu'
+
+        # Dictionaries/lists to store results
+        if self.test_ids is not None:
+            rewards_per_id = {id: [] for id in self.test_ids}
+            do_balanced_eval = True
+        else:
+            all_episode_rewards = []  # Original behavior
+            do_balanced_eval = False
+
+        try:
+            original_device = algo._device
+            algo.to('cpu')
+            algo._device = 'cpu'
+        except AttributeError:
+            original_device = None
 
         running_avg_deques = None
         if self.running_average_obs:
@@ -552,11 +596,25 @@ class ParallelEnvironmentEvaluator:
         # Get initial hidden state for the batch
         hidden_state = algo.get_initial_states(batch_size=self.n_eval_envs)
 
-        # --- 3. Run Episodes ---
-        with tqdm(total=self.n_eval_episodes, desc="Evaluating Episodes", mininterval=2.0, disable=not self.verbose) as pbar:
-            while len(all_episode_rewards) < self.n_eval_episodes:
+        # --- 3. Define Loop Condition ---
+        if do_balanced_eval:
+            def is_evaluation_done():
+                # Loop until ALL test IDs have reached their target
+                return all(len(rewards_per_id[id]) >= self.target_episodes_per_id for id in self.test_ids)
 
-                # --- 3a. Prepare Observations ---
+            pbar_total = self.total_target_episodes
+        else:
+            def is_evaluation_done():
+                # Original loop condition
+                return len(all_episode_rewards) >= self.n_eval_episodes
+
+            pbar_total = self.n_eval_episodes
+
+        # --- 4. Run Episodes ---
+        with tqdm(total=pbar_total, desc="Evaluating Episodes", mininterval=2.0, disable=not self.verbose) as pbar:
+            while not is_evaluation_done():
+
+                # --- 4a. Prepare Observations ---
                 obs_to_predict = obs
                 if self.running_average_obs:
                     # Calculate mean obs for each env in the batch
@@ -564,7 +622,7 @@ class ParallelEnvironmentEvaluator:
                                       for deque in running_avg_deques]
                     obs_to_predict = np.stack(mean_obs_batch) # for seq dim
 
-                # --- 3b. Predict Action ---
+                # --- 4b. Predict Action ---
                 with torch.no_grad():
                     # Make sure the seq_dim is present
                     obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
@@ -572,13 +630,13 @@ class ParallelEnvironmentEvaluator:
                                                         hidden_state=hidden_state,
                                                         deterministic=True)
 
-                # --- 3c. Step Environment ---
+                # --- 4c. Step Environment ---
                 # action is a batch (B, ...), so we pass it directly
                 # (or convert to numpy if it's a tensor)
                 try:
                     action_np = action.cpu().numpy()
                 except AttributeError:
-                    action_np = action  # Assume it's already numpy
+                    action_np = action
 
                 if action_np.ndim == 1:
                     action_np = np.expand_dims(action_np, axis=-1)
@@ -588,44 +646,61 @@ class ParallelEnvironmentEvaluator:
 
                 episode_rewards += reward
 
-                # --- 3d. Handle Dones and State Updates ---
+                # --- 4d. Handle Dones and State Updates ---
                 for i, done in enumerate(dones):
-                    # Always append the *next* observation for the running average
                     if self.running_average_obs:
                         running_avg_deques[i].append(next_obs[i])
 
                     if done:
-                        # An episode finished
-                        all_episode_rewards.append(episode_rewards[i])
-                        episode_rewards[i] = 0  # Reset reward accumulator
+                        episode_finished = False
+                        # --- Balanced Logic: Add to the correct dictionary list ---
+                        if do_balanced_eval:
+                            current_id = self.env_id_map[i]
+                            # Only add if this ID still needs episodes
+                            if len(rewards_per_id[current_id]) < self.target_episodes_per_id:
+                                rewards_per_id[current_id].append(episode_rewards[i])
+                                episode_finished = True
 
-                        # Update the progress bar
-                        pbar.update(1)
+                        # --- Original Logic: Add to the main list ---
+                        else:
+                            all_episode_rewards.append(episode_rewards[i])
+                            episode_finished = True
 
-                        # Reset hidden state for this env (mimicking your example)
+                        if episode_finished:
+                            # Update pbar only if we actually stored the episode
+                            pbar.update(1)
+
+                        # Reset reward accumulator
+                        episode_rewards[i] = 0
+
+                        # Reset hidden state
                         if isinstance(hidden_state, tuple):
-                            # Handle LSTM-like states (h, c)
                             hidden_state[0][:, i, :] = 0
                             hidden_state[1][:, i, :] = 0
                         elif hidden_state is not None:
-                            # Handle GRU-like states
                             hidden_state[:, i, :] = 0
 
-                        # Reset the running average deque for this env
+                        # Reset running average
                         if self.running_average_obs:
                             running_avg_deques[i].clear()
-                            # Add the new obs from the auto-reset
                             running_avg_deques[i].append(next_obs[i])
 
-                            # The observation for the next loop
-                obs = next_obs
+                obs = next_obs  # End of loop, update obs
 
-        # Ensure we only use the requested number of episodes
-        final_rewards = all_episode_rewards[:self.n_eval_episodes]
+        # --- 5. Combine and Return Results ---
+        if self.test_ids is not None:
+            final_rewards = []
+            for id in self.test_ids:
+                # This guarantees an equal number of episodes from each ID
+                final_rewards.extend(rewards_per_id[id])
+        else:
+            # Original logic: slice to the exact amount
+            final_rewards = all_episode_rewards[:self.n_eval_episodes]
 
         # Set algo back to original device
-        algo.to(original_device)
-        algo._device = original_device
+        if original_device is not None:
+            algo.to(original_device)
+            algo._device = original_device
 
         return final_rewards
 

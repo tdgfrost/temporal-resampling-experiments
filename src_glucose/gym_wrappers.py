@@ -23,13 +23,16 @@ CHO_SCALE = 300.0
 # Seed
 MASTER_SEED = 123
 
-# Get our adult patients
+# Get all our patients
+patient_id_counter = 1
 for i in range(1, 11):
-    register(
-        id=f"simglucose/adult{i}-v0",
-        entry_point="simglucose.envs:T1DSimGymnaisumEnv",
-        kwargs={"patient_name": f"adult#0{i:02}"},
-    )
+    for group in ['adult', 'adolescent', 'child']:
+        register(
+            id=f"simglucose/{patient_id_counter}-v0",
+            entry_point="simglucose.envs:T1DSimGymnaisumEnv",
+            kwargs={"patient_name": f"{group}#0{i:02}"},
+        )
+        patient_id_counter += 1
 
 
 class SampleTimeWrapper(RecordConstructorArgs, Wrapper):
@@ -74,18 +77,16 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
 
 class T1DPatientEnv(Wrapper):
 
-    def __init__(self, test_ids: List[int], use_test_ids: bool = False, **kwargs):
+    def __init__(self, patient_ids: Iterable[int] = range(1, 31), **kwargs):
         self.kwargs = kwargs
-        if not isinstance(test_ids, Iterable):
-            test_ids = [test_ids]
+        if not isinstance(patient_ids, Iterable):
+            patient_ids = [patient_ids]
 
-        # Offline ID range (1-5)
-        all_train_ids = [1, 2, 3, 4, 5]
-        self._id_choices = test_ids if use_test_ids else [t_id for t_id in all_train_ids if t_id not in test_ids]
+        self._id_choices = patient_ids
 
         # Pick a random patient at initialization
         id_choice = np.random.choice(self._id_choices)
-        identity = f"simglucose/adult{id_choice}-v0"
+        identity = f"simglucose/{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
 
@@ -93,7 +94,7 @@ class T1DPatientEnv(Wrapper):
         # Rebuild env each reset
         self.env.close()  # cleanup
         id_choice = np.random.choice(self._id_choices)
-        identity = f"simglucose/adult{id_choice}-v0"
+        identity = f"simglucose/{id_choice}-v0"
         self.env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
 
@@ -261,9 +262,9 @@ class EnforcePPOWrapper(Wrapper):
         return obs, reward, term, trunc, info
 
 
-def make_glucose_env(*, test_ids: List[int], use_test_ids: bool = False, no_interim_rewards: bool = False, gamma: float = 1.0,
+def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_rewards: bool = False, gamma: float = 1.0,
                      forced_interval: int = 0, use_scaling: bool = False, **kwargs):
-    env = T1DPatientEnv(test_ids=test_ids, use_test_ids=use_test_ids, **kwargs)
+    env = T1DPatientEnv(patient_ids=patient_ids, **kwargs)
     env = SampleTimeWrapper(env)
     if use_scaling:
         env = NormalizeReward(env, gamma=gamma)

@@ -698,6 +698,8 @@ class _RecurrentBase(nn.Module):
             n_epochs_train: int = 1,
             n_epochs_per_eval: int = 1,
             evaluators=None,
+            evaluators_val=None,
+            evaluators_test=None,
             show_progress: bool = True,
             decoy_interval: int = 0,
             early_stopping_limit: int = 3,
@@ -715,10 +717,17 @@ class _RecurrentBase(nn.Module):
                                     batch_size=self._batch_size, **dataset_kwargs)
         dataloader = DataPrefetcher(dataset, prefetch_count=5)
 
+        # Set up our evaluators
+        assert not (evaluators is not None and (evaluators_val is not None or evaluators_test is not None)), \
+            "Please specify either 'evaluators' OR 'evaluators_val/evaluators_test', not both."
+        evaluators_val = evaluators_val or evaluators
+        evaluators_test = evaluators_test or evaluators
+
         loss_dict = self._reset_loss_dict()
         stop_early_count = 0
         best_online_return = -1 * float('inf')
         best_log_dict = None
+        best_epoch = None
 
         # Start training
         with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0,
@@ -753,32 +762,33 @@ class _RecurrentBase(nn.Module):
 
                 # Logging
                 if epoch < n_epochs_train:
-                    do_eval = epoch % n_epochs_per_eval == 0
+                    do_eval = (epoch % n_epochs_per_eval == 0) and (evaluators_val is not None)
                     if do_eval:
                         log_dict = self._log_progress(
                             epoch=epoch,
-                            evaluators=evaluators
+                            evaluators=evaluators_val
                         )
 
-                        # TBC
                         current_return = log_dict['online_irregular']
                         if current_return > best_online_return + 1e-4:
                             best_online_return = current_return
                             best_log_dict = log_dict
+                            best_epoch = epoch
                             stop_early_count = 0
                             self._save_best_model_state()
                         else:
                             stop_early_count += 1
 
                         if stop_early_count >= early_stopping_limit:
-                            print(f"Early stopping triggered at epoch {epoch} - loading previous best state.")
+                            print(f"Early stopping triggered at epoch {epoch} "
+                                  f"- loading previous best state at epoch {best_epoch}.")
                             self._load_best_model_state()
                             break
 
-            if best_log_dict is None:
+            if (best_log_dict is None) or (evaluators_test is not evaluators_val):
                 best_log_dict = self._log_progress(
                     epoch="final",
-                    evaluators=evaluators
+                    evaluators=evaluators_test
                 )
 
         return best_log_dict
