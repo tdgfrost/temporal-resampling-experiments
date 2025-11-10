@@ -854,12 +854,12 @@ class _RecurrentBase(nn.Module):
 
         return action.detach().squeeze(-1).cpu().numpy(), next_hidden_state
 
-    def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
+    def _filter_to_correct_visibles(self, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
         N, T = visible.shape[:2]
         dtype = r.dtype
 
-        # --- NEW: Apply the mask to sanitize inputs ---
+        # --- Apply the mask to sanitize inputs ---
         mask = padding_mask
         mask_squeezed = padding_mask.squeeze(-1)  # Shape (N, T)
 
@@ -874,7 +874,6 @@ class _RecurrentBase(nn.Module):
         # Ensure no visible flags are true in the padded region
         visible = visible & mask
         next_visible = next_visible & mask
-        # --- END OF NEW CODE ---
 
         vis = visible.squeeze(-1).bool()  # (N,T)
         nvis = next_visible.squeeze(-1).bool()  # (N,T)
@@ -897,15 +896,13 @@ class _RecurrentBase(nn.Module):
         # --- Use train_mask to select valid steps ---
         valid = vis & (target_idx < T) & train_mask.squeeze(-1).bool()
 
-        # gather helpers
-        b_full = self._buffered_batch_arange
-        b = b_full[valid]  # (M,)
-        i = t_idx[valid]  # (M,)
-        j = target_idx[valid]  # (M,)
+        # Create dense i and j tensors (as floats for pow)
+        i_dense = self._buffered_sequence_arange.to(dtype)  # (N, T)
+        j_dense = target_idx.to(dtype)  # (N, T)
 
-        # select current Q-values at visible timesteps
-        q1_sel = q1[b, i]
-        q2_sel = q2[b, i]
+        # Clamp j to avoid OOB errors.
+        # The 'valid' mask will filter out these junk values anyway.
+        j_clamped = target_idx.clamp(max=T - 1)  # (N, T)
 
         # n-step reward sum over [i..j] with constant gamma
         r_flat = r.squeeze(-1)  # (N,T)
@@ -913,20 +910,25 @@ class _RecurrentBase(nn.Module):
         rg = r_flat * pow_t  # r_t * γ^t
         S = torch.cumsum(rg, dim=1)  # prefix sum of r_t * γ^t
 
-        Sj = S[b, j]
-        Si_1 = torch.where(i > 0, S[b, i - 1], torch.zeros_like(Sj))
-        gamma_neg_i = torch.pow(self._gamma, -i.to(dtype))
-        R_i_j = gamma_neg_i * (Sj - Si_1)  # Σ_{k=i..j} γ^{k-i} r_k   (M,)
+        # Dense R_i_j
+        Sj_dense = torch.gather(S, 1, j_clamped)  # (N, T)
+        S_padded = torch.nn.functional.pad(S, (1, 0), 'constant', 0.0)  # (N, T+1)
+        Si_1_dense = S_padded[:, :-1]  # (N, T)
+        gamma_neg_i = torch.pow(self._gamma, -i_dense)  # (N, T)
+        R_i_j_dense = gamma_neg_i * (Sj_dense - Si_1_dense)  # (N, T)
 
-        # bootstrap from s_{j+1} with γ^(j-i+1) and (1 - done_j)
-        vnext_j = v_next[b, j].squeeze(-1)  # (M,)
-        done_j = dn[b, j].to(dtype)  # (M,)
-        expo = torch.pow(self._gamma,
-                         (j - i + 1).to(dtype))  # (M,)
+        # Dense bootstrap
+        vnext_j_dense = torch.gather(
+            v_next, 1, j_clamped.unsqueeze(-1)
+        ).squeeze(-1)  # (N, T)
+        done_j_dense = torch.gather(dn, 1, j_clamped).to(dtype)  # (N, T)
+        expo_dense = torch.pow(self._gamma, j_dense - i_dense + 1.0)  # (N, T)
 
-        q_target_sel = R_i_j.unsqueeze(-1) + (expo * (1 - done_j) * vnext_j).unsqueeze(-1)
+        # Final dense target
+        bootstrap_dense = expo_dense * (1.0 - done_j_dense) * vnext_j_dense  # (N, T)
+        q_target_dense = (R_i_j_dense + bootstrap_dense).unsqueeze(-1)  # (N, T, 1)
 
-        return q1_sel, q2_sel, q_target_sel, valid
+        return q_target_dense, valid.unsqueeze(-1)
 
     def _to_tensors(self, *arrays):
         new_tensors = []
@@ -1148,21 +1150,19 @@ class RecurrentIQL(_RecurrentBase):
             q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, train_mask)
 
             if self.decoy_interval == 0:
-                q1, q2, q_target, _ = self._filter_to_correct_visibles(
-                    q1, q2, rews, v_next, dones, visible, next_visible, padding_mask, train_mask)
-
-                critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+                q_target, train_mask = self._filter_to_correct_visibles(
+                    rews, v_next, dones, visible, next_visible, padding_mask, train_mask)
 
             else:
                 q_target = rews + self._gamma * (1 - dones.float()) * v_next
 
-                q1_loss = F.mse_loss(q1, q_target, reduction='none')
-                q2_loss = F.mse_loss(q2, q_target, reduction='none')
-                critic_loss_unmasked = q1_loss + q2_loss
+            q1_loss = F.mse_loss(q1, q_target, reduction='none')
+            q2_loss = F.mse_loss(q2, q_target, reduction='none')
+            critic_loss_unmasked = q1_loss + q2_loss
 
-                # Apply the mask
-                masked_loss = critic_loss_unmasked * train_mask
-                critic_loss = masked_loss.sum() / (train_mask.sum() + self._eps)
+            # Apply the mask
+            masked_loss = critic_loss_unmasked * train_mask
+            critic_loss = masked_loss.sum() / (train_mask.sum() + self._eps)
 
         return critic_loss
 
@@ -1466,23 +1466,21 @@ class RecurrentCQLSAC(_RecurrentBase):
 
             # Create the Bellman loss
             if self.decoy_interval == 0:
-                q1_pred, q2_pred, q_target, valid_mask = self._filter_to_correct_visibles(
-                    q1_pred, q2_pred, rews, next_v, dones, visible, next_visible, padding_mask, train_mask)
-
-                bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
+                q_target, train_mask = self._filter_to_correct_visibles(
+                    rews, next_v, dones, visible, next_visible, padding_mask, train_mask)
 
             else:
                 q_target = rews + self._gamma * (1 - dones.float()) * next_v
 
-                q1_loss = F.mse_loss(q1_pred, q_target, reduction='none')
-                q2_loss = F.mse_loss(q2_pred, q_target, reduction='none')
+            q1_loss = F.mse_loss(q1_pred, q_target, reduction='none')
+            q2_loss = F.mse_loss(q2_pred, q_target, reduction='none')
 
-                bellman_loss = q1_loss + q2_loss  # Shape [N, T, 1]
+            bellman_loss = q1_loss + q2_loss  # Shape [N, T, 1]
 
-                # Use train_mask (which is False for padding AND burn-in)
-                valid_count = train_mask.sum() + self._eps
-                bellman_loss = (bellman_loss * train_mask)
-                bellman_loss = bellman_loss.sum() / valid_count
+            # Use train_mask (which is False for padding AND burn-in)
+            valid_count = train_mask.sum() + self._eps
+            bellman_loss = (bellman_loss * train_mask)
+            bellman_loss = bellman_loss.sum() / valid_count
 
             critic_loss = bellman_loss + cql_loss
 
