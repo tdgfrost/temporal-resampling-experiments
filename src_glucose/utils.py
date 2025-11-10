@@ -242,13 +242,8 @@ class RecurrentReplayBufferEnv:
         next_visible_batch = torch.roll(visible_batch, shifts=-1, dims=1)
         next_visible_batch[:, -1] = False  # Last step does not have a next step
 
-        # Get our lengths
-        lengths = padding_mask.sum(dim=1).squeeze(-1).cpu().to(torch.int64).clamp(min=1)
-        next_lengths = next_padding_mask.sum(dim=1).squeeze(-1).cpu().to(torch.int64).clamp(min=1)
-
         return (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch,
-                visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask,
-                lengths, next_lengths)
+                visible_batch, next_visible_batch, padding_mask, next_padding_mask, train_mask)
 
     def save(self, path: str):
         if os.path.exists(path):
@@ -302,9 +297,9 @@ class RecurrentReplayBufferEnv:
 
         # Tweak to shorten to 1M steps if needed
         """
-        print(f"Trimming 10M to ~1M steps for dataset...")
+        print(f"Trimming 1M to ~500k steps for dataset...")
         for i in range(3):
-            n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 10
+            n_episodes = np.where(np.array(self.dones[i]))[0].shape[0] // 2
             start_idx = 0
             end_idx = np.where(np.array(self.dones[i]))[0][n_episodes] + 1
             self.observations[i] = deque(list(self.observations[i])[start_idx:end_idx + 1], maxlen=self.buffer_size)
@@ -527,6 +522,9 @@ class ParallelEnvironmentEvaluator:
         all_episode_rewards = []
         episode_rewards = np.zeros(self.n_eval_envs)
         seed = seed or self.seed
+        original_device = algo._device
+        algo.to('cpu')
+        algo._device = 'cpu'
 
         running_avg_deques = None
         if self.running_average_obs:
@@ -620,6 +618,10 @@ class ParallelEnvironmentEvaluator:
 
         # Ensure we only use the requested number of episodes
         final_rewards = all_episode_rewards[:self.n_eval_episodes]
+
+        # Set algo back to original device
+        algo.to(original_device)
+        algo._device = original_device
 
         return final_rewards
 

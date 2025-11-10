@@ -426,9 +426,7 @@ class SharedRecurrentEncoder(nn.Module):
     def forward(self, x: Optional[torch.Tensor] = None,
                 obs_features: Optional[torch.Tensor] = None,
                 hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                padding_mask: Optional[torch.Tensor] = None,
-                train_mask: Optional[torch.Tensor] = None,
-                lengths: Optional[List[int]] = None) -> Tuple[
+                train_mask: Optional[torch.Tensor] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Processes observations through the encoder and LSTM.
@@ -462,94 +460,25 @@ class SharedRecurrentEncoder(nn.Module):
         # (N * T, lstm_input_size) -> (N, T, lstm_input_size)
         lstm_input = hidden.view(batch_size, seq_len, -1)
 
-        default_is_training_mask = torch.ones(
-            lstm_input.shape[:2], dtype=torch.bool, device=lstm_input.device)
-
         if train_mask is not None:
-            # --- Burn-in Logic with per-sequence length ---
-            burn_in_lengths = self._get_burn_in_lengths(train_mask)  # shape: [B]
-
-            # Create a mask of shape (B, T) to identify training steps.
-            timesteps = torch.arange(seq_len, device=lstm_input.device).expand(len(burn_in_lengths), seq_len)
-            is_training_mask_with_burn_in = timesteps >= burn_in_lengths.unsqueeze(1)
-
-            is_any_training = ~(train_mask == padding_mask)
-            has_training_steps_per_seq = torch.any(is_any_training, dim=1)
-
-            is_training_mask = torch.where(
-                has_training_steps_per_seq,
-                is_training_mask_with_burn_in,
-                default_is_training_mask
-            )
+            is_training_mask = train_mask
         else:
-            is_training_mask = default_is_training_mask
+            is_training_mask = torch.ones(
+                lstm_input.shape[:2], dtype=torch.bool, device=lstm_input.device).unsqueeze(-1)
 
         # Use torch.where to create a new input tensor.
         # For training steps, use the original input to preserve the computation graph.
         # For burn-in steps, use a detached version to cut the graph.
         lstm_input = torch.where(
-            is_training_mask.unsqueeze(-1),  # expand to [B, T, 1] to broadcast
+            is_training_mask,  # expand to [B, T, 1] to broadcast
             lstm_input,
             lstm_input.detach()
         )
 
         # Now, proceed with the masked input as if it were the original.
-        packed_input = self._pack_sequence_maybe(lstm_input, padding_mask, lengths)
-        lstm_out, next_hidden_state = self.lstm(packed_input, hidden_state)
-        lstm_out = self._unpack_sequence_maybe(lstm_out, seq_len)
+        lstm_out, next_hidden_state = self.lstm(lstm_input, hidden_state)
 
         return lstm_out, next_hidden_state
-
-    @staticmethod
-    def _get_burn_in_lengths(train_mask):
-        """
-        Calculates the length of the burn-in period for each sequence in the batch.
-        A burn-in period is the sequence of leading False values in the train_mask.
-
-        Args:
-            train_mask (Tensor): A boolean tensor of shape [B, T, 1].
-
-        Returns:
-            Tensor: A 1D tensor of shape [B] with the burn-in length for each sequence.
-        """
-        # Squeeze to shape [B, T]
-        mask = train_mask.squeeze(-1)
-
-        # `argmax` finds the index of the first `True`. This index is the number of
-        # leading `False` values, which is our burn-in length.
-        # To handle sequences that are all `False` (all burn-in), we add a `True`
-        # sentinel value at the end. `argmax` will then return `seq_len`.
-        sentinel = torch.ones(mask.shape[0], 1, dtype=torch.bool, device=mask.device)
-        mask_with_sentinel = torch.cat([mask, sentinel], dim=1)
-
-        # Cast to int for argmax
-        burn_in_lengths = torch.argmax(mask_with_sentinel.to(torch.int), dim=1)
-        return burn_in_lengths
-
-    @staticmethod
-    def _pack_sequence_maybe(lstm_input, padding_mask, lengths=None):
-        if padding_mask is not None:
-            if lengths is None:
-                lengths = padding_mask.sum(dim=1).squeeze(-1).cpu().to(torch.int64)
-                lengths = torch.clamp(lengths, min=1)  # Ensure no zero lengths
-            lstm_input = pack_padded_sequence(
-                lstm_input,
-                lengths,
-                batch_first = True,
-                enforce_sorted = False
-            )
-
-        return lstm_input
-
-    @staticmethod
-    def _unpack_sequence_maybe(lstm_out, seq_len):
-        if isinstance(lstm_out, PackedSequence):
-            lstm_out, _ = pad_packed_sequence(
-                lstm_out,
-                batch_first = True,
-                total_length = seq_len
-            )
-        return lstm_out
 
 
 class RecurrentNet(nn.Module):
@@ -745,11 +674,11 @@ class _RecurrentBase(nn.Module):
                     pbar.update(1)
                     if len(loss_dict['policy_loss']) > 1:
                         pbar_dict = {'epoch': epoch_str,
-                                     'policy_loss': f"{np.mean(loss_dict['policy_loss']):.5f}",
+                                     'policy_loss': f"{torch.stack(list(loss_dict['policy_loss'])).mean().item():.5f}",
                                      'refresh': False}
                         if not self._cloning_only:
-                            pbar_dict['critic_loss'] = f"{np.mean(loss_dict['critic_loss']):.5f}"
-                            pbar_dict['value_loss'] = f"{np.mean(loss_dict['value_loss']):.5f}"
+                            pbar_dict['critic_loss'] = f"{torch.stack(list(loss_dict['critic_loss'])).mean().item():.5f}"
+                            pbar_dict['value_loss'] = f"{torch.stack(list(loss_dict['value_loss'])).mean().item():.5f}"
 
                         pbar.set_postfix(**pbar_dict)
 
@@ -814,7 +743,7 @@ class _RecurrentBase(nn.Module):
             for net in nets:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
-        return loss.item()
+        return loss.detach().clone()
 
     def sync_target_networks(self):
         pass
@@ -836,9 +765,7 @@ class _RecurrentBase(nn.Module):
         assert self.actor_encoder is not None, "Missing actor encoder in the recurrent network."
         lstm_out_pi, next_hidden_state = self.actor_encoder(obs_tensor,
                                                             hidden_state=hidden_state,
-                                                            padding_mask=None,
-                                                            train_mask=None,
-                                                            lengths=None)
+                                                            train_mask=None)
 
         # 2. Call the policy decoder
         #    Input: (1, 1, hidden_size), Output: (1, 1, 2)
@@ -853,14 +780,9 @@ class _RecurrentBase(nn.Module):
             action = dist.sample()
 
         if with_dist:
-            return dist, action.squeeze(-1).cpu().numpy(), next_hidden_state
+            return dist, action.detach().squeeze(-1).cpu().numpy(), next_hidden_state
 
-        return action.squeeze(-1).cpu().numpy(), next_hidden_state
-
-    def evaluate_actions(self, obs, hidden_state, actions):
-        dist, _, _ = self.predict(obs, hidden_state=hidden_state, deterministic=True, with_dist=True)
-        log_probs = dist.log_prob(actions)
-        return log_probs
+        return action.detach().squeeze(-1).cpu().numpy(), next_hidden_state
 
     def _filter_to_correct_visibles(self, q1, q2, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
@@ -1132,32 +1054,28 @@ class RecurrentIQL(_RecurrentBase):
 
         return critic_loss
 
-    @torch.compile(mode='default') # reduce-overhead leads to NaNs here
-    def _update_critic_compiled(self, obs, acts, next_obs, padding_mask, next_padding_mask, train_mask, lengths,
-                                next_lengths):
+    #@torch.compile(mode='default')  # reduce-overhead leads to NaNs here
+    def _update_critic_compiled(self, obs, acts, next_obs, train_mask):
         # We only need the network output, not the final hidden state for training
-        lstm_out_q, hidden_state = self.shared_critic_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
-                                                              lengths=lengths)
+        lstm_out_q, hidden_state = self.shared_critic_encoder(obs, train_mask=train_mask)
         q1 = self.critic_net1(lstm_out_q, actions=acts)
         q2 = self.critic_net2(lstm_out_q, actions=acts)
 
         with torch.no_grad():
             # Use target shared encoder and target value decoder
-            next_lstm_out_tgt, _ = self.target_shared_critic_encoder(next_obs, padding_mask=next_padding_mask,
-                                                                     train_mask=None, lengths=next_lengths)
+            next_lstm_out_tgt, _ = self.target_shared_critic_encoder(next_obs, train_mask=None)
             v_next = self.target_value_net(next_lstm_out_tgt, actions=None)
 
         return q1, q2, v_next
 
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                       train_mask, lengths, next_lengths):
+                       train_mask):
         # Add some noise
         obs = self.add_noise(obs)
         next_obs = self.add_noise(next_obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
-            q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, padding_mask, next_padding_mask,
-                                                          train_mask, lengths, next_lengths)
+            q1, q2, v_next = self._update_critic_compiled(obs, acts, next_obs, train_mask)
 
             if self.decoy_interval == 0:
                 q1, q2, q_target, _ = self._filter_to_correct_visibles(
@@ -1191,16 +1109,15 @@ class RecurrentIQL(_RecurrentBase):
 
         return value_loss
 
-    @torch.compile(mode='reduce-overhead')
+    #@torch.compile(mode='reduce-overhead')
     def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                      train_mask, lengths, next_lengths):
+                      train_mask):
         # Add some noise
         obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Value function doesn't depend on actions
-            lstm_out_q, _ = self.shared_critic_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
-                                                       lengths=lengths)
+            lstm_out_q, _ = self.shared_critic_encoder(obs, train_mask=train_mask)
             v = self.value_net(lstm_out_q, actions=None)
 
             with torch.no_grad():
@@ -1231,16 +1148,15 @@ class RecurrentIQL(_RecurrentBase):
 
         return policy_loss
 
-    @torch.compile(mode='default')
+    #@torch.compile(mode='default')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                      train_mask, lengths, next_lengths, diff):
+                      train_mask, diff):
         # Add some noise
         obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Policy doesn't depend on actions
-            lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
-                                                lengths=lengths)
+            lstm_out_pi, _ = self.actor_encoder(obs, train_mask=train_mask)
             params = self.policy_net(lstm_out_pi, actions=None)
 
             dist = self.dist.proba_distribution(params)
@@ -1353,19 +1269,16 @@ class RecurrentCQLSAC(_RecurrentBase):
         )
         return critic_loss
 
-    @torch.compile(mode='default')
-    def _update_critic_inference_compiled(self, obs, acts, next_obs, visible, padding_mask, next_padding_mask,
-                                          train_mask, lengths, next_lengths):
+    #@torch.compile(mode='default')
+    def _update_critic_inference_compiled(self, obs, acts, next_obs, visible, train_mask):
         # -- Inference for Bellman loss -- #
-        lstm_out_q, _ = self.shared_critic_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
-                                                   lengths=lengths)
+        lstm_out_q, _ = self.shared_critic_encoder(obs, train_mask=train_mask)
         q1_pred = self.critic_net1(lstm_out_q, actions=acts)
         q2_pred = self.critic_net2(lstm_out_q, actions=acts)
 
         with torch.no_grad():
             # 2. Get our a' sampled from our policy
-            next_lstm_out_pi, _ = self.actor_encoder(next_obs, padding_mask=next_padding_mask, train_mask=None,
-                                                     lengths=next_lengths)
+            next_lstm_out_pi, _ = self.actor_encoder(next_obs, train_mask=None)
             params = self.policy_net(next_lstm_out_pi, actions=None)
 
             # Create the Beta distribution
@@ -1376,8 +1289,7 @@ class RecurrentCQLSAC(_RecurrentBase):
             next_log_pi = dist.log_prob(next_actions_sampled)
 
             # 3. Get our Q(s',a') using the sampled action
-            next_lstm_out_tgt, _ = self.target_shared_critic_encoder(next_obs, padding_mask=next_padding_mask,
-                                                                     train_mask=None, lengths=next_lengths)
+            next_lstm_out_tgt, _ = self.target_shared_critic_encoder(next_obs, train_mask=None)
             next_q1 = self.target_critic_net1(next_lstm_out_tgt, actions=next_actions_sampled)
             next_q2 = self.target_critic_net2(next_lstm_out_tgt, actions=next_actions_sampled)
             next_q = torch.min(next_q1, next_q2)
@@ -1399,8 +1311,7 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         with torch.no_grad():
             # 5. Sample our actions
-            cql_lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=None,
-                                                    lengths=lengths)
+            cql_lstm_out_pi, _ = self.actor_encoder(obs, train_mask=None)
             params = self.policy_net(cql_lstm_out_pi, actions=None)
 
             # Create the Beta distribution
@@ -1454,7 +1365,7 @@ class RecurrentCQLSAC(_RecurrentBase):
         return q1_pred, q2_pred, next_v, scaled_cql_loss
 
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                       train_mask, lengths, next_lengths):
+                       train_mask):
         '''
         CQL Q-loss: logsumexp_loss + bellman_error_loss
         1) bellman_error_loss = MSE(Q(s,a), r + gamma * (1 - done) * V(s'))
@@ -1480,7 +1391,7 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1_pred, q2_pred, next_v, cql_loss = self._update_critic_inference_compiled(
-                obs, acts, next_obs, visible, padding_mask, next_padding_mask, train_mask, lengths, next_lengths
+                obs, acts, next_obs, visible, train_mask
             )
 
             # Create the Bellman loss
@@ -1517,16 +1428,15 @@ class RecurrentCQLSAC(_RecurrentBase):
         )
         return policy_loss
 
-    @torch.compile(mode='reduce-overhead')
+    #@torch.compile(mode='reduce-overhead')
     def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                      train_mask, lengths, next_lengths):
+                      train_mask):
         # Add some noise
         obs = self.add_noise(obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # 1. Get policy params (action-independent)
-            lstm_out_pi, _ = self.actor_encoder(obs, padding_mask=padding_mask, train_mask=train_mask,
-                                                lengths=lengths)
+            lstm_out_pi, _ = self.actor_encoder(obs, train_mask=train_mask)
             params = self.policy_net(lstm_out_pi, actions=None)
 
             # Create the Beta distribution
@@ -1539,8 +1449,7 @@ class RecurrentCQLSAC(_RecurrentBase):
             # We pass u_sampled (normalized action) to the critics, as they expect.
             # We do *not* detach gradients here, as we need them to flow through Q into u_sampled
             with torch.no_grad():
-                lstm_out_q, _ = self.shared_critic_encoder(obs, padding_mask=padding_mask, train_mask=None,
-                                                           lengths=lengths)
+                lstm_out_q, _ = self.shared_critic_encoder(obs, train_mask=None)
                 q1_dataset = self.critic_net1(lstm_out_q, actions=acts)
                 q2_dataset = self.critic_net2(lstm_out_q, actions=acts)
                 q_values = torch.min(q1_dataset, q2_dataset)
