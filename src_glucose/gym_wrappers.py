@@ -8,6 +8,8 @@ from gymnasium.wrappers import NormalizeReward
 from minigrid.wrappers import Wrapper
 from gymnasium.envs.registration import register
 import random
+from importlib.resources import files
+import polars as pl
 
 SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 24  # 24 * 10 minutes = 240 minutes
@@ -79,32 +81,111 @@ class T1DPatientEnv(Wrapper):
 
     def __init__(self, patient_ids: Iterable[int] = range(1, 31), **kwargs):
         self.kwargs = kwargs
+
+        # Ensure _id_choices is a list for consistent indexing
         if not isinstance(patient_ids, Iterable):
             patient_ids = [patient_ids]
 
         self._id_choices = patient_ids
 
-        # Pick a random patient at initialization
-        id_choice = np.random.choice(self._id_choices)
+        self._step_counts = {pid: 1 for pid in self._id_choices}
+        self._current_id = None
+        id_choice = self._get_next_patient_id()
+        self._current_id = id_choice  # Set the current ID
+
         identity = f"simglucose/{id_choice}-v0"
         env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
 
+    def _get_next_patient_id(self) -> int:
+        """
+        Helper method to select the next patient ID.
+
+        Selects a patient with probability inversely proportional
+        to the number of steps that patient has already taken.
+        """
+        # Get the current counts for all available patient IDs
+        counts = np.array([self._step_counts[pid] for pid in self._id_choices])
+        weights = 1.0 / counts
+        # Normalize the weights to create a probability distribution
+        probabilities = weights / np.sum(weights)
+
+        # Sample a patient ID using the calculated probabilities
+        id_choice = np.random.choice(self._id_choices, p=probabilities)
+        return int(id_choice)
+
     def reset(self, **kwargs):
         # Rebuild env each reset
         self.env.close()  # cleanup
-        id_choice = np.random.choice(self._id_choices)
+
+        id_choice = self._get_next_patient_id()
+        self._current_id = id_choice
+
         identity = f"simglucose/{id_choice}-v0"
         self.env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
 
     def step(self, action):
+        if self._current_id is not None:
+            self._step_counts[self._current_id] += 1
+
+        # Perform the step in the underlying environment
         return self.env.step(action)
 
     def get_time(self):
         time = self.unwrapped.env.env.time
         hour_float = (time.day - 1) * 24 + time.hour + time.minute / 60.0
         return hour_float
+
+
+class AddPatientState(Wrapper):
+
+    def __init__(self, env, **kwargs):
+        super().__init__(env)
+
+        # Load patient parameters for normalisation
+        csv_path = files('simglucose').joinpath('params/vpatient_params.csv')
+        with files('simglucose').joinpath('params/vpatient_params.csv').open('r', encoding='utf-8') as f:
+            df = pl.read_csv(f)
+
+        self.keys = [
+            'x0_ 4', 'x0_ 5', 'x0_ 6', 'x0_ 8', 'x0_ 9', 'x0_10', 'x0_11', 'x0_12', 'x0_13', 'BW', 'EGPb', 'Gb',
+            'Ib', 'kabs', 'kmax', 'kmin', 'b', 'd', 'Vg', 'Vi', 'Ipb', 'Vmx', 'Km0', 'k2', 'k1', 'p2u', 'm1', 'm5',
+            'CL', 'm2', 'm4', 'm30', 'Ilb', 'ki', 'kp2', 'kp3', 'Gpb', 'ke1', 'ke2', 'Gtb', 'Vm0', 'Rdb', 'PCRb', 'kd',
+            'ksc', 'ka1', 'ka2', 'dosekempt', 'u2ss', 'isc1ss', 'isc2ss', 'kp1'
+        ]
+
+        self.normalise_factor = df[self.keys].max().to_numpy()
+        self.patient_state = None
+
+        # Update observation space
+        patient_state_size = len(self.keys)
+        low, high = env.observation_space.low, env.observation_space.high
+        self.state_dim = (low.shape[0] + patient_state_size,)
+        self.dtype = low.dtype
+
+        low = np.concatenate([low, [0 for _ in range(patient_state_size)]])
+        high = np.concatenate([high, [np.inf for _ in range(patient_state_size)]])
+
+        self.observation_space = spaces.Box(
+            low=low, high=high, shape=self.state_dim, dtype=self.dtype
+        )
+
+    def _get_params(self):
+        params = np.stack(self.env.unwrapped.env.env.patient._params[self.keys])
+        return params.squeeze() / self.normalise_factor.squeeze()
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.patient_state = self._get_params()
+        obs = np.concatenate([obs, self.patient_state], axis=-1)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.patient_state = self._get_params()
+        obs = np.concatenate([obs, self.patient_state], axis=-1)
+        return obs, reward, terminated, truncated, info
 
 
 class FixedScaler(ObservationWrapper):
@@ -263,8 +344,9 @@ class EnforcePPOWrapper(Wrapper):
 
 
 def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_rewards: bool = False, gamma: float = 1.0,
-                     forced_interval: int = 0, use_scaling: bool = False, **kwargs):
+                     forced_interval: int = 0, use_scaling: bool = False, enforce_ppo_wrapper: bool = False, **kwargs):
     env = T1DPatientEnv(patient_ids=patient_ids, **kwargs)
+    env = AddPatientState(env)
     env = SampleTimeWrapper(env)
     if use_scaling:
         env = NormalizeReward(env, gamma=gamma)
@@ -273,4 +355,6 @@ def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_re
     env = FixedScaler(env)
     env = AlternateStepWrapper(env, forced_interval=forced_interval)
     env = RepeatFlagChannel(env)
+    if enforce_ppo_wrapper:
+        env = EnforcePPOWrapper(env, gamma=gamma)
     return env

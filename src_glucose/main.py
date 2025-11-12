@@ -52,14 +52,16 @@ if __name__ == "__main__":
 
     if train_ppo:
         print(f'\n\n====== Training PPO ======\n\n')
-        base_env = make_glucose_env(use_scaling=True, patient_ids=TRAIN_IDS)
-        base_env = EnforcePPOWrapper(base_env, gamma=GAMMA)
+        train_env_creator_fn = partial(make_glucose_env, use_scaling=True, enforce_ppo_wrapper=True)
+        eval_env_creator_fn = make_glucose_env
 
         # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
-        agent = RecurrentPPO(base_env, env_creator_fn=make_glucose_env,
+        agent = RecurrentPPO(train_env_creator_fn=train_env_creator_fn,
+                             eval_env_creator_fn=eval_env_creator_fn,
                              eval_envs_per_id=1,
                              gamma=GAMMA,
-                             test_ids=TRAIN_IDS,
+                             train_ids=TRAIN_IDS,
+                             test_ids=VAL_IDS,
                              n_steps=1024,  # More data per update
                              entropy_coef=0.01,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
@@ -80,9 +82,11 @@ if __name__ == "__main__":
             ppo_agent = choose_ppo_agent()
         ppo_agent = f'../logs_glucose/ppo_logs/{ppo_agent}'
         assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
-        ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, make_glucose_env(),
-                                                 env_creator_fn=make_glucose_env,
-                                                 test_ids=TEST_IDS)
+        dummy_args = {'train_env_creator_fn': make_glucose_env,
+                      'eval_env_creator_fn': make_glucose_env,
+                      'train_ids': TRAIN_IDS,
+                      'test_ids': TEST_IDS}
+        ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **dummy_args)
 
         # --- Set up our offline training ---
         EXPECTILE = args.expectile

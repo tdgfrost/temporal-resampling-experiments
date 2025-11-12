@@ -10,7 +10,11 @@ from gymnasium.vector import AsyncVectorEnv
 from torch.distributions import Beta
 from functools import partial
 import random
+from tqdm import tqdm
 from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, MASTER_SEED
+
+
+LSTM_LAYERS = 1
 
 
 def set_seed(seed: int):
@@ -201,8 +205,7 @@ class EncoderActorCriticLSTM(nn.Module):
         self.encoder = encoder
 
         # The LSTM now takes the output of the encoder as its input
-        # - num layers in LSTM MUST be left as 1.
-        self.lstm = nn.LSTM(encoder_output_dim, hidden_dim, batch_first=True)
+        self.lstm = nn.LSTM(encoder_output_dim, hidden_dim, batch_first=True, num_layers=LSTM_LAYERS)
         self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
@@ -275,11 +278,11 @@ class EncoderActorCriticLSTM(nn.Module):
         return log_probs.squeeze()
 
     def init_hidden_state(self, batch_size=1):
-        return torch.zeros(1, batch_size, self.hidden_dim), torch.zeros(1, batch_size, self.hidden_dim)
+        return torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim), torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim)
 
 
 class RecurrentPPO:
-    def __init__(self, train_env, env_creator_fn, test_ids, hidden_dim=128, learning_rate=3e-4, gamma=0.99,
+    def __init__(self, train_env_creator_fn, eval_env_creator_fn, train_ids, test_ids, hidden_dim=128, learning_rate=3e-4, gamma=0.99,
                  eval_envs_per_id: int = 1, gae_lambda=0.95, entropy_coef=0.01, vf_coef=0.5,
                  clip_range=0.2, seed=None, batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000,
                  eval_episodes=500, log_dir="../logs_glucose/ppo_logs"):
@@ -289,21 +292,24 @@ class RecurrentPPO:
             self.set_random_seed(seed)
 
         # Save the patient IDs and env_creator functions
+        self.train_ids = train_ids
         self.test_ids = test_ids
 
         self.eval_envs_per_id = eval_envs_per_id
         self.n_eval_envs = len(self.test_ids) * eval_envs_per_id
 
-        self.eval_env_creator_fn = partial(env_creator_fn, gamma=gamma)
+        self.train_env_creator_fn = partial(train_env_creator_fn, gamma=gamma)
+        self.eval_env_creator_fn = partial(eval_env_creator_fn, gamma=gamma)
+
+        self.train_env = train_env_creator_fn(patient_ids=self.train_ids)
 
         # Save our env parameters
-        assert isinstance(train_env.action_space, gym.spaces.Box), "Continuous action spaces only."
+        assert isinstance(self.train_env.action_space, gym.spaces.Box), "Continuous action spaces only."
 
-        self.train_env = train_env
-        self.input_dim = train_env.observation_space.shape[-1]
-        self.action_dim = train_env.action_space.shape[0]
-        self.action_scale = torch.FloatTensor((train_env.action_space.high - train_env.action_space.low) / 2.)
-        self.action_bias = torch.FloatTensor((train_env.action_space.high + train_env.action_space.low) / 2.)
+        self.input_dim = self.train_env.observation_space.shape[-1]
+        self.action_dim = self.train_env.action_space.shape[0]
+        self.action_scale = torch.FloatTensor((self.train_env.action_space.high - self.train_env.action_space.low) / 2.)
+        self.action_bias = torch.FloatTensor((self.train_env.action_space.high + self.train_env.action_space.low) / 2.)
         self.hidden_dim = hidden_dim
 
         # Create our vectorised evaluation environments
@@ -597,10 +603,10 @@ class RecurrentPPO:
             ep_rewards_this_rollout = []
             ep_lengths_this_rollout = []
 
-            for _ in range(self.n_steps):
+            for _ in tqdm(range(self.n_steps), mininterval=2, leave=False):
                 h_x, c_x = hidden_state
-                rollout_h_states.append(h_x.detach().squeeze())
-                rollout_c_states.append(c_x.detach().squeeze())
+                rollout_h_states.append(h_x.detach().squeeze(1))
+                rollout_c_states.append(c_x.detach().squeeze(1))
                 with torch.no_grad():
                     dist, value, hidden_state = self.ac_network(obs_tensor, hidden_state)
 
@@ -666,8 +672,8 @@ class RecurrentPPO:
                     batch_log_probs = flat_log_probs[batch_indices]
                     batch_advantages = flat_advantages[batch_indices]
                     batch_returns = flat_returns[batch_indices]
-                    batch_h_state = flat_h_states[batch_indices].unsqueeze(0)
-                    batch_c_state = flat_c_states[batch_indices].unsqueeze(0)
+                    batch_h_state = flat_h_states[batch_indices].transpose(0, 1)
+                    batch_c_state = flat_c_states[batch_indices].transpose(0, 1)
 
                     # Pack the observation sequences
                     lengths = torch.LongTensor([len(o) for o in batch_obs_seqs])
