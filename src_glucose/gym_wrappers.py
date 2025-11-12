@@ -28,7 +28,7 @@ MASTER_SEED = 123
 # Get all our patients
 patient_id_counter = 1
 for i in range(1, 11):
-    for group in ['adult', 'adolescent', 'child']:
+    for group in ['adult', 'adolescent']: #, 'child']:
         register(
             id=f"simglucose/{patient_id_counter}-v0",
             entry_point="simglucose.envs:T1DSimGymnaisumEnv",
@@ -136,6 +136,17 @@ class T1DPatientEnv(Wrapper):
         time = self.unwrapped.env.env.time
         hour_float = (time.day - 1) * 24 + time.hour + time.minute / 60.0
         return hour_float
+
+
+class ManualRewardScaler(Wrapper):
+    def __init__(self, env, scale: float = 1.0):
+        super().__init__(env)
+        self.scale = scale
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        reward /= self.scale
+        return obs, reward, terminated, truncated, info
 
 
 class AddPatientState(Wrapper):
@@ -309,20 +320,36 @@ class EnforcePPOWrapper(Wrapper):
     'bonus' steps using the same action.
     """
 
-    def __init__(self, env: gym.Env, gamma: float = 0.99) -> None:
+    def __init__(self, env: gym.Env, n_envs: int = 8, gamma: float = 0.99) -> None:
         Wrapper.__init__(self, env)
         self._gamma = gamma
+        # Get underlying shape and dtype
+        underlying_shape = env.observation_space.shape
+        underlying_dtype = env.observation_space.dtype
+
+        new_shape = (TOTAL_SIZE,) + underlying_shape
+
+        # Create new low/high bounds for the stacked shape
+        low = np.repeat(env.observation_space.low[np.newaxis], TOTAL_SIZE, axis=0)
+        high = np.repeat(env.observation_space.high[np.newaxis], TOTAL_SIZE, axis=0)
+
+        # Define our new observation space
         self.observation_space = gym.spaces.Box(
-            low=env.observation_space.low[np.newaxis],
-            high=env.observation_space.high[np.newaxis],
-            shape=(1,) + env.observation_space.shape,
-            dtype=env.observation_space.dtype
+            low=low,
+            high=high,
+            shape=new_shape,
+            dtype=underlying_dtype
         )
 
     def reset(self, *args, **kwargs) -> np.ndarray:
         obs, info = self.env.reset(*args, **kwargs)
         info['steps_taken'] = 1
-        return np.expand_dims(obs, 0), info
+
+        # Pad the single observation to match the new space
+        obs_expanded = np.expand_dims(obs, 0)
+        pad_amount = TOTAL_SIZE - 1
+        padded_obs = np.pad(obs_expanded, ((0, pad_amount), (0, 0)), "constant")
+        return padded_obs, info
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs, reward, term, trunc, info = self.env.step(action)
@@ -340,21 +367,26 @@ class EnforcePPOWrapper(Wrapper):
 
         obs = np.stack(obs_lst, axis=0)
 
-        return obs, reward, term, trunc, info
+        # Pad obs to max length
+        pad_amount = TOTAL_SIZE - obs.shape[0]
+        padded_obs = np.pad(obs, ((0, pad_amount), (0, 0)), 'constant')
+
+        return padded_obs, reward, term, trunc, info
 
 
 def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_rewards: bool = False, gamma: float = 1.0,
-                     forced_interval: int = 0, use_scaling: bool = False, enforce_ppo_wrapper: bool = False, **kwargs):
+                     forced_interval: int = 0, use_scaling: bool = False, enforce_ppo_wrapper: bool = False,
+                     n_envs: int = 1, **kwargs):
     env = T1DPatientEnv(patient_ids=patient_ids, **kwargs)
     env = AddPatientState(env)
     env = SampleTimeWrapper(env)
     if use_scaling:
-        env = NormalizeReward(env, gamma=gamma)
+        env = ManualRewardScaler(env, scale=100)
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
     env = FixedScaler(env)
     env = AlternateStepWrapper(env, forced_interval=forced_interval)
     env = RepeatFlagChannel(env)
     if enforce_ppo_wrapper:
-        env = EnforcePPOWrapper(env, gamma=gamma)
+        env = EnforcePPOWrapper(env, n_envs=n_envs, gamma=gamma)
     return env

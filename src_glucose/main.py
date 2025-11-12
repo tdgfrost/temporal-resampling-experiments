@@ -27,9 +27,9 @@ GAMMA = 0.99
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Train ids for PPO training and dataset generation
-TRAIN_IDS = [i for i in range(1, 19)]
-VAL_IDS = [i for i in range(19, 25)]
-TEST_IDS = [i for i in range(25, 31)]
+TRAIN_IDS = [i for i in range(1, 9)]  # range(1, 19)]
+VAL_IDS = [i for i in range(9, 15)]  # range(19, 25)]
+TEST_IDS = [i for i in range(15, 21)]  # range(25, 31)]
 
 torch.set_float32_matmul_precision('high')
 
@@ -58,22 +58,23 @@ if __name__ == "__main__":
         # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
         agent = RecurrentPPO(train_env_creator_fn=train_env_creator_fn,
                              eval_env_creator_fn=eval_env_creator_fn,
+                             train_envs_per_id=1,
                              eval_envs_per_id=1,
                              gamma=GAMMA,
                              train_ids=TRAIN_IDS,
                              test_ids=VAL_IDS,
                              n_steps=1024,  # More data per update
-                             entropy_coef=0.01,  # Too high = too unstable
+                             entropy_coef=0.02,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
                              batch_size=256,
                              gae_lambda=0.95,
                              n_epochs=10,  # Fewer epochs
-                             hidden_dim=128,
+                             hidden_dim=256,
                              seed=MASTER_SEED,
-                             learning_rate=3e-4,  # Standard learning rate
-                             eval_freq=50_000,
+                             learning_rate=5e-5,  # Standard learning rate
+                             eval_freq=100_000 * len(TRAIN_IDS),
                              eval_episodes=500)
-        agent.fit(total_timesteps=10_000_000)
+        agent.fit(total_timesteps=100_000_000)
 
     if train_offline:
         # --- Load our pre-trained PPO agent ----

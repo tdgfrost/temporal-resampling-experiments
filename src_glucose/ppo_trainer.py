@@ -215,7 +215,7 @@ class EncoderActorCriticLSTM(nn.Module):
             high=INSULIN_ACTION_HIGH,
         )
 
-    def forward_lstm(self, x, hidden_state=None):
+    def forward_lstm(self, x, hidden_state=None, unsorted_indices=None):
         # Need to use packed sequence for PPO because c_n must be accurate (as it gets re-used with each new step)
         # - doesn't apply for offline learning because we never need to re-use hidden states.
         is_packed = isinstance(x, PackedSequence)
@@ -237,18 +237,32 @@ class EncoderActorCriticLSTM(nn.Module):
 
         lstm_out, new_hidden = self.lstm(lstm_input, hidden_state)
 
-        return lstm_out, new_hidden, is_packed
-
-    def forward(self, x, hidden_state=None, deterministic=False):
-        lstm_out, new_hidden, is_packed = self.forward_lstm(x, hidden_state)
-
         if is_packed:
-            lstm_out, lengths = pad_packed_sequence(lstm_out, batch_first=True)
+            sorted_lstm_out, sorted_lengths = pad_packed_sequence(lstm_out, batch_first=True)
+
+            # Unsort to match the original input order
+            unsorted_indices = x.unsorted_indices if x.unsorted_indices is not None else unsorted_indices
+            lstm_out = sorted_lstm_out.index_select(dim=0, index=unsorted_indices)
+            lengths = sorted_lengths.index_select(dim=0, index=unsorted_indices)
+
+            new_hidden = (new_hidden[0].index_select(dim=1, index=unsorted_indices),
+                          new_hidden[1].index_select(dim=1, index=unsorted_indices))
+
+            # Get the last outputs
             batch_size = lstm_out.size(0)
             last_step_indices = lengths.long() - 1
             last_outputs = lstm_out[torch.arange(batch_size), last_step_indices, :]
+
         else:
+            assert LSTM_LAYERS == 1, "Check whether this code is correct if num_layers > 1"
             last_outputs = lstm_out[:, -1, :]
+
+        return lstm_out, last_outputs, new_hidden
+
+    def forward(self, x, hidden_state=None, deterministic=False, unsorted_indices=None):
+        lstm_out, last_outputs, new_hidden = self.forward_lstm(
+            x, hidden_state=hidden_state, unsorted_indices=unsorted_indices
+        )
 
         value = self.critic_head(last_outputs)
         actor_out = self.actor_head(last_outputs)
@@ -265,27 +279,15 @@ class EncoderActorCriticLSTM(nn.Module):
 
         return dist, value, new_hidden
 
-    def evaluate_actions(self, obs, actions, hidden_state=None):
-        assert obs.ndim == 2 or (obs.ndim == 3 and obs.shape[0] == 1), \
-            "Observations must be 2D or 3D with batch size 1."
-
-        lstm_out, new_hidden, _ = self.forward_lstm(obs, hidden_state)
-        actor_out = self.actor_head(lstm_out)
-
-        dist = self.dist.proba_distribution(actor_out)
-        log_probs = dist.log_prob(actions.view(-1, self.action_dim))
-
-        return log_probs.squeeze()
-
     def init_hidden_state(self, batch_size=1):
         return torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim), torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim)
 
 
 class RecurrentPPO:
-    def __init__(self, train_env_creator_fn, eval_env_creator_fn, train_ids, test_ids, hidden_dim=128, learning_rate=3e-4, gamma=0.99,
-                 eval_envs_per_id: int = 1, gae_lambda=0.95, entropy_coef=0.01, vf_coef=0.5,
-                 clip_range=0.2, seed=None, batch_size=64, n_steps=2048, n_epochs=10, eval_freq=10000,
-                 eval_episodes=500, log_dir="../logs_glucose/ppo_logs"):
+    def __init__(self, train_env_creator_fn, eval_env_creator_fn, train_ids, test_ids, hidden_dim=128,
+                 learning_rate=3e-4, gamma=0.99, train_envs_per_id: int = 1, eval_envs_per_id: int = 1,
+                 gae_lambda=0.95, entropy_coef=0.01, vf_coef=0.5, clip_range=0.2, seed=None, batch_size=64,
+                 n_steps=2048, n_epochs=10, eval_freq=10000, eval_episodes=500, log_dir="../logs_glucose/ppo_logs"):
         # Set the seed
         self.seed = seed
         if seed is not None:
@@ -295,24 +297,29 @@ class RecurrentPPO:
         self.train_ids = train_ids
         self.test_ids = test_ids
 
+        self.train_envs_per_id = train_envs_per_id
         self.eval_envs_per_id = eval_envs_per_id
+        self.n_train_envs = len(self.train_ids) * train_envs_per_id
         self.n_eval_envs = len(self.test_ids) * eval_envs_per_id
 
-        self.train_env_creator_fn = partial(train_env_creator_fn, gamma=gamma)
+        self.train_env_creator_fn = partial(train_env_creator_fn, n_envs=self.n_train_envs, gamma=gamma)
         self.eval_env_creator_fn = partial(eval_env_creator_fn, gamma=gamma)
 
-        self.train_env = train_env_creator_fn(patient_ids=self.train_ids)
+        dummy_env = train_env_creator_fn(patient_ids=self.train_ids)
 
         # Save our env parameters
-        assert isinstance(self.train_env.action_space, gym.spaces.Box), "Continuous action spaces only."
+        assert isinstance(dummy_env.action_space, gym.spaces.Box), "Continuous action spaces only."
 
-        self.input_dim = self.train_env.observation_space.shape[-1]
-        self.action_dim = self.train_env.action_space.shape[0]
-        self.action_scale = torch.FloatTensor((self.train_env.action_space.high - self.train_env.action_space.low) / 2.)
-        self.action_bias = torch.FloatTensor((self.train_env.action_space.high + self.train_env.action_space.low) / 2.)
+        self.input_dim = dummy_env.observation_space.shape[-1]
+        self.action_dim = dummy_env.action_space.shape[0]
+        self.action_scale = torch.FloatTensor((dummy_env.action_space.high - dummy_env.action_space.low) / 2.)
+        self.action_bias = torch.FloatTensor((dummy_env.action_space.high + dummy_env.action_space.low) / 2.)
         self.hidden_dim = hidden_dim
 
-        # Create our vectorised evaluation environments
+        # Create our vectorised environments
+        self.train_env, self.train_env_id_map = self._build_parallel_env(self.train_env_creator_fn,
+                                                                         self.train_ids,
+                                                                         self.train_envs_per_id)
         self.eval_env, self.eval_env_id_map = self._build_parallel_env(self.eval_env_creator_fn,
                                                                        self.test_ids,
                                                                        self.eval_envs_per_id)
@@ -332,6 +339,7 @@ class RecurrentPPO:
         self.log_dir = log_dir
         self.last_obs_tensor = None
         self.last_hidden_state = None
+        self.last_unsorted_idx = None
 
         self._num_timesteps = 0
         self.best_mean_reward = -np.inf
@@ -348,7 +356,12 @@ class RecurrentPPO:
             hidden_dim=self.hidden_dim,
             action_dim=self.action_dim,
         )
-        self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
+        actor_params = (list(self.ac_network.lstm.parameters())
+                        + list(self.ac_network.actor_head.parameters())
+                        + list(self.ac_network.encoder.parameters()))
+        critic_params = list(self.ac_network.critic_head.parameters())
+        self.actor_optimizer = optim.Adam(actor_params, lr=self.learning_rate)
+        self.critic_optimizer = optim.Adam(critic_params, lr=self.learning_rate * 10)
 
     def __call__(self, obs, deterministic=True, *args, **kwargs):
         action, lstm_states = self.predict(obs, deterministic=deterministic, *args, **kwargs)
@@ -382,7 +395,8 @@ class RecurrentPPO:
         """Saves the model and optimizer state."""
         checkpoint = {
             'ac_network_state_dict': self.ac_network.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'num_timesteps': self._num_timesteps,
             'best_mean_reward': self.best_mean_reward,
             'mean_ep_length': self.mean_ep_length,
@@ -428,10 +442,18 @@ class RecurrentPPO:
         with torch.no_grad():
             if deterministic:
                 # Use the mode for deterministic prediction
-                action, _, new_hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=True)
+                action, _, new_hidden_state = self.ac_network(
+                    obs_tensor,
+                    hidden_state=hidden_state,
+                    deterministic=True
+                )
             else:
                 # Sample for stochastic action
-                dist, _, new_hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
+                dist, _, new_hidden_state = self.ac_network(
+                    obs_tensor,
+                    hidden_state=hidden_state,
+                    deterministic=False
+                )
                 action = dist.sample()
 
         # The environment expects a flattened numpy array
@@ -440,13 +462,17 @@ class RecurrentPPO:
 
     def _compute_advantages_and_returns(self, rewards, values, dones, steps_taken):
         n_steps = len(rewards)
-        advantages = np.zeros(n_steps, dtype=np.float32)
-        last_advantage = 0
+        advantages = np.zeros((n_steps, self.n_train_envs), dtype=np.float32)
+        last_advantage = np.zeros(self.n_train_envs, dtype=np.float32)
 
         with torch.no_grad():
-            _, last_value, _ = self.ac_network(self.last_obs_tensor, self.last_hidden_state)
+            _, last_value, _ = self.ac_network(
+                self.last_obs_tensor,
+                hidden_state=self.last_hidden_state,
+                unsorted_indices=self.last_unsorted_idx
+            )
 
-        last_value = last_value.item()
+        last_value = last_value.squeeze().numpy()
 
         for t in reversed(range(n_steps)):
             mask = 1.0 - dones[t]
@@ -456,7 +482,7 @@ class RecurrentPPO:
             advantages[t] = last_advantage
             last_value = values[t]
 
-        returns = advantages + values
+        returns = advantages + np.stack(values)
         return advantages, returns
 
     def _evaluate_policy(self, n_eval_episodes=None, env_creator_fn=None, test_ids=None):
@@ -522,7 +548,11 @@ class RecurrentPPO:
             obs_tensor = torch.FloatTensor(obs).unsqueeze(1)
             with torch.no_grad():
                 # Use stochastic actions for evaluation
-                dist, _, hidden_state = self.ac_network(obs_tensor, hidden_state, deterministic=False)
+                dist, _, hidden_state = self.ac_network(
+                    obs_tensor,
+                    hidden_state=hidden_state,
+                    deterministic=False
+                )
                 action_env = dist.last_sampled_action
 
             obs, reward, term, trunc, _ = eval_env.step(action_env.numpy())
@@ -575,14 +605,20 @@ class RecurrentPPO:
     def fit(self, total_timesteps):
         # Set up our initial obs
         if self.seed is not None:
-            obs, _ = self.train_env.reset(seed=self.seed)
+            rng = np.random.default_rng(self.seed)
+            train_seeds = rng.integers(low=0, high=2 ** 32 - 1, size=self.n_train_envs).tolist()
+            obs, info = self.train_env.reset(seed=train_seeds)
         else:
-            obs, _ = self.train_env.reset()
+            obs, info = self.train_env.reset()
 
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
+        # Pack the padded initial obs
+        obs_tensor = torch.from_numpy(obs)
+        packed_obs_tensor, sorted_idx, unsorted_idx = pack_obs(obs_tensor, info['steps_taken'])
 
-        # Get our initial hidden state
-        hidden_state = self.get_initial_states(batch_size=1)
+        # Get our initial hidden state and sort (for best practice)
+        hidden_state = (h_x, c_x) = self.get_initial_states(batch_size=self.n_train_envs)
+        sorted_hidden = (h_x.index_select(dim=1, index=sorted_idx),
+                         c_x.index_select(dim=1, index=sorted_idx))
 
         # Define our training/eval epoch parameters
         start_timesteps = self._num_timesteps
@@ -598,66 +634,78 @@ class RecurrentPPO:
             rollout_h_states, rollout_c_states = [], []
             rollout_steps_taken = []
 
-            current_episode_reward = 0
-            current_episode_length = 0
+            current_episode_reward = np.zeros(self.n_train_envs)
+            current_episode_length = np.zeros(self.n_train_envs)
             ep_rewards_this_rollout = []
             ep_lengths_this_rollout = []
 
             for _ in tqdm(range(self.n_steps), mininterval=2, leave=False):
-                h_x, c_x = hidden_state
-                rollout_h_states.append(h_x.detach().squeeze(1))
-                rollout_c_states.append(c_x.detach().squeeze(1))
+                rollout_h_states.append(h_x.detach())
+                rollout_c_states.append(c_x.detach())
+
                 with torch.no_grad():
-                    dist, value, hidden_state = self.ac_network(obs_tensor, hidden_state)
+                    dist, value, hidden_state = self.ac_network(
+                        packed_obs_tensor,
+                        hidden_state=sorted_hidden,
+                        unsorted_indices=unsorted_idx
+                    )
 
                 sampled_actions = dist.last_sampled_action
-                sampled_actions_np = sampled_actions.numpy().flatten()
+                sampled_actions_np = sampled_actions.numpy()
                 log_prob = dist.log_prob(sampled_actions)
 
                 new_obs, reward, term, trunc, info = self.train_env.step(sampled_actions_np)
-                done = term or trunc
+                done = term | trunc
                 steps_taken = info.get('steps_taken', 1)
 
-                self._num_timesteps += steps_taken
+                self._num_timesteps += sum(steps_taken)
 
                 current_episode_reward += reward
                 current_episode_length += steps_taken
 
                 # Store rollout data
-                rollout_obs.append(obs)
+                rollout_obs.append(obs_tensor)
                 rollout_actions.append(sampled_actions_np)
                 rollout_rewards.append(reward)
                 rollout_dones.append(done)
-                rollout_log_probs.append(log_prob.item())
-                rollout_values.append(value.item())
+                rollout_log_probs.append(log_prob.squeeze().numpy())
+                rollout_values.append(value.squeeze().numpy())
                 rollout_steps_taken.append(steps_taken)
 
                 obs = new_obs
-                obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
-                if done:
-                    ep_rewards_this_rollout.append(current_episode_reward)
-                    ep_lengths_this_rollout.append(current_episode_length)
-                    current_episode_reward = 0
-                    current_episode_length = 0
-                    obs, _ = self.train_env.reset()
-                    hidden_state = self.ac_network.init_hidden_state()
+                if done.any():
+                    ep_rewards_this_rollout += current_episode_reward[done].tolist()
+                    ep_lengths_this_rollout += current_episode_length[done].tolist()
+                    current_episode_reward[done] *= 0
+                    current_episode_length[done] *= 0
+                    hidden_state[0][:, done] *= 0
+                    hidden_state[1][:, done] *= 0
 
-            self.last_obs_tensor = obs_tensor
-            self.last_hidden_state = hidden_state
+                obs_tensor = torch.from_numpy(obs)
+                packed_obs_tensor, sorted_idx, unsorted_idx = pack_obs(obs_tensor, steps_taken)
+                (h_x, c_x) = hidden_state
+                sorted_hidden = (h_x.index_select(dim=1, index=sorted_idx),
+                                 c_x.index_select(dim=1, index=sorted_idx))
+
+            self.last_obs_tensor = packed_obs_tensor
+            self.last_hidden_state = sorted_hidden
+            self.last_unsorted_idx = unsorted_idx
 
             advantages, returns = self._compute_advantages_and_returns(rollout_rewards, rollout_values, rollout_dones,
                                                                        rollout_steps_taken)
 
             # *** KEY CHANGE: NORMALIZE ADVANTAGES ***
-            advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
+            advantages = (advantages - advantages.mean(0)) / (advantages.std(0) + 1e-8)
 
-            flat_advantages = torch.from_numpy(advantages).float()
-            flat_returns = torch.from_numpy(returns).float()
-            flat_actions = torch.from_numpy(np.array(rollout_actions)).float()
-            flat_log_probs = torch.from_numpy(np.array(rollout_log_probs)).float()
-            flat_h_states = torch.stack(rollout_h_states)
-            flat_c_states = torch.stack(rollout_c_states)
-            total_transitions = self.n_steps
+            flat_rollout_obs = torch.concatenate(rollout_obs)
+            flat_obs_lengths = np.concatenate(rollout_steps_taken)
+            flat_advantages = torch.from_numpy(advantages).flatten()
+            flat_returns = torch.from_numpy(returns).flatten()
+            flat_actions = torch.from_numpy(np.concatenate(rollout_actions))
+            flat_log_probs = torch.from_numpy(np.concatenate(rollout_log_probs))
+            flat_h_states = torch.concatenate(rollout_h_states, 1)
+            flat_c_states = torch.concatenate(rollout_c_states, 1)
+            total_transitions = self.n_steps * self.n_train_envs
 
             policy_losses, value_losses, entropy_losses, approx_kls = [], [], [], []
             for _ in range(self.n_epochs):
@@ -667,46 +715,41 @@ class RecurrentPPO:
                     end = start + self.batch_size
                     # Get our batch data
                     batch_indices = indices[start:end]
-                    batch_obs_seqs = [rollout_obs[i] for i in batch_indices]
+                    batch_obs_seqs = flat_rollout_obs[batch_indices]
+                    batch_obs_lengths = flat_obs_lengths[batch_indices]
                     batch_actions = flat_actions[batch_indices]
                     batch_log_probs = flat_log_probs[batch_indices]
                     batch_advantages = flat_advantages[batch_indices]
                     batch_returns = flat_returns[batch_indices]
-                    batch_h_state = flat_h_states[batch_indices].transpose(0, 1)
-                    batch_c_state = flat_c_states[batch_indices].transpose(0, 1)
+                    batch_h_state = flat_h_states[:, batch_indices]
+                    batch_c_state = flat_c_states[:, batch_indices]
 
                     # Pack the observation sequences
-                    lengths = torch.LongTensor([len(o) for o in batch_obs_seqs])
-                    sorted_lengths, sorted_idx = lengths.sort(descending=True)
-                    padded_obs = pad_sequence(
-                        [torch.from_numpy(batch_obs_seqs[i]).float() for i in sorted_idx], batch_first=True)
-                    packed_obs = pack_padded_sequence(padded_obs, sorted_lengths, batch_first=True, enforce_sorted=True)
-
-                    # Sort the rest of the batch according to the packed lengths
-                    sorted_actions = batch_actions[sorted_idx]
-                    sorted_log_probs = batch_log_probs[sorted_idx]
-                    sorted_advantages = batch_advantages[sorted_idx]
-                    sorted_returns = batch_returns[sorted_idx]
-                    sorted_h_state = batch_h_state[:, sorted_idx, :]
-                    sorted_c_state = batch_c_state[:, sorted_idx, :]
+                    packed_obs, batch_sorted_idx, batch_unsorted_idx = pack_obs(batch_obs_seqs, batch_obs_lengths)
+                    batch_sorted_hn = batch_h_state.index_select(dim=1, index=batch_sorted_idx)
+                    batch_sorted_cn = batch_c_state.index_select(dim=1, index=batch_sorted_idx)
 
                     # Forward pass
-                    new_dist, new_values, _ = self.ac_network(packed_obs, (sorted_h_state, sorted_c_state))
+                    new_dist, new_values, _ = self.ac_network(
+                        packed_obs,
+                        hidden_state=(batch_sorted_hn, batch_sorted_cn),
+                        unsorted_indices=batch_unsorted_idx
+                    )
                     new_values = new_values.squeeze()
-                    new_log_probs = new_dist.log_prob(sorted_actions).squeeze(-1)
+                    new_log_probs = new_dist.log_prob(batch_actions).squeeze(-1)
 
                     # Get PPO ratio and losses
-                    log_ratio = new_log_probs - sorted_log_probs
+                    log_ratio = new_log_probs - batch_log_probs
                     ratio = log_ratio.exp()
-                    surr1 = ratio * sorted_advantages
-                    surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * sorted_advantages
+                    surr1 = ratio * batch_advantages
+                    surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * batch_advantages
                     policy_loss = -torch.min(surr1, surr2).mean()
-                    value_loss = F.mse_loss(new_values, sorted_returns)
+                    value_loss = F.mse_loss(new_values, batch_returns)
                     entropy_loss = -new_dist.entropy().mean()
                     loss = policy_loss + self.vf_coef * value_loss + self.entropy_coef * entropy_loss
 
                     with torch.no_grad():
-                        log_ratio = new_log_probs - sorted_log_probs
+                        log_ratio = new_log_probs - batch_log_probs
                         approx_kl = ((ratio - 1) - log_ratio).mean().item()
 
                     policy_losses.append(policy_loss.item())
@@ -714,10 +757,12 @@ class RecurrentPPO:
                     entropy_losses.append(entropy_loss.item())
                     approx_kls.append(approx_kl)
 
-                    self.optimizer.zero_grad()
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 0.5)
-                    self.optimizer.step()
+                    self.actor_optimizer.step()
+                    self.critic_optimizer.step()
 
             mean_reward = np.mean(ep_rewards_this_rollout) if ep_rewards_this_rollout else np.nan
             mean_ep_length = np.mean(ep_lengths_this_rollout) if ep_lengths_this_rollout else np.nan
@@ -744,3 +789,13 @@ class RecurrentPPO:
 
         self.train_env.close()
         self.eval_env.close()
+
+
+def pack_obs(batch_obs, lengths):
+    if isinstance(lengths, np.ndarray):
+        lengths = torch.from_numpy(lengths).long()
+    lengths_sorted, sorted_idx = lengths.sort(descending=True)
+    unsorted_idx = sorted_idx.argsort()
+    sorted_obs = batch_obs[sorted_idx]
+    packed_obs = pack_padded_sequence(sorted_obs, lengths_sorted, batch_first=True, enforce_sorted=True)
+    return packed_obs, sorted_idx, unsorted_idx
