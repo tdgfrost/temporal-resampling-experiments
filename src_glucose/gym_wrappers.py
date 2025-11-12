@@ -378,7 +378,7 @@ def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_re
                      forced_interval: int = 0, use_scaling: bool = False, enforce_ppo_wrapper: bool = False,
                      n_envs: int = 1, **kwargs):
     env = T1DPatientEnv(patient_ids=patient_ids, **kwargs)
-    env = AddPatientState(env)
+    # env = AddPatientState(env)
     env = SampleTimeWrapper(env)
     if use_scaling:
         env = ManualRewardScaler(env, scale=100)

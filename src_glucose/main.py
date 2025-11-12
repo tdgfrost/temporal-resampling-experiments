@@ -11,7 +11,7 @@ from utils import *
 from ppo_trainer import *
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
+parser.add_argument('--train_ppo', default=True, type=parse_bool, help='Train PPO agent')
 parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train offline agent')
 
 parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo'],
@@ -64,14 +64,14 @@ if __name__ == "__main__":
                              train_ids=TRAIN_IDS,
                              test_ids=VAL_IDS,
                              n_steps=1024,  # More data per update
-                             entropy_coef=0.02,  # Too high = too unstable
-                             clip_range=0.2,  # Relax the clip range
+                             entropy_coef=0.05,  # Too high = too unstable
+                             clip_range=0.1,  # Relax the clip range
                              batch_size=256,
                              gae_lambda=0.95,
-                             n_epochs=10,  # Fewer epochs
-                             hidden_dim=256,
+                             n_epochs=5,  # Fewer epochs
+                             hidden_dim=64,
                              seed=MASTER_SEED,
-                             learning_rate=5e-5,  # Standard learning rate
+                             learning_rate=1e-4,  # Standard learning rate
                              eval_freq=100_000 * len(TRAIN_IDS),
                              eval_episodes=500)
         agent.fit(total_timesteps=100_000_000)

@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -62,16 +64,21 @@ class FeatureEncoder(nn.Module):
             self,
             input_dim,
             hidden_dim: int = 128,
+            layer_norm_out: bool = True,
+            out_dim: Optional[int] = None,
     ):
         super().__init__()
+
+        out_dim = out_dim or hidden_dim
 
         self.fc = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, out_dim),
         )
+        if layer_norm_out:
+            self.fc.append(nn.LayerNorm(out_dim))
         self.init_weights()
 
     def init_weights(self):
@@ -206,8 +213,19 @@ class EncoderActorCriticLSTM(nn.Module):
 
         # The LSTM now takes the output of the encoder as its input
         self.lstm = nn.LSTM(encoder_output_dim, hidden_dim, batch_first=True, num_layers=LSTM_LAYERS)
-        self.actor_head = nn.Linear(hidden_dim, action_dim * 2)
-        self.critic_head = nn.Linear(hidden_dim, 1)
+
+        self.actor_head = FeatureEncoder(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            out_dim=action_dim * 2,
+            layer_norm_out=False
+        )
+        self.critic_head = FeatureEncoder(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            out_dim=1,
+            layer_norm_out=False
+        )
 
         self.dist = CustomBetaDistribution(
             action_dim,
