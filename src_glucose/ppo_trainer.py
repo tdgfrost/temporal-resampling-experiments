@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence, PackedSequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
+from torch.utils.data import IterableDataset
 import gymnasium as gym
 import numpy as np
 import os
@@ -796,14 +797,14 @@ class RecurrentPPO:
 
             policy_losses, value_losses, entropy_losses, approx_kls = [], [], [], []
 
-            for epoch in range(self.n_epochs):
+            for _ in tqdm(
+                range(self.n_epochs),
+                mininterval=2,
+                leave=False,
+                desc=f"Updating agent..."
+            ):
                 # The sampler shuffles data automatically on each new iteration
-                for i, batch in enumerate(tqdm(
-                        dataloader,
-                        mininterval=2,
-                        leave=False,
-                        desc=f"Updating agent (epoch {epoch + 1}/{self.n_epochs})"
-                )):
+                for i, batch in enumerate(dataloader):
                     # Unpack the batch
                     (
                         obs_batch_cpu,
@@ -867,6 +868,9 @@ class RecurrentPPO:
                     torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 0.5)
                     self.optimizer.step()
 
+            # Move network back to the CPU
+            self.ac_network.to('cpu')
+
             mean_reward = np.mean(ep_rewards_this_rollout) if ep_rewards_this_rollout else np.nan
             mean_ep_length = np.mean(ep_lengths_this_rollout) if ep_lengths_this_rollout else np.nan
             print(
@@ -895,7 +899,7 @@ class RecurrentPPO:
         self.eval_env.close()
 
 
-class LSTMSMDPBatchSampler:
+class LSTMSMDPBatchSampler(IterableDataset):
     """
     A batch sampler for SMDP rollouts for LSTM training.
 
@@ -996,25 +1000,43 @@ class LSTMSMDPBatchSampler:
                     )
 
         self.total_valid_sequences = len(self.valid_sequences)
-
-    def __len__(self):
-        return self.total_valid_sequences // self.num_sequences_per_batch
+        self.sampler_length = self.total_valid_sequences // self.num_sequences_per_batch
 
     def __iter__(self):
         """
-        Create a generator that yields mini-batches.
+        Create a generator that yields mini-batches, compatible with multi-worker loading.
         """
-        # Shuffle all valid starting positions
+
+        # --- 1. Get all possible sequence start indices and shuffle them ---
+        # This is the main list of "work" to be done.
         indices = np.random.permutation(self.total_valid_sequences)
 
+        # --- 2. Determine which batches this worker should process ---
         num_seqs = self.num_sequences_per_batch
+        total_batches = self.total_valid_sequences // num_seqs
 
-        for start_idx in range(0, self.total_valid_sequences, num_seqs):
+        # Get a list of all batch start points in the 'indices' array
+        all_batch_starts = list(range(0, total_batches * num_seqs, num_seqs))
+
+        # Shuffle the *order* of the batches
+        np.random.shuffle(all_batch_starts)
+
+        worker_info = torch.utils.data.get_worker_info()
+
+        if worker_info is None:  # Single-process
+            batches_for_this_worker = all_batch_starts
+        else:  # Multi-process: split the list of batches
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+
+            per_worker = int(np.ceil(total_batches / float(num_workers)))
+            start = worker_id * per_worker
+            end = min(start + per_worker, total_batches)
+            batches_for_this_worker = all_batch_starts[start:end]
+
+        # --- 3. Yield batches assigned to this worker ---
+        for start_idx in batches_for_this_worker:
             end_idx = start_idx + num_seqs
-
-            # Drop the last partial mini-batch
-            if end_idx > self.total_valid_sequences:
-                continue
 
             # Get the (env, step, len) info for this mini-batch
             batch_indices = indices[start_idx:end_idx]
@@ -1025,7 +1047,7 @@ class LSTMSMDPBatchSampler:
             batch_actual_lens = [info[2] for info in seq_info]
 
             # --- 3. Create padded buffers ---
-            # Max possible size is sequence_length * TOTAL_SIZE
+            # (This part is identical to your original __iter__)
             max_sequence_length = self.sequence_length * TOTAL_SIZE
             obs_batch = np.zeros(
                 (max_sequence_length, num_seqs, *self.obs_shape),
@@ -1047,10 +1069,6 @@ class LSTMSMDPBatchSampler:
                 (max_sequence_length, num_seqs, 1),
                 dtype=self.advantages.dtype
             )
-            dones_batch = np.zeros(
-                (max_sequence_length, num_seqs, 1),
-                dtype=self.dones.dtype
-            )
             mask_batch = np.zeros(
                 (max_sequence_length, num_seqs, 1),
                 dtype=bool
@@ -1061,7 +1079,6 @@ class LSTMSMDPBatchSampler:
             )
 
             # --- 4. Fetch initial hidden states (no padding needed) ---
-            # shape: (LSTM_layers, num_seqs, hidden_dim)
             h_starts = np.stack(
                 [self.h_states[n, t] for n, t in zip(batch_env_idxs, batch_start_idxs)],
                 axis=1
@@ -1075,7 +1092,7 @@ class LSTMSMDPBatchSampler:
             for seq_i in range(num_seqs):
                 n, t, L = batch_env_idxs[seq_i], batch_start_idxs[seq_i], batch_actual_lens[seq_i]
 
-                # Copy the data slices into the padded buffers
+                # (This logic is identical to your original __iter__)
                 padded_obs_batch = self.obs[n, t: t + L]
                 unpadded_action_batch = self.actions[n, t: t + L]
                 unpadded_log_probs_batch = self.log_probs[n, t: t + L].reshape(-1, 1)
@@ -1083,7 +1100,6 @@ class LSTMSMDPBatchSampler:
                 unpadded_advantages_batch = self.advantages[n, t: t + L]
                 unpadded_lengths_batch = self.lengths[n, t: t + L]
 
-                # Unpad and flatten the obs accordingly
                 obs_mask = np.arange(TOTAL_SIZE) < unpadded_lengths_batch
                 flattened_obs_batch = padded_obs_batch[obs_mask]
                 obs_real_L = flattened_obs_batch.shape[0]
@@ -1097,9 +1113,8 @@ class LSTMSMDPBatchSampler:
                 mask_batch[pad_mask, seq_i] = True
                 padding_mask_batch[:, seq_i, 0] = np.arange(max_sequence_length) < obs_real_L
 
-            # Yield the data as torch tensors
-            # - transpose from (L, num_seqs, -1) to (num_seqs, L, -1)
-
+            # --- 6. Yield the CPU tensors ---
+            # (This is identical to your original __iter__ post-edit)
             yield (
                 torch.from_numpy(obs_batch).transpose(0, 1),
                 torch.from_numpy(actions_batch).transpose(0, 1),
@@ -1108,8 +1123,8 @@ class LSTMSMDPBatchSampler:
                 torch.from_numpy(advantages_batch).transpose(0, 1),
                 torch.from_numpy(mask_batch).transpose(0, 1),
                 torch.from_numpy(padding_mask_batch).transpose(0, 1),
-                torch.from_numpy(h_starts),  # DON'T transpose the hidden states
-                torch.from_numpy(c_starts),  # DON'T transpose the hidden states
+                torch.from_numpy(h_starts),  # No transpose
+                torch.from_numpy(c_starts),  # No transpose
             )
 
 

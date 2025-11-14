@@ -67,9 +67,9 @@ if __name__ == "__main__":
                              entropy_coef=0.01,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
                              gae_lambda=0.95,
-                             n_epochs=5,  # Fewer epochs
+                             n_epochs=10,  # Fewer epochs
                              hidden_dim=64,
-                             batch_size=512,
+                             batch_size=256,
                              batch_sequence_length=64,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
                              learning_rate=3e-4,  # Standard learning rate
