@@ -1,3 +1,4 @@
+from collections import defaultdict
 from typing import Optional
 
 import torch
@@ -13,8 +14,7 @@ from torch.distributions import Beta
 from functools import partial
 import random
 from tqdm import tqdm
-from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, MASTER_SEED
-
+from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, MASTER_SEED, TOTAL_SIZE
 
 LSTM_LAYERS = 1
 
@@ -83,6 +83,7 @@ class FeatureEncoder(nn.Module):
 
     def init_weights(self):
         """Initializes weights for the network."""
+
         def _init_fn(m: nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
@@ -203,6 +204,7 @@ class EncoderActorCriticLSTM(nn.Module):
     An Actor-Critic network that first encodes observations using a feature extractor
     and then processes the sequence of encoded features with an LSTM.
     """
+
     def __init__(self, encoder: nn.Module, encoder_output_dim: int, hidden_dim: int, action_dim: int):
         super(EncoderActorCriticLSTM, self).__init__()
         self.hidden_dim = hidden_dim
@@ -233,10 +235,11 @@ class EncoderActorCriticLSTM(nn.Module):
             high=INSULIN_ACTION_HIGH,
         )
 
-    def forward_lstm(self, x, hidden_state=None, unsorted_indices=None):
+    def forward_lstm(self, x, hidden_state=None, unsorted_indices=None, padding_mask=None):
         # Need to use packed sequence for PPO because c_n must be accurate (as it gets re-used with each new step)
         # - doesn't apply for offline learning because we never need to re-use hidden states.
         is_packed = isinstance(x, PackedSequence)
+        assert not (is_packed and padding_mask is not None), "Padding mask has no effect on packed tensors."
 
         if is_packed:
             # If the input is a packed sequence, apply the encoder to the data part
@@ -252,6 +255,10 @@ class EncoderActorCriticLSTM(nn.Module):
             encoded_x = self.encoder(x_reshaped)
             # Reshape back for the LSTM: (batch, seq_len, encoder_output_dim)
             lstm_input = encoded_x.reshape(batch_size, seq_len, -1)
+
+        if padding_mask is not None and not is_packed:
+            # Detach using padding mask to reduce gradient calculation requirements
+            lstm_input = torch.where(padding_mask, lstm_input, lstm_input.detach())
 
         lstm_out, new_hidden = self.lstm(lstm_input, hidden_state)
 
@@ -272,7 +279,6 @@ class EncoderActorCriticLSTM(nn.Module):
             last_outputs = lstm_out[torch.arange(batch_size), last_step_indices, :]
 
         else:
-            assert LSTM_LAYERS == 1, "Check whether this code is correct if num_layers > 1"
             last_outputs = lstm_out[:, -1, :]
 
         return lstm_out, last_outputs, new_hidden
@@ -298,14 +304,41 @@ class EncoderActorCriticLSTM(nn.Module):
         return dist, value, new_hidden
 
     def init_hidden_state(self, batch_size=1):
-        return torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim), torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim)
+        return torch.zeros(LSTM_LAYERS, batch_size, self.hidden_dim), torch.zeros(LSTM_LAYERS, batch_size,
+                                                                                  self.hidden_dim)
 
 
 class RecurrentPPO:
-    def __init__(self, train_env_creator_fn, eval_env_creator_fn, train_ids, test_ids, hidden_dim=128,
-                 learning_rate=3e-4, gamma=0.99, train_envs_per_id: int = 1, eval_envs_per_id: int = 1,
-                 gae_lambda=0.95, entropy_coef=0.01, vf_coef=0.5, clip_range=0.2, seed=None, batch_size=64,
-                 n_steps=2048, n_epochs=10, eval_freq=10000, eval_episodes=500, log_dir="../logs_glucose/ppo_logs"):
+    def __init__(
+            self,
+            # Env params
+            train_env_creator_fn,
+            eval_env_creator_fn,
+            train_ids, test_ids,
+            train_envs_per_id: int = 1,
+            eval_envs_per_id: int = 1,
+            # Network params
+            hidden_dim=128,
+            learning_rate=3e-4,
+            device='cpu',
+            # Learning params
+            gamma=0.99,
+            gae_lambda=0.95,
+            entropy_coef=0.01,
+            vf_coef=0.5,
+            clip_range=0.2,
+            seed=None,
+            # Sampling params
+            n_steps=2048,
+            n_epochs=10,
+            batch_size=64,
+            batch_sequence_length=64,
+            # Eval params
+            eval_freq=10000,
+            eval_episodes=500,
+            log_dir="../logs_glucose/ppo_logs"):
+        # Store device, but keep everything on CPU initially
+        self.device = device
         # Set the seed
         self.seed = seed
         if seed is not None:
@@ -349,9 +382,12 @@ class RecurrentPPO:
         self.entropy_coef = entropy_coef
         self.vf_coef = vf_coef
         self.clip_range = clip_range
+
         self.n_steps = n_steps
-        self.batch_size = batch_size
         self.n_epochs = n_epochs
+        self.batch_size = batch_size  # Number of sequences per minibatch
+        self.batch_sequence_length = batch_sequence_length  # Num of decisions per sequence
+
         self.eval_freq = eval_freq
         self.eval_episodes = eval_episodes
         self.log_dir = log_dir
@@ -374,12 +410,7 @@ class RecurrentPPO:
             hidden_dim=self.hidden_dim,
             action_dim=self.action_dim,
         )
-        actor_params = (list(self.ac_network.lstm.parameters())
-                        + list(self.ac_network.actor_head.parameters())
-                        + list(self.ac_network.encoder.parameters()))
-        critic_params = list(self.ac_network.critic_head.parameters())
-        self.actor_optimizer = optim.Adam(actor_params, lr=self.learning_rate)
-        self.critic_optimizer = optim.Adam(critic_params, lr=self.learning_rate * 10)
+        self.optimizer = optim.Adam(self.ac_network.parameters(), lr=self.learning_rate)
 
     def __call__(self, obs, deterministic=True, *args, **kwargs):
         action, lstm_states = self.predict(obs, deterministic=deterministic, *args, **kwargs)
@@ -413,8 +444,7 @@ class RecurrentPPO:
         """Saves the model and optimizer state."""
         checkpoint = {
             'ac_network_state_dict': self.ac_network.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
             'num_timesteps': self._num_timesteps,
             'best_mean_reward': self.best_mean_reward,
             'mean_ep_length': self.mean_ep_length,
@@ -647,19 +677,22 @@ class RecurrentPPO:
 
         while self._num_timesteps < target_timesteps:
             updates += 1
+
+            # --- ROLLOUT COLLECTION ---
             rollout_obs, rollout_rewards, rollout_dones = [], [], []
             rollout_actions, rollout_log_probs, rollout_values = [], [], []
             rollout_h_states, rollout_c_states = [], []
-            rollout_steps_taken = []
+            rollout_lengths = []
 
             current_episode_reward = np.zeros(self.n_train_envs)
             current_episode_length = np.zeros(self.n_train_envs)
             ep_rewards_this_rollout = []
             ep_lengths_this_rollout = []
 
-            for _ in tqdm(range(self.n_steps), mininterval=2, leave=False):
-                rollout_h_states.append(h_x.detach())
-                rollout_c_states.append(c_x.detach())
+            for _ in tqdm(range(self.n_steps), mininterval=2, leave=False, desc="Collecting Rollout"):
+                # Store the hidden state *before* the step
+                rollout_h_states.append(h_x.detach().numpy())
+                rollout_c_states.append(c_x.detach().numpy())
 
                 with torch.no_grad():
                     dist, value, hidden_state = self.ac_network(
@@ -682,13 +715,13 @@ class RecurrentPPO:
                 current_episode_length += steps_taken
 
                 # Store rollout data
-                rollout_obs.append(obs_tensor)
+                rollout_obs.append(obs)  # obs_tensor)
                 rollout_actions.append(sampled_actions_np)
                 rollout_rewards.append(reward)
                 rollout_dones.append(done)
                 rollout_log_probs.append(log_prob.squeeze().numpy())
                 rollout_values.append(value.squeeze().numpy())
-                rollout_steps_taken.append(steps_taken)
+                rollout_lengths.append(steps_taken)
 
                 obs = new_obs
                 if done.any():
@@ -705,82 +738,134 @@ class RecurrentPPO:
                 sorted_hidden = (h_x.index_select(dim=1, index=sorted_idx),
                                  c_x.index_select(dim=1, index=sorted_idx))
 
+            # --- END ROLLOUT COLLECTION ---
+
             self.last_obs_tensor = packed_obs_tensor
             self.last_hidden_state = sorted_hidden
             self.last_unsorted_idx = unsorted_idx
 
-            advantages, returns = self._compute_advantages_and_returns(rollout_rewards, rollout_values, rollout_dones,
-                                                                       rollout_steps_taken)
+            # GAE Calculation
+            rollout_advantages, rollout_returns = self._compute_advantages_and_returns(rollout_rewards, rollout_values,
+                                                                                       rollout_dones, rollout_lengths)
 
-            # *** KEY CHANGE: NORMALIZE ADVANTAGES ***
-            advantages = (advantages - advantages.mean(0)) / (advantages.std(0) + 1e-8)
+            # Normalize Advantages
+            rollout_advantages = (rollout_advantages - rollout_advantages.mean(0)) / (rollout_advantages.std(0) + 1e-8)
 
-            flat_rollout_obs = torch.concatenate(rollout_obs)
-            flat_obs_lengths = np.concatenate(rollout_steps_taken)
-            flat_advantages = torch.from_numpy(advantages).flatten()
-            flat_returns = torch.from_numpy(returns).flatten()
-            flat_actions = torch.from_numpy(np.concatenate(rollout_actions))
-            flat_log_probs = torch.from_numpy(np.concatenate(rollout_log_probs))
-            flat_h_states = torch.concatenate(rollout_h_states, 1)
-            flat_c_states = torch.concatenate(rollout_c_states, 1)
-            total_transitions = self.n_steps * self.n_train_envs
+            # --- DATA PREPARATION ---
+            # Reshape data to (rollout_seq_len, n_envs, ...)
+            n_steps = self.n_steps
+            n_envs = self.n_train_envs
+
+            rollout_obs = np.concatenate(rollout_obs).reshape(n_steps, n_envs, TOTAL_SIZE, -1)
+            rollout_actions = np.concatenate(rollout_actions).reshape(n_steps, n_envs, 1)
+            rollout_lengths = np.concatenate(rollout_lengths).reshape(n_steps, n_envs, 1)
+            rollout_log_probs = np.concatenate(rollout_log_probs).reshape(n_steps, n_envs, 1)
+            rollout_advantages = rollout_advantages.reshape(n_steps, n_envs, 1)
+            rollout_returns = rollout_returns.reshape(n_steps, n_envs, 1)
+            rollout_dones = np.array(rollout_dones).reshape(n_steps, n_envs, 1)
+
+            rollout_h_states = (np.concatenate(rollout_h_states, 1)
+                                .reshape(LSTM_LAYERS, n_steps, n_envs, -1).transpose(1, 0, 2, 3))
+            rollout_c_states = (np.concatenate(rollout_c_states, 1)
+                                .reshape(LSTM_LAYERS, n_steps, n_envs, -1).transpose(1, 0, 2, 3))
+
+            sampler = LSTMSMDPBatchSampler(
+                rollout_obs,  # (n_steps, n_envs, TOTAL_SIZE, 4)
+                rollout_actions,  # (n_steps, n_envs, 1)
+                rollout_log_probs,  # (n_steps, n_envs, 1)
+                rollout_returns,  # (n_steps, n_envs, 1)
+                rollout_advantages,  # (n_steps, n_envs, 1)
+                rollout_dones,  # (n_steps, n_envs, 1)
+                rollout_lengths,  # (n_steps, n_envs, 1)
+                rollout_h_states,  # (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
+                rollout_c_states,  # (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
+                sequence_length=self.batch_sequence_length,  # The length of subsequences to sample
+                num_sequences_per_batch=self.batch_size,  # The total number of (env, step) transitions per mini-batch
+            )
+
+            dataloader = torch.utils.data.DataLoader(
+                sampler,
+                batch_size=None,  # <-- Must be None for iterable-style datasets
+                num_workers=2,  # <-- KEY: Number of parallel processes (start with 2-4)
+                prefetch_factor=2,  # <-- KEY: Preloads 2 batches per worker
+                pin_memory=True  # <-- IMPORTANT: Speeds up CPU-to-GPU transfer
+            )
+
+            # Move network to the correct device
+            self.ac_network.to(self.device)
 
             policy_losses, value_losses, entropy_losses, approx_kls = [], [], [], []
-            for _ in range(self.n_epochs):
-                indices = np.arange(total_transitions)
-                np.random.shuffle(indices)
-                for start in range(0, total_transitions, self.batch_size):
-                    end = start + self.batch_size
-                    # Get our batch data
-                    batch_indices = indices[start:end]
-                    batch_obs_seqs = flat_rollout_obs[batch_indices]
-                    batch_obs_lengths = flat_obs_lengths[batch_indices]
-                    batch_actions = flat_actions[batch_indices]
-                    batch_log_probs = flat_log_probs[batch_indices]
-                    batch_advantages = flat_advantages[batch_indices]
-                    batch_returns = flat_returns[batch_indices]
-                    batch_h_state = flat_h_states[:, batch_indices]
-                    batch_c_state = flat_c_states[:, batch_indices]
 
-                    # Pack the observation sequences
-                    packed_obs, batch_sorted_idx, batch_unsorted_idx = pack_obs(batch_obs_seqs, batch_obs_lengths)
-                    batch_sorted_hn = batch_h_state.index_select(dim=1, index=batch_sorted_idx)
-                    batch_sorted_cn = batch_c_state.index_select(dim=1, index=batch_sorted_idx)
+            for epoch in range(self.n_epochs):
+                # The sampler shuffles data automatically on each new iteration
+                for i, batch in enumerate(tqdm(
+                        dataloader,
+                        mininterval=2,
+                        leave=False,
+                        desc=f"Updating agent (epoch {epoch + 1}/{self.n_epochs})"
+                )):
+                    # Unpack the batch
+                    (
+                        obs_batch_cpu,
+                        actions_batch_cpu,
+                        log_probs_batch_cpu,
+                        returns_batch_cpu,
+                        advantages_batch_cpu,
+                        mask_batch_cpu,
+                        padding_mask_batch_cpu,
+                        h_starts_cpu,
+                        c_starts_cpu,
+                    ) = batch
 
-                    # Forward pass
-                    new_dist, new_values, _ = self.ac_network(
-                        packed_obs,
-                        hidden_state=(batch_sorted_hn, batch_sorted_cn),
-                        unsorted_indices=batch_unsorted_idx
+                    # --- NEW: Move batch to device *inside* the training loop ---
+                    # Using non_blocking=True is efficient thanks to pin_memory=True
+                    obs_batch = obs_batch_cpu.to(self.device, non_blocking=True)
+                    actions_batch = actions_batch_cpu.to(self.device, non_blocking=True)
+                    log_probs_batch = log_probs_batch_cpu.to(self.device, non_blocking=True)
+                    returns_batch = returns_batch_cpu.to(self.device, non_blocking=True)
+                    advantages_batch = advantages_batch_cpu.to(self.device, non_blocking=True)
+                    mask_batch = mask_batch_cpu.to(self.device, non_blocking=True)
+                    padding_mask_batch = padding_mask_batch_cpu.to(self.device, non_blocking=True)
+                    h_starts = h_starts_cpu.to(self.device, non_blocking=True)
+                    c_starts = c_starts_cpu.to(self.device, non_blocking=True)
+
+                    # Run inference
+                    lstm_out, _, _ = self.ac_network.forward_lstm(
+                        obs_batch,
+                        hidden_state=(h_starts, c_starts),
+                        padding_mask=padding_mask_batch
                     )
-                    new_values = new_values.squeeze()
-                    new_log_probs = new_dist.log_prob(batch_actions).squeeze(-1)
 
-                    # Get PPO ratio and losses
-                    log_ratio = new_log_probs - batch_log_probs
+                    new_values = self.ac_network.critic_head(lstm_out)
+                    actor_out = self.ac_network.actor_head(lstm_out)
+                    new_dist = self.ac_network.dist.proba_distribution(actor_out)
+                    new_log_probs = new_dist.log_prob(actions_batch)
+
+                    log_ratio = new_log_probs - log_probs_batch
                     ratio = log_ratio.exp()
-                    surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * batch_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    value_loss = F.mse_loss(new_values, batch_returns)
-                    entropy_loss = -new_dist.entropy().mean()
+                    surr1 = ratio * advantages_batch
+                    surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantages_batch
+
+                    valid_counts = torch.clip(mask_batch.sum(), min=1)
+
+                    policy_loss = (-torch.min(surr1, surr2) * mask_batch).sum() / valid_counts
+                    value_loss = ((new_values - returns_batch) ** 2 * mask_batch).sum() / valid_counts
+                    entropy_loss = (-new_dist.entropy() * mask_batch).sum() / valid_counts
                     loss = policy_loss + self.vf_coef * value_loss + self.entropy_coef * entropy_loss
 
                     with torch.no_grad():
-                        log_ratio = new_log_probs - batch_log_probs
-                        approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                        approx_kl = ((((ratio - 1) - log_ratio) * mask_batch).sum() / valid_counts).item()
 
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropy_losses.append(entropy_loss.item())
                     approx_kls.append(approx_kl)
 
-                    self.actor_optimizer.zero_grad()
-                    self.critic_optimizer.zero_grad()
+                    # 6. --- BACKWARD PASS ---
+                    self.optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 0.5)
-                    self.actor_optimizer.step()
-                    self.critic_optimizer.step()
+                    self.optimizer.step()
 
             mean_reward = np.mean(ep_rewards_this_rollout) if ep_rewards_this_rollout else np.nan
             mean_ep_length = np.mean(ep_lengths_this_rollout) if ep_lengths_this_rollout else np.nan
@@ -790,7 +875,8 @@ class RecurrentPPO:
             if self._num_timesteps >= next_eval:
                 avg_eval_reward, info = self._evaluate_policy()
                 print(f"--- EVALUATION at Timestep: {self._num_timesteps}/{target_timesteps} ---")
-                print(f"Average reward: {avg_eval_reward:.2f} | Best IQM reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
+                print(
+                    f"Average reward: {avg_eval_reward:.2f} | Best IQM reward: {self.best_mean_reward:.2f} | Mean Length: {self.mean_ep_length:.2f}\n")
 
                 if avg_eval_reward > self.best_mean_reward:
                     self.best_mean_reward = avg_eval_reward
@@ -807,6 +893,224 @@ class RecurrentPPO:
 
         self.train_env.close()
         self.eval_env.close()
+
+
+class LSTMSMDPBatchSampler:
+    """
+    A batch sampler for SMDP rollouts for LSTM training.
+
+    This sampler takes (n_steps, n_envs, ...) structured rollouts and
+    yields mini-batches of subsequences of shape (sequence_length, num_sequences, ...)
+    along with the correct initial hidden states for each sequence.
+
+    It correctly handles episode boundaries, ensuring no subsequence
+    crosses a 'done' signal (except at the very last step).
+    """
+
+    def __init__(
+            self,
+            rollout_obs: np.ndarray,
+            rollout_actions: np.ndarray,
+            rollout_log_probs: np.ndarray,
+            rollout_returns: np.ndarray,
+            rollout_advantages: np.ndarray,
+            rollout_dones: np.ndarray,
+            rollout_lengths: np.ndarray,
+            rollout_h_states: np.ndarray,
+            rollout_c_states: np.ndarray,
+            sequence_length: int,
+            num_sequences_per_batch: int,
+    ):
+        """
+        Initialize the sampler with the full rollout data.
+
+        Args:
+            rollout_obs: (n_steps, n_envs, TOTAL_SIZE, 4)
+            rollout_actions: (n_steps, n_envs, 1)
+            rollout_log_probs: (n_steps, n_envs, 1)
+            rollout_returns: (n_steps, n_envs, 1)
+            rollout_advantages: (n_steps, n_envs, 1)
+            rollout_dones: (n_steps, n_envs, 1)
+            rollout_lengths: (n_steps, n_envs, 1)
+            rollout_h_states: (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
+            rollout_c_states: (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
+            sequence_length: The length of subsequences to sample (e.g., 32).
+            num_sequences_per_batch: The number of sequences to include in each mini-batch (e.g., 16)
+        """
+        self.n_steps, self.n_envs = rollout_obs.shape[:2]
+        self.sequence_length = sequence_length
+        self.num_sequences_per_batch = num_sequences_per_batch
+
+        # --- 1. Reshape data for easier sampling ---
+        # We want to view the data as (n_envs, n_steps, ...)
+        # This makes it easy to grab sequences from each environment.
+
+        # (T, N, ...) -> (N, T, ...)
+        self.obs = np.swapaxes(rollout_obs, 0, 1)
+        self.actions = np.swapaxes(rollout_actions, 0, 1)
+        self.log_probs = np.swapaxes(rollout_log_probs, 0, 1)
+        self.returns = np.swapaxes(rollout_returns, 0, 1)
+        self.advantages = np.swapaxes(rollout_advantages, 0, 1)
+        self.dones = np.swapaxes(rollout_dones, 0, 1)
+        self.lengths = np.swapaxes(rollout_lengths, 0, 1)
+
+        self.h_states = np.transpose(rollout_h_states, (2, 0, 1, 3))
+        self.c_states = np.transpose(rollout_c_states, (2, 0, 1, 3))
+
+        # Cache data shapes
+        self.obs_shape = (self.obs.shape[-1],)
+        self.action_shape = self.actions.shape[2:]
+
+        # --- 2. Find all valid sequence start indices ---
+        # A start (env_idx, step_idx) is valid if the sequence
+        # [step_idx, step_idx + sequence_length) does not cross
+        # an episode boundary (a 'done' signal).
+        # --- 2. Find all valid sequence start indices AND their lengths ---
+        # This now includes short sequences.
+        self.valid_sequences = []
+        for env_idx in range(self.n_envs):
+            # Find all episode boundaries for this environment
+            done_indices = np.where(self.dones[env_idx])[0]
+
+            # List of (start, end) tuples for each episode
+            ep_starts = [0] + (done_indices + 1).tolist()
+            ep_ends = (done_indices + 1).tolist() + [self.n_steps]
+
+            for ep_start, ep_end in zip(ep_starts, ep_ends):
+                episode_len = ep_end - ep_start
+                if episode_len == 0:
+                    continue
+
+                # We can start a sequence at *any* step in the episode
+                for step_idx in range(ep_start, ep_end):
+                    # The sequence starts at step_idx
+                    # The max end is step_idx + sequence_length
+                    # The episode ends at ep_end
+
+                    # The actual end is the minimum of these two
+                    actual_end = min(step_idx + self.sequence_length, ep_end)
+                    actual_len = actual_end - step_idx
+
+                    self.valid_sequences.append(
+                        (env_idx, step_idx, actual_len)
+                    )
+
+        self.total_valid_sequences = len(self.valid_sequences)
+
+    def __len__(self):
+        return self.total_valid_sequences // self.num_sequences_per_batch
+
+    def __iter__(self):
+        """
+        Create a generator that yields mini-batches.
+        """
+        # Shuffle all valid starting positions
+        indices = np.random.permutation(self.total_valid_sequences)
+
+        num_seqs = self.num_sequences_per_batch
+
+        for start_idx in range(0, self.total_valid_sequences, num_seqs):
+            end_idx = start_idx + num_seqs
+
+            # Drop the last partial mini-batch
+            if end_idx > self.total_valid_sequences:
+                continue
+
+            # Get the (env, step, len) info for this mini-batch
+            batch_indices = indices[start_idx:end_idx]
+            seq_info = [self.valid_sequences[idx] for idx in batch_indices]
+
+            batch_env_idxs = [info[0] for info in seq_info]
+            batch_start_idxs = [info[1] for info in seq_info]
+            batch_actual_lens = [info[2] for info in seq_info]
+
+            # --- 3. Create padded buffers ---
+            # Max possible size is sequence_length * TOTAL_SIZE
+            max_sequence_length = self.sequence_length * TOTAL_SIZE
+            obs_batch = np.zeros(
+                (max_sequence_length, num_seqs, *self.obs_shape),
+                dtype=self.obs.dtype
+            )
+            actions_batch = np.zeros(
+                (max_sequence_length, num_seqs, *self.action_shape),
+                dtype=self.actions.dtype
+            )
+            log_probs_batch = np.zeros(
+                (max_sequence_length, num_seqs, 1),
+                dtype=self.log_probs.dtype
+            )
+            returns_batch = np.zeros(
+                (max_sequence_length, num_seqs, 1),
+                dtype=self.returns.dtype
+            )
+            advantages_batch = np.zeros(
+                (max_sequence_length, num_seqs, 1),
+                dtype=self.advantages.dtype
+            )
+            dones_batch = np.zeros(
+                (max_sequence_length, num_seqs, 1),
+                dtype=self.dones.dtype
+            )
+            mask_batch = np.zeros(
+                (max_sequence_length, num_seqs, 1),
+                dtype=bool
+            )
+            padding_mask_batch = np.zeros(
+                (max_sequence_length, num_seqs, 1),
+                dtype=bool
+            )
+
+            # --- 4. Fetch initial hidden states (no padding needed) ---
+            # shape: (LSTM_layers, num_seqs, hidden_dim)
+            h_starts = np.stack(
+                [self.h_states[n, t] for n, t in zip(batch_env_idxs, batch_start_idxs)],
+                axis=1
+            )
+            c_starts = np.stack(
+                [self.c_states[n, t] for n, t in zip(batch_env_idxs, batch_start_idxs)],
+                axis=1
+            )
+
+            # --- 5. Fill buffers with data and create mask ---
+            for seq_i in range(num_seqs):
+                n, t, L = batch_env_idxs[seq_i], batch_start_idxs[seq_i], batch_actual_lens[seq_i]
+
+                # Copy the data slices into the padded buffers
+                padded_obs_batch = self.obs[n, t: t + L]
+                unpadded_action_batch = self.actions[n, t: t + L]
+                unpadded_log_probs_batch = self.log_probs[n, t: t + L].reshape(-1, 1)
+                unpadded_returns_batch = self.returns[n, t: t + L]
+                unpadded_advantages_batch = self.advantages[n, t: t + L]
+                unpadded_lengths_batch = self.lengths[n, t: t + L]
+
+                # Unpad and flatten the obs accordingly
+                obs_mask = np.arange(TOTAL_SIZE) < unpadded_lengths_batch
+                flattened_obs_batch = padded_obs_batch[obs_mask]
+                obs_real_L = flattened_obs_batch.shape[0]
+                obs_batch[:obs_real_L, seq_i] = flattened_obs_batch
+
+                pad_mask = unpadded_lengths_batch.flatten().cumsum() - 1
+                actions_batch[pad_mask, seq_i] = unpadded_action_batch
+                log_probs_batch[pad_mask, seq_i] = unpadded_log_probs_batch
+                returns_batch[pad_mask, seq_i] = unpadded_returns_batch
+                advantages_batch[pad_mask, seq_i] = unpadded_advantages_batch
+                mask_batch[pad_mask, seq_i] = True
+                padding_mask_batch[:, seq_i, 0] = np.arange(max_sequence_length) < obs_real_L
+
+            # Yield the data as torch tensors
+            # - transpose from (L, num_seqs, -1) to (num_seqs, L, -1)
+
+            yield (
+                torch.from_numpy(obs_batch).transpose(0, 1),
+                torch.from_numpy(actions_batch).transpose(0, 1),
+                torch.from_numpy(log_probs_batch).transpose(0, 1),
+                torch.from_numpy(returns_batch).transpose(0, 1),
+                torch.from_numpy(advantages_batch).transpose(0, 1),
+                torch.from_numpy(mask_batch).transpose(0, 1),
+                torch.from_numpy(padding_mask_batch).transpose(0, 1),
+                torch.from_numpy(h_starts),  # DON'T transpose the hidden states
+                torch.from_numpy(c_starts),  # DON'T transpose the hidden states
+            )
 
 
 def pack_obs(batch_obs, lengths):

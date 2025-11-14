@@ -61,19 +61,21 @@ if __name__ == "__main__":
                              train_envs_per_id=1,
                              eval_envs_per_id=1,
                              gamma=GAMMA,
-                             train_ids=TRAIN_IDS,
+                             train_ids=TRAIN_IDS[:4],
                              test_ids=VAL_IDS,
                              n_steps=1024,  # More data per update
-                             entropy_coef=0.05,  # Too high = too unstable
-                             clip_range=0.1,  # Relax the clip range
-                             batch_size=256,
+                             entropy_coef=0.01,  # Too high = too unstable
+                             clip_range=0.2,  # Relax the clip range
                              gae_lambda=0.95,
                              n_epochs=5,  # Fewer epochs
                              hidden_dim=64,
+                             batch_size=512,
+                             batch_sequence_length=64,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
-                             learning_rate=1e-4,  # Standard learning rate
+                             learning_rate=3e-4,  # Standard learning rate
                              eval_freq=100_000 * len(TRAIN_IDS),
-                             eval_episodes=500)
+                             eval_episodes=500,
+                             device=DEVICE)
         agent.fit(total_timesteps=100_000_000)
 
     if train_offline:
