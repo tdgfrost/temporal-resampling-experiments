@@ -984,22 +984,29 @@ class LSTMSMDPBatchSampler(IterableDataset):
                 if episode_len == 0:
                     continue
 
-                # We can start a sequence at *any* step in the episode
-                for step_idx in range(ep_start, ep_end):
+                # Instead of a sliding window, we create mutually exclusive
+                # sequences by "tiling" the episode.
+                for step_idx in range(ep_start, ep_end, self.sequence_length):
                     # The sequence starts at step_idx
-                    # The max end is step_idx + sequence_length
                     # The episode ends at ep_end
+                    # The max end for this sequence is step_idx + sequence_length
 
-                    # The actual end is the minimum of these two
+                    # The actual end is the minimum of the max end and the episode end
                     actual_end = min(step_idx + self.sequence_length, ep_end)
                     actual_len = actual_end - step_idx
 
-                    self.valid_sequences.append(
-                        (env_idx, step_idx, actual_len)
-                    )
+                    # We must have at least one step
+                    if actual_len > 0:
+                        self.valid_sequences.append(
+                            (env_idx, step_idx, actual_len)
+                        )
 
         self.total_valid_sequences = len(self.valid_sequences)
         self.sampler_length = self.total_valid_sequences // self.num_sequences_per_batch
+        assert self.sampler_length > 0, \
+            (f"Warning: Sampler length is 0. "
+             f"total_valid_sequences ({self.total_valid_sequences}) < num_sequences_per_batch "
+             f"({self.num_sequences_per_batch}).")
 
     def __iter__(self):
         """
