@@ -28,7 +28,7 @@ MASTER_SEED = 123
 # Get all our patients
 patient_id_counter = 1
 for i in range(1, 11):
-    for group in ['adult', 'adolescent']: #, 'child']:
+    for group in ['adult', 'adolescent', 'child']:
         register(
             id=f"simglucose/{patient_id_counter}-v0",
             entry_point="simglucose.envs:T1DSimGymnaisumEnv",

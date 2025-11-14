@@ -799,9 +799,8 @@ class RecurrentPPO:
 
             for _ in tqdm(
                 range(self.n_epochs),
-                mininterval=2,
                 leave=False,
-                desc=f"Updating agent..."
+                desc=f"Updating agent ({sampler.sampler_length} batches per epoch)..."
             ):
                 # The sampler shuffles data automatically on each new iteration
                 for i, batch in enumerate(dataloader):

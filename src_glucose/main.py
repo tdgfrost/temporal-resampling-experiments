@@ -27,9 +27,9 @@ GAMMA = 0.99
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Train ids for PPO training and dataset generation
-TRAIN_IDS = [i for i in range(1, 9)]  # range(1, 19)]
-VAL_IDS = [i for i in range(9, 15)]  # range(19, 25)]
-TEST_IDS = [i for i in range(15, 21)]  # range(25, 31)]
+TRAIN_IDS = [i for i in range(1, 19)]
+VAL_IDS = [i for i in range(19, 25)]
+TEST_IDS = [i for i in range(25, 31)]
 
 torch.set_float32_matmul_precision('high')
 
@@ -61,16 +61,16 @@ if __name__ == "__main__":
                              train_envs_per_id=1,
                              eval_envs_per_id=1,
                              gamma=GAMMA,
-                             train_ids=TRAIN_IDS[:4],
+                             train_ids=TRAIN_IDS,
                              test_ids=VAL_IDS,
                              n_steps=1024,  # More data per update
-                             entropy_coef=0.01,  # Too high = too unstable
+                             entropy_coef=0.05,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
                              gae_lambda=0.95,
                              n_epochs=10,  # Fewer epochs
-                             hidden_dim=64,
+                             hidden_dim=128,
                              batch_size=256,
-                             batch_sequence_length=64,  # The (max) number of independent decisions per sequence
+                             batch_sequence_length=32,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
                              learning_rate=3e-4,  # Standard learning rate
                              eval_freq=100_000 * len(TRAIN_IDS),
