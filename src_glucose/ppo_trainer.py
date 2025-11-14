@@ -17,7 +17,7 @@ import random
 from tqdm import tqdm
 from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH, MASTER_SEED, TOTAL_SIZE
 
-LSTM_LAYERS = 1
+LSTM_LAYERS = 2
 
 
 def set_seed(seed: int):

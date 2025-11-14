@@ -64,10 +64,10 @@ if __name__ == "__main__":
                              train_ids=TRAIN_IDS,
                              test_ids=VAL_IDS,
                              n_steps=1024,  # More data per update
-                             entropy_coef=0.05,  # Too high = too unstable
+                             entropy_coef=0.01,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
                              gae_lambda=0.95,
-                             n_epochs=10,  # Fewer epochs
+                             n_epochs=5,  # Fewer epochs
                              hidden_dim=128,
                              batch_size=512,
                              batch_sequence_length=32,  # The (max) number of independent decisions per sequence
