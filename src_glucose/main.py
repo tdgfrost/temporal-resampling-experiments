@@ -14,7 +14,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=True, type=parse_bool, help='Train PPO agent')
 parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train offline agent')
 
-parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo'],
+parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo', 'random'],
                     help='Type of offline RL model to train (iql or cql)')
 parser.add_argument('--target_ppo_agent', default="best_model16_1412.85.pth", type=str,
                     help='Path to target PPO agent for dataset generation')
@@ -43,12 +43,13 @@ if __name__ == "__main__":
     is_iql = args.offline_model == 'iql'
     is_cql = args.offline_model == 'cql'
     is_ppo = args.offline_model == 'ppo'  # Used for evaluation only
+    is_random = args.offline_model == 'random'  # Used for evaluation only
 
     assert sum([train_ppo, train_offline]) == 1, \
         "Please select only one option (train_ppo, train_offline)."
 
-    assert not train_offline or is_iql or is_cql or is_ppo, (
-        "Please choose a valid offline model: 'iql', 'cql', or 'ppo' (eval only).")
+    assert not train_offline or is_iql or is_cql or is_ppo or is_random, (
+        "Please choose a valid offline model: 'iql', 'cql', 'ppo' (eval only), or 'random' (eval only).")
 
     if train_ppo:
         print(f'\n\n====== Training PPO ======\n\n')
@@ -84,16 +85,19 @@ if __name__ == "__main__":
 
     if train_offline:
         # --- Load our pre-trained PPO agent ----
-        ppo_agent = args.target_ppo_agent
-        if ppo_agent is None:
-            ppo_agent = choose_ppo_agent()
-        ppo_agent = f'../logs_glucose/ppo_logs/{ppo_agent}'
-        assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
-        dummy_args = {'train_env_creator_fn': make_glucose_env,
-                      'eval_env_creator_fn': make_glucose_env,
-                      'train_ids': TRAIN_IDS,
-                      'test_ids': TEST_IDS}
-        ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **dummy_args)
+        if is_ppo or (not is_random and not os.path.exists(f'./replay_buffer/COMPLETE')):
+            ppo_agent = args.target_ppo_agent
+            if ppo_agent is None:
+                ppo_agent = choose_ppo_agent()
+            ppo_agent = f'../logs_glucose/ppo_logs/{ppo_agent}'
+            assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
+            dummy_args = {'train_env_creator_fn': make_glucose_env,
+                          'eval_env_creator_fn': make_glucose_env,
+                          'train_ids': TRAIN_IDS,
+                          'test_ids': TEST_IDS}
+            ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **dummy_args)
+        else:
+            ppo_agent = None
 
         # --- Set up our offline training ---
         EXPECTILE = args.expectile
@@ -110,6 +114,8 @@ if __name__ == "__main__":
             print(f"\n=====\nDECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {args.beta}\n=====\n")
         elif is_ppo:
             print('\n=====\nSpecial case - evaluating pre-trained PPO agent only.\n=====\n')
+        elif is_random:
+            print('\n=====\nSpecial case - evaluating random performance only.\n=====\n')
         elif is_cql:
             print(
                 f"\n=====\nDECOY_INTERVAL: {DECOY_INTERVAL}\n=====\n")
@@ -164,7 +170,7 @@ if __name__ == "__main__":
                                                                                           gamma=GAMMA,
                                                                                           verbose=False)
 
-        if is_ppo:
+        if is_ppo or is_random:
             print(f'\n=== Evaluating pre-trained PPO ===\n')
             with tqdm(total=n_runs) as pbar:
                 for seed_idx, seed in enumerate(experiment_seeds):
@@ -278,6 +284,8 @@ if __name__ == "__main__":
             csv_path = f'../logs_glucose/iql_logs/decoy={DECOY_INTERVAL}_CQL.csv'
         elif is_ppo:
             csv_path = f'../logs_glucose/iql_logs/ppo_baseline.csv'
+        elif is_random:
+            csv_path = f'../logs_glucose/iql_logs/random_baseline.csv'
         else:
             raise ValueError("Invalid offline model type.")
         pl.DataFrame(logs).write_csv(csv_path)

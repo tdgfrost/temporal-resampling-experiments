@@ -594,7 +594,10 @@ class ParallelEnvironmentEvaluator:
                 running_avg_deques[i].append(obs[i])
 
         # Get initial hidden state for the batch
-        hidden_state = algo.get_initial_states(batch_size=self.n_eval_envs)
+        try:
+            hidden_state = algo.get_initial_states(batch_size=self.n_eval_envs)
+        except:
+            hidden_state = None
 
         # --- 3. Define Loop Condition ---
         if do_balanced_eval:
@@ -626,9 +629,12 @@ class ParallelEnvironmentEvaluator:
                 with torch.no_grad():
                     # Make sure the seq_dim is present
                     obs_to_predict = np.expand_dims(obs_to_predict, axis=-2)
-                    action, hidden_state = algo.predict(obs_to_predict,
-                                                        hidden_state=hidden_state,
-                                                        deterministic=True)
+                    if algo is None:
+                        action = self.eval_env.action_space.sample()
+                    else:
+                        action, hidden_state = algo.predict(obs_to_predict,
+                                                            hidden_state=hidden_state,
+                                                            deterministic=True)
 
                 # --- 4c. Step Environment ---
                 # action is a batch (B, ...), so we pass it directly
