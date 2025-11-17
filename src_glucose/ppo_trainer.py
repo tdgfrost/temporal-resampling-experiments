@@ -7,6 +7,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 from torch.utils.data import IterableDataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import gymnasium as gym
 import numpy as np
 import os
@@ -672,6 +673,11 @@ class RecurrentPPO:
         # Define our training/eval epoch parameters
         start_timesteps = self._num_timesteps
         target_timesteps = start_timesteps + total_timesteps
+
+        timesteps_per_update = self.n_steps * self.n_train_envs
+        total_updates = int(np.ceil(total_timesteps / timesteps_per_update))
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_updates, eta_min=0)
+
         updates = 0
         model_save_num = 1
         next_eval = (start_timesteps // self.eval_freq + 1) * self.eval_freq
@@ -710,8 +716,6 @@ class RecurrentPPO:
                 done = term | trunc
                 steps_taken = info.get('steps_taken', 1)
 
-                self._num_timesteps += sum(steps_taken)
-
                 current_episode_reward += reward
                 current_episode_length += steps_taken
 
@@ -738,6 +742,8 @@ class RecurrentPPO:
                 (h_x, c_x) = hidden_state
                 sorted_hidden = (h_x.index_select(dim=1, index=sorted_idx),
                                  c_x.index_select(dim=1, index=sorted_idx))
+
+            self._num_timesteps += self.n_steps * self.n_train_envs
 
             # --- END ROLLOUT COLLECTION ---
 
@@ -795,7 +801,7 @@ class RecurrentPPO:
             # Move network to the correct device
             self.ac_network.to(self.device)
 
-            policy_losses, value_losses, entropy_losses, approx_kls = [], [], [], []
+            policy_losses, value_losses, entropy_losses, approx_kls, grad_norms = [], [], [], [], []
 
             for _ in tqdm(
                 range(self.n_epochs),
@@ -864,16 +870,36 @@ class RecurrentPPO:
                     # 6. --- BACKWARD PASS ---
                     self.optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 0.5)
+                    total_norm = torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 1.0)
+                    grad_norms.append(total_norm)
                     self.optimizer.step()
 
             # Move network back to the CPU
             self.ac_network.to('cpu')
 
+            grad_norms = torch.stack(grad_norms).cpu()
+
+            if len(grad_norms) > 0:
+                p90_grad_norm = torch.quantile(grad_norms, 0.9).item()
+                mean_grad_norm = grad_norms.mean().item()  # np.mean(grad_norms)
+            else:
+                p90_grad_norm = 0.0
+                mean_grad_norm = 0.0
+
             mean_reward = np.mean(ep_rewards_this_rollout) if ep_rewards_this_rollout else np.nan
             mean_ep_length = np.mean(ep_lengths_this_rollout) if ep_lengths_this_rollout else np.nan
+
             print(
-                f"Timestep: {self._num_timesteps}/{target_timesteps} | Mean Ep. Length {mean_ep_length:.2f} | Mean Reward: {mean_reward:.2f} | Entropy: {np.mean(entropy_losses):.3f} | Value Loss: {np.mean(value_losses):.3f} | Policy Loss: {np.mean(policy_losses):.3f} | Approx. KL {np.mean(approx_kls):.5f}")
+                f"Timestep: {self._num_timesteps}/{target_timesteps} | "
+                f"Mean Ep. Length {mean_ep_length:.2f} | "
+                f"Mean Reward: {mean_reward:.2f} | "
+                f"Grad Norm (mean): {mean_grad_norm:.3f} | "  # <--- Added here
+                f"Grad Norm (P90): {p90_grad_norm:.3f} | "  # <--- Added here
+                f"Entropy: {np.mean(entropy_losses):.3f} | "
+                f"Value Loss: {np.mean(value_losses):.3f} | "
+                f"Policy Loss: {np.mean(policy_losses):.3f} | "
+                f"Approx. KL {np.mean(approx_kls):.5f}"
+            )
 
             if self._num_timesteps >= next_eval:
                 avg_eval_reward, info = self._evaluate_policy()
@@ -893,6 +919,8 @@ class RecurrentPPO:
                         model_save_num += 1
 
                 next_eval += self.eval_freq
+
+            self.scheduler.step()
 
         self.train_env.close()
         self.eval_env.close()

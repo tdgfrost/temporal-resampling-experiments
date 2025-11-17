@@ -381,7 +381,7 @@ def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_re
     # env = AddPatientState(env)
     env = SampleTimeWrapper(env)
     if use_scaling:
-        env = ManualRewardScaler(env, scale=100)
+        env = ManualRewardScaler(env, scale=10_000)
     if no_interim_rewards:
         env = EpisodeRewardsOnly(env)
     env = FixedScaler(env)

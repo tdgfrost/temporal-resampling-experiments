@@ -72,11 +72,11 @@ if __name__ == "__main__":
                              batch_size=512,
                              batch_sequence_length=32,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
-                             learning_rate=3e-4,  # Standard learning rate
-                             eval_freq=100_000 * len(TRAIN_IDS),
+                             learning_rate=5e-4,  # Standard learning rate
+                             eval_freq=(1024 * len(TRAIN_IDS)) * 10, # eval every 10 updates
                              eval_episodes=500,
                              device=DEVICE)
-        agent.fit(total_timesteps=100_000_000)
+        agent.fit(total_timesteps=20_000_000)
 
     if train_offline:
         # --- Load our pre-trained PPO agent ----
