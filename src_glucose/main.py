@@ -69,7 +69,7 @@ if __name__ == "__main__":
                              gae_lambda=0.95,
                              n_epochs=5,  # Fewer epochs
                              hidden_dim=128,
-                             batch_size=512,
+                             n_minibatches=8,
                              batch_sequence_length=32,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
                              learning_rate=5e-4,  # Standard learning rate

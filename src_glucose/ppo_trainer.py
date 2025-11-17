@@ -333,7 +333,7 @@ class RecurrentPPO:
             # Sampling params
             n_steps=2048,
             n_epochs=10,
-            batch_size=64,
+            n_minibatches=8,
             batch_sequence_length=64,
             # Eval params
             eval_freq=10000,
@@ -387,7 +387,7 @@ class RecurrentPPO:
 
         self.n_steps = n_steps
         self.n_epochs = n_epochs
-        self.batch_size = batch_size  # Number of sequences per minibatch
+        self.n_minibatches = n_minibatches  # Number of sequences per minibatch
         self.batch_sequence_length = batch_sequence_length  # Num of decisions per sequence
 
         self.eval_freq = eval_freq
@@ -787,7 +787,7 @@ class RecurrentPPO:
                 rollout_h_states,  # (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
                 rollout_c_states,  # (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
                 sequence_length=self.batch_sequence_length,  # The length of subsequences to sample
-                num_sequences_per_batch=self.batch_size,  # The total number of (env, step) transitions per mini-batch
+                n_minibatches=self.n_minibatches,  # The total number of (env, step) transitions per mini-batch
             )
 
             dataloader = torch.utils.data.DataLoader(
@@ -806,7 +806,9 @@ class RecurrentPPO:
             for _ in tqdm(
                 range(self.n_epochs),
                 leave=False,
-                desc=f"Updating agent ({sampler.sampler_length} batches per epoch)..."
+                desc=f"Updating agent "
+                     f"({sampler.batch_size} sequences per minibatch, "
+                     f"{sampler.n_minibatches} minibatches)..."
             ):
                 # The sampler shuffles data automatically on each new iteration
                 for i, batch in enumerate(dataloader):
@@ -950,7 +952,7 @@ class LSTMSMDPBatchSampler(IterableDataset):
             rollout_h_states: np.ndarray,
             rollout_c_states: np.ndarray,
             sequence_length: int,
-            num_sequences_per_batch: int,
+            n_minibatches: int,
     ):
         """
         Initialize the sampler with the full rollout data.
@@ -966,11 +968,11 @@ class LSTMSMDPBatchSampler(IterableDataset):
             rollout_h_states: (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
             rollout_c_states: (n_steps, LSTM_LAYERS, n_envs, HIDDEN_DIM)
             sequence_length: The length of subsequences to sample (e.g., 32).
-            num_sequences_per_batch: The number of sequences to include in each mini-batch (e.g., 16)
+            n_minibatches: The number of minibatches
         """
         self.n_steps, self.n_envs = rollout_obs.shape[:2]
         self.sequence_length = sequence_length
-        self.num_sequences_per_batch = num_sequences_per_batch
+        self.n_minibatches = n_minibatches
 
         # --- 1. Reshape data for easier sampling ---
         # We want to view the data as (n_envs, n_steps, ...)
@@ -1030,11 +1032,12 @@ class LSTMSMDPBatchSampler(IterableDataset):
                         )
 
         self.total_valid_sequences = len(self.valid_sequences)
-        self.sampler_length = self.total_valid_sequences // self.num_sequences_per_batch
+        self.batch_size = self.total_valid_sequences // self.n_minibatches
+        self.sampler_length = self.n_minibatches
         assert self.sampler_length > 0, \
             (f"Warning: Sampler length is 0. "
              f"total_valid_sequences ({self.total_valid_sequences}) < num_sequences_per_batch "
-             f"({self.num_sequences_per_batch}).")
+             f"({self.batch_size}).")
 
     def __iter__(self):
         """
@@ -1046,7 +1049,7 @@ class LSTMSMDPBatchSampler(IterableDataset):
         indices = np.random.permutation(self.total_valid_sequences)
 
         # --- 2. Determine which batches this worker should process ---
-        num_seqs = self.num_sequences_per_batch
+        num_seqs = self.batch_size
         total_batches = self.total_valid_sequences // num_seqs
 
         # Get a list of all batch start points in the 'indices' array
