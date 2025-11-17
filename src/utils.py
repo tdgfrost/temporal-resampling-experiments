@@ -1,10 +1,12 @@
-from typing import Union
+from typing import Union, Callable, Tuple
 import numpy as np
 import torch
 from pathlib import Path
 from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
 from collections import deque
+import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv
 import argparse
 import inquirer
 import os
@@ -200,6 +202,94 @@ class EnvironmentEvaluator:
             mean_returns.append(total_reward)
 
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
+
+
+class ParallelEnvironmentEvaluator:
+    def __init__(self,
+                 env_creator: Callable[[], gym.Env],
+                 n_eval_episodes: int,
+                 n_eval_envs: int = 4):
+        """
+        :param env_creator: A function that returns a gymnasium Environment.
+                            (e.g. lambda: gym.make('MyEnv-v0'))
+        :param n_eval_episodes: Total number of episodes to collect for the statistic.
+        :param n_eval_envs: Number of parallel environments to run.
+        """
+        self.env_creator = env_creator
+        self.n_eval_episodes = n_eval_episodes
+        self.n_eval_envs = n_eval_envs
+        self.vec_env = AsyncVectorEnv([self.env_creator for _ in range(self.n_eval_envs)])
+
+    def __call__(self, algo, seed: int = None) -> Tuple[float, float]:
+        """
+        Runs the evaluation.
+        Returns: (mean_reward, standard_error)
+        """
+        # 2. Reset Envs
+        if seed is not None:
+            # Create a list of seeds, one for each env
+            rng = np.random.default_rng(seed)
+            env_seeds = rng.integers(0, 2 ** 32 - 1, size=self.n_eval_envs).tolist()
+            obs, info = self.vec_env.reset(seed=env_seeds)
+        else:
+            obs, info = self.vec_env.reset()
+
+        # 3. Variables to track progress
+        completed_episode_rewards = []
+        current_episode_rewards = np.zeros(self.n_eval_envs)
+
+        # We use a progress bar for better visibility
+        pbar = tqdm(total=self.n_eval_episodes, desc="Evaluating", unit="ep", leave=False)
+
+        # 4. Evaluation Loop
+        while len(completed_episode_rewards) < self.n_eval_episodes:
+
+            # --- Predict ---
+            with torch.no_grad():
+                # obs is already (n_envs, obs_dim), so no expand_dims needed
+                # assuming algo.predict handles batch inputs
+                action = algo.predict(obs)
+
+                # Handle tuple actions (common in some custom algos)
+                if isinstance(action, tuple):
+                    action = action[0]
+
+            # Ensure action is a numpy array for the env
+            if isinstance(action, torch.Tensor):
+                action = action.cpu().numpy()
+
+            # --- Step ---
+            # vec_env.step automatically resets sub-envs that are done
+            obs, rewards, terminated, truncated, infos = self.vec_env.step(action)
+            dones = terminated | truncated
+
+            current_episode_rewards += rewards
+
+            # --- Handle Completions ---
+            if np.any(dones):
+                for i, done in enumerate(dones):
+                    if done:
+                        # Store the result
+                        completed_episode_rewards.append(current_episode_rewards[i])
+                        pbar.update(1)
+
+                        # Reset accumulator for this specific environment
+                        current_episode_rewards[i] = 0.0
+
+                        # Optimization: Stop early if we have enough data
+                        if len(completed_episode_rewards) >= self.n_eval_episodes:
+                            break
+
+        pbar.close()
+
+        # 5. Calculate Statistics
+        # Slice to exactly n_eval_episodes in case we over-collected slightly
+        results = completed_episode_rewards[:self.n_eval_episodes]
+
+        mean_return = float(np.mean(results))
+        std_error = float(np.std(results) / np.sqrt(self.n_eval_episodes))
+
+        return mean_return, std_error
 
 
 def parse_bool(value, name: str = ''):

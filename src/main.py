@@ -5,6 +5,7 @@ from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 import pickle
 import argparse
 from math import ceil
+from functools import partial
 from collections import defaultdict
 import polars as pl
 from scipy.stats import trim_mean
@@ -180,11 +181,13 @@ if __name__ == "__main__":
             ["lavagap_1_3_eval", (0, not DECOY_INTERVAL)],
             ["lavagap_1_1_eval", (1, False)],
         ]:
-            evaluators[key] = EnvironmentEvaluator(gym.make(env_name,
-                                                            max_steps=50,
-                                                            use_flag=flag,
-                                                            forced_interval=interval),
-                                                   n_trials=100)
+            evaluators[key] = ParallelEnvironmentEvaluator(partial(gym.make,
+                                                                   env_name,
+                                                                   max_steps=50,
+                                                                   use_flag=flag,
+                                                                   forced_interval=interval),
+                                                           n_eval_episodes=100,
+                                                           n_eval_envs=20)
 
         # Get our PPO model
         base_env = gym.make(env_name, max_steps=50)
