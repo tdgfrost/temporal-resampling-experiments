@@ -7,6 +7,7 @@ import argparse
 from math import ceil
 from collections import defaultdict
 import polars as pl
+from scipy.stats import trim_mean
 
 from utils import *
 from gym_wrappers import *
@@ -15,7 +16,7 @@ from models import *
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
 parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train IQL agent')
-parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql'],
+parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo'],
                     help='Type of offline RL model to train (iql or cql)')
 parser.add_argument('--ppo_agent', default=None, type=str, help='Path to pre-trained PPO agent')
 parser.add_argument('--render_performance', default=False, type=parse_bool,
@@ -30,6 +31,7 @@ parser.add_argument('--beta', default=10.0, type=float, help='Beta parameter for
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
 GAMMA = 0.99
+MASTER_SEED = 123
 
 """
 Trained on natural dataset:
@@ -105,18 +107,18 @@ if __name__ == "__main__":
     train_offline = args.train_offline
     is_iql = args.offline_model == 'iql'
     is_cql = args.offline_model == 'cql'
-    assert not train_offline or is_iql or is_cql, (
-        "Please choose a valid offline model: 'iql' or 'cql'.")
+    is_ppo = args.offline_model == 'ppo'
+    assert not train_offline or is_iql or is_cql or is_ppo, (
+        "Please choose a valid offline model: 'iql', 'cql', or 'ppo'.")
     offline_model = CustomIQL if is_iql else (CustomCQLSAC if is_cql else None)
     render_performance = args.render_performance
     record_video = args.record_video
 
-    if (train_offline and not os.path.exists('./dataset.pkl')) or render_performance:
+    if (train_offline and not os.path.exists('./dataset.pkl')) or (train_offline and is_ppo) or render_performance:
         ppo_agent = f'../logs/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
         if ppo_agent is None:
             ppo_agent = choose_ppo_agent()
-        assert ppo_agent is not None, ("Please provide a pre-trained PPO agent from the logs/ppo_minigrid_logs folder "
-                                       "for IQL training.")
+        assert ppo_agent is not None, "Please provide a pre-trained PPO agent from the logs/ppo_minigrid_logs folder."
         assert os.path.exists(ppo_agent), "Provided PPO agent path does not exist."
 
     assert not (train_ppo and train_offline), "Please choose to train either PPO or IQL, not both."
@@ -157,87 +159,113 @@ if __name__ == "__main__":
         elif is_cql:
             print(
                 f"DECOY_INTERVAL: {DECOY_INTERVAL}, ALPHA: {ALPHA}")
+        elif is_ppo:
+            print("No offline training - PPO evaluation only.")
 
         logs = defaultdict(list)
+        all_scores = defaultdict(list)
 
-        # Get our PPO model
-        base_env = gym.make(env_name, max_steps=50)
+        algo_name = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
+        logs['algo'].append(algo_name)
+        logs['decoy_interval'].append(DECOY_INTERVAL)
 
-        # Fill our replay buffer (or load pre-filled)
-        replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000)
-        if not os.path.exists('./dataset.pkl'):
-            model = CallablePPO.load(ppo_agent, env=base_env, device="auto")
-            model_loaded = True
-            replay_buffer_env.fill_buffer(model=model, n_frames=100_000)
-            with open('./dataset.pkl', 'wb') as f:
-                pickle.dump(replay_buffer_env, f)
-                f.close()
-        else:
-            print('=' * 50, '\nRe-using existing dataset.pkl...\n', '=' * 50)
-            with open('./dataset.pkl', 'rb') as f:
-                replay_buffer_env = pickle.load(f)
-                f.close()
-
-        dataset_rewards = np.array(replay_buffer_env.rewards[0])[np.array(replay_buffer_env.dones[0]) == 1]
-        dataset_n_episodes = len(dataset_rewards)
-
-        print(f"Baseline reward of the dataset: {dataset_rewards.mean():.2f} "
-              f"+/- {dataset_rewards.std() / np.sqrt(dataset_n_episodes):.2f}")
+        # Create our random seeds
+        rng = np.random.default_rng(MASTER_SEED)
+        n_runs = 50
+        experiment_seeds = rng.integers(low=0, high=2**32 - 1, size=n_runs)
 
         # Get our evaluators
         evaluators = {}
         for key, (interval, flag) in [
-            ["lavagap_1_3", (0, not DECOY_INTERVAL)],
-            ["lavagap_1_1", (1, False)],
+            ["lavagap_1_3_eval", (0, not DECOY_INTERVAL)],
+            ["lavagap_1_1_eval", (1, False)],
         ]:
             evaluators[key] = EnvironmentEvaluator(gym.make(env_name,
                                                             max_steps=50,
                                                             use_flag=flag,
                                                             forced_interval=interval),
-                                                   n_trials=500)
+                                                   n_trials=100)
 
-        for n_trial in range(10):
-            logs['decoy_interval'].append(DECOY_INTERVAL)
-            logs['dataset_reward'].append(dataset_rewards.mean())
-            if is_iql:
-                logs['expectile'].append(EXPECTILE)
-            elif is_cql:
-                logs['cql_alpha'].append(ALPHA)
+        # Get our PPO model
+        base_env = gym.make(env_name, max_steps=50)
 
-            # Alternately collect and training
-            algo = offline_model(observation_shape=base_env.observation_space.shape,
-                                 action_size=base_env.action_space.n,
-                                 feature_size=ceil(64 / (1 - args.dropout_p)),
-                                 batch_size=ceil(64 / (1 - args.dropout_p)),
-                                 expectile=EXPECTILE,
-                                 gamma=GAMMA,
-                                 dropout_p=args.dropout_p,
-                                 beta=args.beta,
-                                 cql_alpha=args.alpha,
-                                 critic_lr=1e-3,
-                                 value_lr=1e-3,
-                                 actor_lr=1e-3,
-                                 device='cuda' if torch.cuda.is_available() else 'cpu')
+        # Do PPO evaluation here
+        if is_ppo:
+            # Load PPO model
+            model = CallablePPO.load(ppo_agent, env=base_env, device="auto")
+            for seed in tqdm(experiment_seeds, mininterval=2, desc="PPO evaluation"):
+                for key in evaluators.keys():
+                    all_scores[key].append(evaluators[key](model, seed=int(seed))[0])
 
-            algo.compile()
+        else:
+            # Fill our replay buffer (or load pre-filled)
+            replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000)
+            if not os.path.exists('./dataset.pkl'):
+                model = CallablePPO.load(ppo_agent, env=base_env, device="auto")
+                model_loaded = True
+                replay_buffer_env.fill_buffer(model=model, n_frames=100_000)
+                with open('./dataset.pkl', 'wb') as f:
+                    pickle.dump(replay_buffer_env, f)
+                    f.close()
+            else:
+                print('=' * 50, '\nRe-using existing dataset.pkl...\n', '=' * 50)
+                with open('./dataset.pkl', 'rb') as f:
+                    replay_buffer_env = pickle.load(f)
+                    f.close()
 
-            log_dict = algo.fit(
-                dataset=replay_buffer_env,
-                epochs=1,
-                n_steps_per_epoch=10_000,
-                evaluators=evaluators,
-                dataset_kwargs={'decoy_interval': DECOY_INTERVAL},
-            )
-            for key in evaluators.keys():
-                logs[f'{key}_eval'].append(log_dict[key][0])
+            dataset_rewards = np.array(replay_buffer_env.rewards[0])[np.array(replay_buffer_env.dones[0]) == 1]
+            dataset_n_episodes = len(dataset_rewards)
+
+            print(f"Baseline reward of the dataset: {dataset_rewards.mean():.2f} "
+                  f"+/- {dataset_rewards.std() / np.sqrt(dataset_n_episodes):.2f}")
+
+            for seed_idx, seed in enumerate(experiment_seeds):
+                # Alternately collect and training
+                algo = offline_model(observation_shape=base_env.observation_space.shape,
+                                     action_size=base_env.action_space.n,
+                                     feature_size=ceil(64 / (1 - args.dropout_p)),
+                                     batch_size=ceil(64 / (1 - args.dropout_p)),
+                                     expectile=EXPECTILE,
+                                     gamma=GAMMA,
+                                     dropout_p=args.dropout_p,
+                                     beta=args.beta,
+                                     cql_alpha=args.alpha,
+                                     critic_lr=1e-3,
+                                     value_lr=1e-3,
+                                     actor_lr=1e-3,
+                                     seed=seed,
+                                     device='cuda' if torch.cuda.is_available() else 'cpu')
+
+                algo.compile()
+
+                log_dict = algo.fit(
+                    dataset=replay_buffer_env,
+                    epochs=1,
+                    n_steps_per_epoch=10_000,
+                    evaluators=evaluators,
+                    dataset_kwargs={'decoy_interval': DECOY_INTERVAL},
+                )
+                for key in evaluators.keys():
+                    all_scores[key].append(log_dict[key][0])
+
+        # Calculate our bootstrap IQM for each evaluator
+        for key, scores in all_scores.items():
+            scores = np.array(scores)
+            bootstrap_scores = np.random.choice(scores, size=(100_000, n_runs), replace=True)
+            bootstrap_iqm = trim_mean(bootstrap_scores, proportiontocut=0.25, axis=-1)
+            bootstrap_low_q = np.percentile(bootstrap_iqm, 2.5)
+            bootstrap_high_q = np.percentile(bootstrap_iqm, 97.5)
+            logs[f'{key}_iqm'] = np.mean(bootstrap_iqm)
+            logs[f'{key}_2.5%'] = bootstrap_low_q
+            logs[f'{key}_97.5%'] = bootstrap_high_q
 
         # Save logs
         os.makedirs('../logs/iql_minigrid_logs', exist_ok=True)
         if is_iql:
             csv_path = (f'../logs/iql_minigrid_logs/decoy={DECOY_INTERVAL}_expectile={EXPECTILE}'
-                        f'_beta={args.beta}.csv')
+                        f'_beta={args.beta}_{algo_name}.csv')
         elif is_cql:
-            csv_path = f'../logs/iql_minigrid_logs/decoy={DECOY_INTERVAL}_alpha={ALPHA}.csv'
+            csv_path = f'../logs/iql_minigrid_logs/decoy={DECOY_INTERVAL}_alpha={ALPHA}_cql.csv'
         pl.DataFrame(logs).write_csv(csv_path)
 
     if render_performance:

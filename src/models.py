@@ -10,6 +10,37 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch.distributions import Categorical
 from tqdm import tqdm
 from collections import deque
+import random
+
+
+def set_seed(seed: int):
+    """
+    Sets the random seed for reproducibility across torch, numpy, and random.
+    """
+    # Set seed for Python's built-in random module
+    random.seed(seed)
+
+    # Set seed for NumPy
+    np.random.seed(seed)
+
+    # Set seed for PyTorch
+    torch.manual_seed(seed)
+
+    # Set seed for PyTorch on CUDA (if available)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # for multi-GPU
+
+    # Set deterministic algorithms for PyTorch (can impact performance)
+    # This is crucial for full reproducibility with CUDA
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # You might also want to set this for newer PyTorch versions
+    # torch.use_deterministic_algorithms(True)
+
+    # Set environment variable for CUDA (if needed)
+    # os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
 class CallablePPO(PPO):
@@ -228,10 +259,13 @@ class CustomNet(nn.Module):
 
 
 class _CustomBase(nn.Module):
-    def __init__(self, device: str = 'cpu', *args, **kwargs):
+    def __init__(self, device: str = 'cpu', seed: Optional[int] = None, *args, **kwargs):
         super().__init__()
         self._cloning_only = False
         self._device = device
+        if seed is not None:
+            self.seed = int(seed)
+            set_seed(seed)
 
     def fit(
         self,
@@ -316,7 +350,7 @@ class _CustomBase(nn.Module):
 
         rewards = {}
         for key in evaluators.keys():
-            mean_rew, std_rew = evaluators[key](self)
+            mean_rew, std_rew = evaluators[key](self, seed=self.seed)
             rewards[key] = (mean_rew, std_rew)
 
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"

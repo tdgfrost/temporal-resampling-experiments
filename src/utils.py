@@ -50,7 +50,7 @@ class ReplayBufferEnv:
             if seed is None:
                 seed = 123
 
-            obs, info, ep_buffer = self.reset(seed=seed)
+            obs, info, ep_buffer = self.reset(seed=int(seed))
             model.set_random_seed(seed)
 
             while frame_count < n_frames:
@@ -176,8 +176,13 @@ class EnvironmentEvaluator:
         self.env = env
         self.n_trials = n_trials
 
-    def __call__(self, algo) -> float:
+    def __call__(self, algo, seed=None) -> float:
         mean_returns = []
+        if seed is not None:
+            _, _ = self.env.reset(seed=seed)
+        else:
+            _, _ = self.env.reset()
+
         for _ in range(self.n_trials):
             obs, info = self.env.reset()
             done = False
@@ -186,6 +191,8 @@ class EnvironmentEvaluator:
             while not done:
                 with torch.no_grad():
                     action = algo.predict(np.expand_dims(obs, 0))
+                    if isinstance(action, tuple):
+                        action = action[0]
                 obs, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
                 total_reward += reward
