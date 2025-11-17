@@ -63,7 +63,7 @@ if __name__ == "__main__":
                              gamma=GAMMA,
                              train_ids=TRAIN_IDS,
                              test_ids=VAL_IDS,
-                             n_steps=1024,  # More data per update
+                             n_steps=1024,
                              entropy_coef=0.01,  # Too high = too unstable
                              clip_range=0.2,  # Relax the clip range
                              gae_lambda=0.95,
@@ -72,11 +72,11 @@ if __name__ == "__main__":
                              n_minibatches=8,
                              batch_sequence_length=32,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
-                             learning_rate=5e-4,  # Standard learning rate
-                             eval_freq=(1024 * len(TRAIN_IDS)) * 10, # eval every 10 updates
+                             learning_rate=3e-4,  # Standard learning rate
+                             eval_freq=(1024 * len(TRAIN_IDS)) * 10,  # eval every 10 updates
                              eval_episodes=500,
                              device=DEVICE)
-        agent.fit(total_timesteps=20_000_000)
+        agent.fit(total_timesteps=2_000_000)
 
         # Close the envs
         agent.train_env.close()
