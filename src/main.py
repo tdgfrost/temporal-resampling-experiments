@@ -269,6 +269,8 @@ if __name__ == "__main__":
                         f'_beta={args.beta}_{algo_name}.csv')
         elif is_cql:
             csv_path = f'../logs/iql_minigrid_logs/decoy={DECOY_INTERVAL}_alpha={ALPHA}_cql.csv'
+        elif is_ppo:
+            csv_path = f"../logs/iql_minigrid_logs/ppo_baseline.csv"
         pl.DataFrame(logs).write_csv(csv_path)
 
     if render_performance:
