@@ -11,7 +11,7 @@ from utils import *
 from ppo_trainer import *
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--train_ppo', default=True, type=parse_bool, help='Train PPO agent')
+parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
 parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train offline agent')
 
 parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo', 'random'],
@@ -71,13 +71,13 @@ if __name__ == "__main__":
                              n_epochs=5,  # Fewer epochs
                              hidden_dim=128,
                              n_minibatches=8,
-                             batch_sequence_length=32,  # The (max) number of independent decisions per sequence
+                             batch_sequence_length=8,  # The (max) number of independent decisions per sequence
                              seed=MASTER_SEED,
                              learning_rate=3e-4,  # Standard learning rate
                              eval_freq=(1024 * len(TRAIN_IDS)) * 10,  # eval every 10 updates
                              eval_episodes=500,
                              device=DEVICE)
-        agent.fit(total_timesteps=2_000_000)
+        agent.fit(total_timesteps=3_000_000)
 
         # Close the envs
         agent.train_env.close()

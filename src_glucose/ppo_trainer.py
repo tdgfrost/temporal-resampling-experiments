@@ -872,7 +872,7 @@ class RecurrentPPO:
                     # 6. --- BACKWARD PASS ---
                     self.optimizer.zero_grad()
                     loss.backward()
-                    total_norm = torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 1.0)
+                    total_norm = torch.nn.utils.clip_grad_norm_(self.ac_network.parameters(), 3.0)
                     grad_norms.append(total_norm)
                     self.optimizer.step()
 
