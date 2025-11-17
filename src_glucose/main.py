@@ -78,6 +78,10 @@ if __name__ == "__main__":
                              device=DEVICE)
         agent.fit(total_timesteps=20_000_000)
 
+        # Close the envs
+        agent.train_env.close()
+        agent.eval_env.close()
+
     if train_offline:
         # --- Load our pre-trained PPO agent ----
         ppo_agent = args.target_ppo_agent
@@ -277,3 +281,9 @@ if __name__ == "__main__":
         else:
             raise ValueError("Invalid offline model type.")
         pl.DataFrame(logs).write_csv(csv_path)
+
+        # Close the evaluator envs
+        for key in evaluators_test.keys():
+            evaluators_test[key].eval_env.close()
+        for key in evaluators_val.keys():
+            evaluators_val[key].eval_env.close()

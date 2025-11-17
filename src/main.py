@@ -273,6 +273,10 @@ if __name__ == "__main__":
             csv_path = f"../logs/iql_minigrid_logs/ppo_baseline.csv"
         pl.DataFrame(logs).write_csv(csv_path)
 
+        # Close the eval environments
+        for key in evaluators.keys():
+            evaluators[key].vec_env.close()
+
     if render_performance:
         eval_env = gym.make(video_env_name if record_video else env_name,
                             render_mode="rgb_array" if record_video else "human",
