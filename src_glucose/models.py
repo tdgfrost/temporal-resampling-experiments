@@ -665,7 +665,6 @@ class _RecurrentBase(nn.Module):
         self._batch_size = batch_size
         self.dist = CustomBetaDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(
             self._device)
-        # self.dist = SquashedGaussianDistribution(action_dim=1, low=INSULIN_ACTION_LOW, high=INSULIN_ACTION_HIGH).to(self._device)
         self._eps = 1e-5
         self._tanh_scale = 1.0
 

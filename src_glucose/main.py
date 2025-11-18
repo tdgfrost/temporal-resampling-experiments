@@ -132,8 +132,6 @@ if __name__ == "__main__":
         experiment_seeds = rng.integers(low=0, high=2**32 - 1, size=n_runs)
 
         # Establish our val and test id setup
-        make_glucose_env_validation = partial(make_glucose_env, patient_ids=VAL_IDS)
-        make_glucose_env_test = partial(make_glucose_env, patient_ids=TEST_IDS)
         dummy_env = make_glucose_env()
 
         # Get our evaluators
@@ -145,28 +143,31 @@ if __name__ == "__main__":
             ["online_irregular", 0],
             ["online_interpolated", 1],
         ]:
-            evaluators_test[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env_test,
+            evaluators_test[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                         forced_interval=interval),
                                                                 n_eval_envs=24,
-                                                                n_eval_episodes=100,
+                                                                n_eval_episodes=200,
                                                                 gamma=GAMMA,
-                                                                verbose=is_ppo or is_random)
+                                                                verbose=is_ppo or is_random,
+                                                                test_ids=TEST_IDS)
 
             if key == "online_irregular":
-                evaluators_val[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env_validation,
+                evaluators_val[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                            forced_interval=interval),
                                                                    n_eval_envs=24,
-                                                                   n_eval_episodes=100,
+                                                                   n_eval_episodes=200,
                                                                    gamma=GAMMA,
-                                                                   verbose=False)
+                                                                   verbose=False,
+                                                                   test_ids=VAL_IDS)
 
         if DECOY_INTERVAL == 2:
-            evaluators_test["online_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env_test,
+            evaluators_test["online_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                                                   forced_interval=0),
                                                                                           n_eval_envs=24,
-                                                                                          n_eval_episodes=100,
+                                                                                          n_eval_episodes=200,
                                                                                           gamma=GAMMA,
-                                                                                          verbose=is_ppo or is_random)
+                                                                                          verbose=is_ppo or is_random,
+                                                                                          test_ids=TEST_IDS)
 
         if is_ppo or is_random:
             print(f'\n=== Evaluating pre-trained PPO ===\n')
