@@ -128,7 +128,7 @@ if __name__ == "__main__":
 
         # Create our random seeds
         rng = np.random.default_rng(MASTER_SEED)
-        n_runs = 50
+        n_runs = 30
         experiment_seeds = rng.integers(low=0, high=2**32 - 1, size=n_runs)
 
         # Establish our val and test id setup
@@ -148,7 +148,7 @@ if __name__ == "__main__":
             evaluators_test[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env_test,
                                                                         forced_interval=interval),
                                                                 n_eval_envs=24,
-                                                                n_eval_episodes=200,
+                                                                n_eval_episodes=100,
                                                                 gamma=GAMMA,
                                                                 verbose=is_ppo or is_random)
 
@@ -156,7 +156,7 @@ if __name__ == "__main__":
                 evaluators_val[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env_validation,
                                                                            forced_interval=interval),
                                                                    n_eval_envs=24,
-                                                                   n_eval_episodes=200,
+                                                                   n_eval_episodes=100,
                                                                    gamma=GAMMA,
                                                                    verbose=False)
 
@@ -164,7 +164,7 @@ if __name__ == "__main__":
             evaluators_test["online_irregular_aggregated"] = ParallelEnvironmentEvaluator(partial(make_glucose_env_test,
                                                                                                   forced_interval=0),
                                                                                           n_eval_envs=24,
-                                                                                          n_eval_episodes=200,
+                                                                                          n_eval_episodes=100,
                                                                                           gamma=GAMMA,
                                                                                           verbose=is_ppo or is_random)
 
