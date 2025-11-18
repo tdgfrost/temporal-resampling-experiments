@@ -455,12 +455,12 @@ class RecurrentPPO:
         print(f"Checkpoint saved to {path}")
 
     @classmethod
-    def load_checkpoint(cls, path, env, *args, **kwargs):
+    def load_checkpoint(cls, path, *args, **kwargs):
         """Loads the model and optimizer state."""
         assert os.path.exists(path), f"No checkpoint found at {path}"
 
         # Get the class instance
-        new_agent = cls(env, *args, **kwargs)
+        new_agent = cls(*args, **kwargs)
 
         # Update the state
         checkpoint = torch.load(path, weights_only=False)

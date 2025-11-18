@@ -16,7 +16,7 @@ parser.add_argument('--train_offline', default=False, type=parse_bool, help='Tra
 
 parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo', 'random'],
                     help='Type of offline RL model to train (iql or cql)')
-parser.add_argument('--target_ppo_agent', default="best_model16_1412.85.pth", type=str,
+parser.add_argument('--target_ppo_agent', default="best_model05_33405.80.pth", type=str,
                     help='Path to target PPO agent for dataset generation')
 
 parser.add_argument('--expectile', default=0.9, type=float, help='Expectile value for IQL training (0.5 is BC)')
@@ -30,6 +30,27 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TRAIN_IDS = [i for i in range(1, 19)]
 VAL_IDS = [i for i in range(19, 25)]
 TEST_IDS = [i for i in range(25, 31)]
+
+PPO_ARGS = {'train_env_creator_fn': make_glucose_env,
+            'eval_env_creator_fn': make_glucose_env,
+            'train_envs_per_id': 1,
+            'eval_envs_per_id': 1,
+            'gamma': GAMMA,
+            'train_ids': TRAIN_IDS,
+            'test_ids': VAL_IDS,
+            'n_steps': 1024,
+            'entropy_coef': 0.01,
+            'clip_range': 0.2,
+            'gae_lambda': 0.95,
+            'n_epochs': 5,
+            'hidden_dim': 128,
+            'n_minibatches': 8,
+            'batch_sequence_length': 8,
+            'seed': MASTER_SEED,
+            'learning_rate': 3e-4,
+            'eval_freq': (1024 * len(TRAIN_IDS)) * 10,
+            'eval_episodes': 500,
+            'device': DEVICE}
 
 torch.set_float32_matmul_precision('high')
 
@@ -54,29 +75,10 @@ if __name__ == "__main__":
     if train_ppo:
         print(f'\n\n====== Training PPO ======\n\n')
         train_env_creator_fn = partial(make_glucose_env, use_scaling=True, enforce_ppo_wrapper=True)
-        eval_env_creator_fn = make_glucose_env
+        PPO_ARGS.update({'train_env_creator_fn': train_env_creator_fn})
 
         # *** KEY CHANGE: UPDATED HYPERPARAMETERS ***
-        agent = RecurrentPPO(train_env_creator_fn=train_env_creator_fn,
-                             eval_env_creator_fn=eval_env_creator_fn,
-                             train_envs_per_id=1,
-                             eval_envs_per_id=1,
-                             gamma=GAMMA,
-                             train_ids=TRAIN_IDS,
-                             test_ids=VAL_IDS,
-                             n_steps=1024,
-                             entropy_coef=0.01,  # Too high = too unstable
-                             clip_range=0.2,  # Relax the clip range
-                             gae_lambda=0.95,
-                             n_epochs=5,  # Fewer epochs
-                             hidden_dim=128,
-                             n_minibatches=8,
-                             batch_sequence_length=8,  # The (max) number of independent decisions per sequence
-                             seed=MASTER_SEED,
-                             learning_rate=3e-4,  # Standard learning rate
-                             eval_freq=(1024 * len(TRAIN_IDS)) * 10,  # eval every 10 updates
-                             eval_episodes=500,
-                             device=DEVICE)
+        agent = RecurrentPPO(**PPO_ARGS)
         agent.fit(total_timesteps=3_000_000)
 
         # Close the envs
@@ -91,11 +93,7 @@ if __name__ == "__main__":
                 ppo_agent = choose_ppo_agent()
             ppo_agent = f'../logs_glucose/ppo_logs/{ppo_agent}'
             assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
-            dummy_args = {'train_env_creator_fn': make_glucose_env,
-                          'eval_env_creator_fn': make_glucose_env,
-                          'train_ids': TRAIN_IDS,
-                          'test_ids': TEST_IDS}
-            ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **dummy_args)
+            ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **PPO_ARGS)
         else:
             ppo_agent = None
 
@@ -152,7 +150,7 @@ if __name__ == "__main__":
                                                                 n_eval_envs=24,
                                                                 n_eval_episodes=200,
                                                                 gamma=GAMMA,
-                                                                verbose=False)
+                                                                verbose=is_ppo or is_random)
 
             if key == "online_irregular":
                 evaluators_val[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env_validation,
@@ -168,7 +166,7 @@ if __name__ == "__main__":
                                                                                           n_eval_envs=24,
                                                                                           n_eval_episodes=200,
                                                                                           gamma=GAMMA,
-                                                                                          verbose=False)
+                                                                                          verbose=is_ppo or is_random)
 
         if is_ppo or is_random:
             print(f'\n=== Evaluating pre-trained PPO ===\n')

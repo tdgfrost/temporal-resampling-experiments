@@ -614,7 +614,7 @@ class ParallelEnvironmentEvaluator:
             pbar_total = self.n_eval_episodes
 
         # --- 4. Run Episodes ---
-        with tqdm(total=pbar_total, desc="Evaluating Episodes", mininterval=2.0, disable=not self.verbose) as pbar:
+        with tqdm(total=pbar_total, desc="Evaluating Episodes", mininterval=2.0, disable=not self.verbose, leave=False) as pbar:
             while not is_evaluation_done():
 
                 # --- 4a. Prepare Observations ---
@@ -692,6 +692,9 @@ class ParallelEnvironmentEvaluator:
                             running_avg_deques[i].append(next_obs[i])
 
                 obs = next_obs  # End of loop, update obs
+
+        # Make sure pbar has cleared
+        pbar.clear()
 
         # --- 5. Combine and Return Results ---
         if self.test_ids is not None:
