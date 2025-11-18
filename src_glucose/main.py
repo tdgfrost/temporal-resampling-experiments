@@ -232,7 +232,6 @@ if __name__ == "__main__":
 
                 # Initialise offline model
                 algo = offline_model(observation_shape=dummy_env.observation_space.shape,
-                                     action_space=dummy_env.action_space,
                                      hidden_dim=128,
                                      recurrent_hidden_size=128,
                                      batch_size=1024,

@@ -97,6 +97,14 @@ class T1DPatientEnv(Wrapper):
         env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
 
+        # Set the action space to 0 - 0.5
+        self.action_space = spaces.Box(
+            low=INSULIN_ACTION_LOW,
+            high=INSULIN_ACTION_HIGH,
+            shape=(1,),
+            dtype=np.float32
+        )
+
     def _get_next_patient_id(self) -> int:
         """
         Helper method to select the next patient ID.
