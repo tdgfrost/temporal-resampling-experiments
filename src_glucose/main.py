@@ -101,12 +101,6 @@ if __name__ == "__main__":
         EXPECTILE = args.expectile
         DECOY_INTERVAL = args.decoy_interval
         algo_name = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
-        if not is_ppo:
-            assert os.path.exists('../logs_glucose/iql_logs/ppo_baseline.csv'), \
-                "Please run PPO evaluation first to establish baseline."
-
-            # Load PPO baseline logs
-            ppo_logs = pl.read_csv('../logs_glucose/iql_logs/ppo_baseline.csv')
 
         if is_iql:
             print(f"\n=====\nDECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {args.beta}\n=====\n")
@@ -193,7 +187,7 @@ if __name__ == "__main__":
 
         else:
             # Load our dataset
-            dataset_size = 1_000_000
+            dataset_size = 10_000_000
             dataset = RecurrentReplayBufferEnv(make_glucose_env(patient_ids=TRAIN_IDS), buffer_size=dataset_size * 2)
 
             if not os.path.exists(f'./replay_buffer/COMPLETE'):
