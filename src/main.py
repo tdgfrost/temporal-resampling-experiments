@@ -140,7 +140,7 @@ if __name__ == "__main__":
     if train_ppo:
         # Create eval callback
         save_each_best = SaveEachBestCallback(save_dir="../logs/ppo_minigrid_logs/historic_bests", verbose=1)
-        eval_callback = EvalCallback(gym.make(env_name, max_steps=100, fixed_reward=False),
+        eval_callback = EvalCallback(gym.make(env_name, max_steps=100, use_flag=False),
                                      n_eval_episodes=100,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
@@ -148,7 +148,7 @@ if __name__ == "__main__":
                                      deterministic=False,
                                      best_model_save_path="../logs/ppo_minigrid_logs")
 
-        model = PPO("CnnPolicy", gym.make(env_name, max_steps=100), ent_coef=0.1,
+        model = PPO("CnnPolicy", gym.make(env_name, max_steps=100, use_flag=False, fixed_reward=False), ent_coef=0.1,
                     policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1)
         model.learn(2e5, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
@@ -184,7 +184,7 @@ if __name__ == "__main__":
             evaluators[key] = ParallelEnvironmentEvaluator(partial(gym.make,
                                                                    env_name,
                                                                    max_steps=50,
-                                                                   use_flag=flag,
+                                                                   use_flag=False,  # flag,
                                                                    forced_interval=interval),
                                                            n_eval_episodes=100,
                                                            n_eval_envs=20)

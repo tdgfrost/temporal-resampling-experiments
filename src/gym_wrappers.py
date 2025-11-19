@@ -6,6 +6,7 @@ from gymnasium.utils import RecordConstructorArgs
 from gymnasium.wrappers import RecordVideo
 from minigrid.wrappers import ImgObsWrapper, Wrapper, FullyObsWrapper
 from datetime import datetime
+import random
 
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
@@ -78,7 +79,8 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
 
     def _flip_step_modes(self):
         self.last_step_mode = self.current_step_mode
-        self.current_step_mode = 1 - self.current_step_mode
+        # self.current_step_mode = 1 - self.current_step_mode
+        self.current_step_mode = random.choice([0, 1])
 
     def _take_first_step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs, reward, term, _, info = self.env.step(action)
@@ -204,12 +206,14 @@ class DecoyObsWrapper(RecordConstructorArgs, Wrapper):
 
 
 folder_name = datetime.now().strftime("%Y%m%d-%H%M%S")
-current_video_folder=f'../logs/videos/{folder_name}/'
+current_video_folder = f'../logs/videos/{folder_name}/'
+
 
 def all_episodes_trigger(x):
     return True
 
-def make_video_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = True,
+
+def make_video_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = False,
                             fixed_reward: bool = True, video_folder=current_video_folder,
                             episode_trigger=all_episodes_trigger, step_trigger=None, video_length=0,
                             name_prefix='rl-video', disable_logger=False, **kwargs):
