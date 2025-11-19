@@ -148,8 +148,8 @@ if __name__ == "__main__":
             if key == "online_irregular":
                 evaluators_val[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                            forced_interval=interval),
-                                                                   n_eval_envs=24,
-                                                                   n_eval_episodes_per_id=20,
+                                                                   n_eval_envs=30,
+                                                                   n_eval_episodes_per_id=5,
                                                                    gamma=GAMMA,
                                                                    verbose=False,
                                                                    test_ids=VAL_IDS)
@@ -187,7 +187,7 @@ if __name__ == "__main__":
 
         else:
             # Load our dataset
-            dataset_size = 10_000_000
+            dataset_size = 1_000_000
             dataset = RecurrentReplayBufferEnv(make_glucose_env(patient_ids=TRAIN_IDS), buffer_size=dataset_size * 2)
 
             if not os.path.exists(f'./replay_buffer/COMPLETE'):
@@ -207,17 +207,9 @@ if __name__ == "__main__":
             # Set offline model template and training params
             offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
 
-            epoch_frac = 1.0
-            early_stopping_limit = 10
-            if 0 <= DECOY_INTERVAL <= 1:
-                n_train_epochs = 50
-                n_epochs_per_eval = 1
-            elif DECOY_INTERVAL == 2:
-                n_train_epochs = 1000
-                n_epochs_per_eval = 20
-                early_stopping_limit = 10
-            else:
-                raise ValueError("Invalid decoy interval.")
+            early_stopping_limit = 5
+            n_train_epochs = 50
+            n_epochs_per_eval = 1
 
             # Log meta data
             model_save_path = f"../logs_glucose/iql_models/{algo_name}"
@@ -229,6 +221,7 @@ if __name__ == "__main__":
                                      hidden_dim=128,
                                      recurrent_hidden_size=128,
                                      batch_size=1024,
+                                     sequence_length=64,
                                      expectile=EXPECTILE,
                                      gamma=GAMMA,
                                      value_lr=3e-4,
@@ -246,7 +239,7 @@ if __name__ == "__main__":
                     evaluators_test=evaluators_test,
                     decoy_interval=DECOY_INTERVAL,
                     early_stopping_limit=early_stopping_limit,
-                    dataset_kwargs={'epoch_fraction': epoch_frac},
+                    dataset_kwargs={},
                 )
                 # Add to our list of run scores
                 for key in evaluators_test.keys():

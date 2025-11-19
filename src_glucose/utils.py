@@ -155,19 +155,13 @@ class RecurrentReplayBufferEnv:
 
     def generate(self):
         """
-        Generates batches by sampling EPISODE indices and then padding them.
+        Yields infinite batches of sequences for training.
         """
         assert self.segments > 0, "Not enough episodes to generate a batch. Call set_generate_params()."
 
-        # Sample indices corresponding to the episodes, not timesteps
-        episode_indices = np.random.choice(
-            self.n_samples,
-            size=(self.segments, self.batch_size),
-            replace=False
-        )
-
-        for batch_of_episode_indices in episode_indices:
-            yield self.fetch_transition_batch(idxs=batch_of_episode_indices, decoy_interval=self.decoy_interval)
+        while True:
+            indices = np.random.randint(0, self.n_samples, size=self.batch_size)
+            yield self.fetch_transition_batch(indices, decoy_interval=self.decoy_interval)
 
     def fetch_transition_batch(self, idxs: np.ndarray, decoy_interval: int = 0):
         """
@@ -301,6 +295,7 @@ class RecurrentReplayBufferEnv:
             self.reward_std[i] = float(loaded_scale[f'reward_std_{i}'])
 
         # Tweak to shorten from 1M to 500k steps (if needed)
+        """
         print(f"Trimming 1M to ~500k steps for dataset...")
         for i in range(3):
             done_indices = np.where(self.dones[i])[0]
@@ -311,6 +306,7 @@ class RecurrentReplayBufferEnv:
             for arr in [self.actions, self.rewards, self.dones,
                         self.sample_bool, self.visible_states]:
                 arr[i] = arr[i][start_idx:end_idx]
+        """
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)

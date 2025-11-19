@@ -728,67 +728,86 @@ class _RecurrentBase(nn.Module):
         best_log_dict = None
         best_epoch = None
 
+        if decoy_interval in [0, 1]:
+            steps_per_epoch = 2_000
+        elif decoy_interval in [2]:
+            steps_per_epoch = 200
+        else:
+            raise Exception(f"Invalid decoy interval: {decoy_interval}")
+
         # Start training
-        with tqdm(total=n_epochs_train * len(dataset), desc="Progress", mininterval=2.0,
-                  disable=not show_progress) as pbar:
-            for epoch in range(1, n_epochs_train + 1):
-                epoch_str = f"{epoch}/{n_epochs_train}"
+        try:
+            total_steps = n_epochs_train * steps_per_epoch
+            with tqdm(total=total_steps, desc="Progress", mininterval=2.0,
+                      disable=not show_progress) as pbar:
+                for epoch in range(1, n_epochs_train + 1):
+                    epoch_str = f"{epoch}/{n_epochs_train}"
 
-                for batch_num, batch in enumerate(dataloader):
-                    # Update the networks
-                    if not self._cloning_only:
-                        loss_dict['critic_loss'].append(self.update_critic(*batch))
-                        loss_dict['value_loss'].append(self.update_value(*batch))
-                    loss_dict['policy_loss'].append(self.update_actor(*batch))
-
-                    if self.scaler is not None:
-                        self.scaler.update()
-
-                    # Soft update of target value network
-                    self.sync_target_networks()
-
-                    pbar.update(1)
-                    if (batch_num + 1) % 50 == 0:
-                        pbar_dict = {'epoch': epoch_str,
-                                     'policy_loss': f"{torch.stack(list(loss_dict['policy_loss'])).mean().item():.5f}",
-                                     'refresh': False}
-                        if not self._cloning_only:
-                            pbar_dict[
-                                'critic_loss'] = f"{torch.stack(list(loss_dict['critic_loss'])).mean().item():.5f}"
-                            pbar_dict['value_loss'] = f"{torch.stack(list(loss_dict['value_loss'])).mean().item():.5f}"
-
-                        pbar.set_postfix(**pbar_dict)
-
-                # Logging
-                if epoch < n_epochs_train:
-                    do_eval = (epoch % n_epochs_per_eval == 0) and (evaluators_val is not None)
-                    if do_eval:
-                        log_dict = self._log_progress(
-                            epoch=epoch,
-                            evaluators=evaluators_val
-                        )
-
-                        current_return = log_dict['online_irregular']
-                        if current_return > best_online_return + 1e-4:
-                            best_online_return = current_return
-                            best_log_dict = log_dict
-                            best_epoch = epoch
-                            stop_early_count = 0
-                            self._save_best_model_state()
-                        else:
-                            stop_early_count += 1
-
-                        if stop_early_count >= early_stopping_limit:
-                            print(f"Early stopping triggered at epoch {epoch} "
-                                  f"- loading previous best state at epoch {best_epoch}.")
-                            self._load_best_model_state()
+                    for step in range(steps_per_epoch):
+                        # Pull next batch from infinite stream
+                        try:
+                            batch = next(dataloader)
+                        except StopIteration:
+                            # Should not happen
                             break
 
-            if (best_log_dict is None) or (evaluators_test is not evaluators_val):
-                best_log_dict = self._log_progress(
-                    epoch="final",
-                    evaluators=evaluators_test
-                )
+                        # Update the networks
+                        if not self._cloning_only:
+                            loss_dict['critic_loss'].append(self.update_critic(*batch))
+                            loss_dict['value_loss'].append(self.update_value(*batch))
+                        loss_dict['policy_loss'].append(self.update_actor(*batch))
+
+                        if self.scaler is not None:
+                            self.scaler.update()
+
+                        # Soft update of target value network
+                        self.sync_target_networks()
+
+                        pbar.update(1)
+                        if (step + 1) % 50 == 0:
+                            pbar_dict = {'epoch': epoch_str,
+                                         'policy_loss': f"{torch.stack(list(loss_dict['policy_loss'])).mean().item():.5f}",
+                                         'refresh': False}
+                            if not self._cloning_only:
+                                pbar_dict[
+                                    'critic_loss'] = f"{torch.stack(list(loss_dict['critic_loss'])).mean().item():.5f}"
+                                pbar_dict['value_loss'] = f"{torch.stack(list(loss_dict['value_loss'])).mean().item():.5f}"
+
+                            pbar.set_postfix(**pbar_dict)
+
+                    # Logging
+                    if epoch < n_epochs_train:
+                        do_eval = (epoch % n_epochs_per_eval == 0) and (evaluators_val is not None)
+                        if do_eval:
+                            log_dict = self._log_progress(
+                                epoch=epoch,
+                                evaluators=evaluators_val
+                            )
+
+                            current_return = log_dict['online_irregular_IQM']
+                            if current_return > best_online_return:
+                                best_online_return = current_return
+                                best_log_dict = log_dict
+                                best_epoch = epoch
+                                stop_early_count = 0
+                                self._save_best_model_state()
+                            else:
+                                stop_early_count += 1
+
+                            if stop_early_count >= early_stopping_limit:
+                                print(f"Early stopping triggered at epoch {epoch} "
+                                      f"- loading previous best state at epoch {best_epoch}.")
+                                self._load_best_model_state()
+                                break
+
+                if (best_log_dict is None) or (evaluators_test is not evaluators_val):
+                    best_log_dict = self._log_progress(
+                        epoch="final",
+                        evaluators=evaluators_test
+                    )
+        finally:
+            # Clean up the prefetcher thread
+            dataloader.stop()
 
         return best_log_dict
 
@@ -814,12 +833,12 @@ class _RecurrentBase(nn.Module):
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(optimizer)
             for net in nets:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             self.scaler.step(optimizer)
         else:
             loss.backward()
             for net in nets:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             optimizer.step()
         return loss.detach().clone()
 
@@ -974,6 +993,8 @@ class _RecurrentBase(nn.Module):
                 iqr_mean = np.mean(iqr)
                 iqr_std = np.std(iqr)
                 iqr_n_samples = len(iqr)
+
+                log_rewards[key + '_IQM'] = iqr_mean
 
                 eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
 
