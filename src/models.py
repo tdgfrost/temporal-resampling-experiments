@@ -263,6 +263,8 @@ class _CustomBase(nn.Module):
         super().__init__()
         self._cloning_only = False
         self._device = device
+        self.scaler = None
+        self._scaler_dtype = None
         if seed is not None:
             self.seed = int(seed)
             set_seed(seed)
@@ -283,6 +285,10 @@ class _CustomBase(nn.Module):
 
         loss_dict = self._reset_loss_dict()
 
+        if torch.cuda.is_available():
+            self.scaler = torch.amp.GradScaler('cuda')
+            self._scaler_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
         # Start training
         with tqdm(total=epochs * n_steps_per_epoch, desc="Progress", mininterval=2.0, disable=not show_progress) as pbar:
             for epoch in range(1, epochs + 1):
@@ -302,6 +308,9 @@ class _CustomBase(nn.Module):
                     # Soft update of target value network
                     self.sync_target_networks()
 
+                    if self.scaler is not None:
+                        self.scaler.update()
+
                     pbar.update(1)
                     pbar.set_postfix(epoch=epoch_str,
                                      policy_loss=f"{np.mean(loss_dict['policy_loss']):.5f}",
@@ -318,6 +327,16 @@ class _CustomBase(nn.Module):
                 )
 
         return log_dict
+
+    def generic_update(self, loss, optimizer):
+        optimizer.zero_grad()
+        if self.scaler:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+        else:
+            loss.backward()
+            optimizer.step()
+        return loss.detach().clone()
 
     def _update_critic(self, *args):
         return np.nan
@@ -445,55 +464,65 @@ class CustomIQL(_CustomBase):
         for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flags, next_flags):
-        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
-        with torch.no_grad():
-            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
-            current_multistep_discount = torch.where(flags == 1, 2, 0)
+    def _update_critic(self, *args):
+        critic_loss = self._update_critic_compiled(*args)
+        critic_loss = self.generic_update(critic_loss, self.critic_optim)
+        return critic_loss.item()
 
-            v_next = self.target_value_net(next_obs)
-            r = self._gamma ** current_multistep_discount * rews.float()
-            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
-
-        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
-        self.critic_optim.zero_grad()
-        loss.backward()
-        self.critic_optim.step()
-        return loss.item()
-
-    def _update_value(self, obs, acts):
-        v = self.value_net(obs)
-        with torch.no_grad():
+    @torch.compile
+    def _update_critic_compiled(self, obs, acts, rews, next_obs, dones, flags, next_flags):
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
-            q = torch.min(q1, q2)
+            with torch.no_grad():
+                next_multistep_discount = torch.where(next_flags == 1, 3, 1)
+                current_multistep_discount = torch.where(flags == 1, 2, 0)
 
-        diff = q - v
-        self._batch_diff = diff.detach().squeeze()
-        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-        value_loss = (weights * (diff.squeeze() ** 2)).mean()
+                v_next = self.target_value_net(next_obs)
+                r = self._gamma ** current_multistep_discount * rews.float()
+                q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
 
-        self.value_optim.zero_grad()
-        value_loss.backward()
-        self.value_optim.step()
+            critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+        return critic_loss
+
+    def _update_value(self, *args):
+        value_loss = self._update_value_compiled(*args)
+        value_loss = self.generic_update(value_loss, self.value_optim)
         return value_loss.item()
 
-    def _update_actor(self, obs, acts):
-        logits = self.policy_net(obs)
-        weights = 1.0
-        if not self._cloning_only:
-            weights = self._batch_diff
-            if self._has_dropout:
-                weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
-            else:
-                weights = torch.clip(torch.exp(self._beta * weights), -torch.inf, 100)
+    @torch.compile
+    def _update_value_compiled(self, obs, acts):
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
+            v = self.value_net(obs)
+            with torch.no_grad():
+                q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+                q = torch.min(q1, q2)
 
-        policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
-        policy_loss = (policy_loss * weights).mean()
+            diff = q - v
+            self._batch_diff = diff.detach().squeeze()
+            weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+            value_loss = (weights * (diff.squeeze() ** 2)).mean()
+        return value_loss
 
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
+    def _update_actor(self, *args):
+        policy_loss = self._update_actor_compiled(*args)
+        policy_loss = self.generic_update(policy_loss, self.policy_optim)
         return policy_loss.item()
+
+    @torch.compile
+    def _update_actor_compiled(self, obs, acts):
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
+            logits = self.policy_net(obs)
+            weights = 1.0
+            if not self._cloning_only:
+                weights = self._batch_diff
+                if self._has_dropout:
+                    weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
+                else:
+                    weights = torch.clip(torch.exp(self._beta * weights), -torch.inf, 100)
+
+            policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
+            policy_loss = (policy_loss * weights).mean()
+        return policy_loss
 
 
 class CustomCQLSAC(_CustomBase):
@@ -552,55 +581,63 @@ class CustomCQLSAC(_CustomBase):
             return logits.argmax(dim=-1).cpu().numpy()
         return Categorical(logits=logits).sample().cpu().numpy()
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flags, next_flags):
-        q1_logits, q2_logits = self.critic_net1(obs), self.critic_net2(obs)
-        q1_pred_logits, q2_pred_logits = q1_logits.gather(1, acts.long()), q2_logits.gather(1, acts.long())
+    def _update_critic(self, *args):
+        critic_loss = self._update_critic_compiled(*args)
+        critic_loss = self.generic_update(critic_loss, self.critic_optim)
+        return critic_loss.item()
 
-        with torch.no_grad():
-            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
-            current_multistep_discount = torch.where(flags == 1, 2, 0)
-
-            next_policy_logits = self.policy_net(next_obs)
-            next_policy_probs = torch.softmax(next_policy_logits, dim=-1)
-
-            next_q1_logits, next_q2_logits = self.target_critic_net1(next_obs), self.target_critic_net2(next_obs)
-            next_q_logits = torch.min(next_q1_logits, next_q2_logits)
-
-            next_v_logits = (next_policy_probs * (next_q_logits - self._entropy_alpha * torch.log_softmax(next_policy_logits, dim=-1))).sum(dim=-1, keepdim=True)
-
-            r = self._gamma ** current_multistep_discount * rews.float()
-            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * torch.sigmoid(next_v_logits)
-
-        q1_pred = torch.sigmoid(q1_pred_logits)
-        q2_pred = torch.sigmoid(q2_pred_logits)
-        bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
-
-        # CQL loss
-        logsumexp_q1 = torch.logsumexp(q1_logits, dim=1, keepdim=True)
-        logsumexp_q2 = torch.logsumexp(q2_logits, dim=1, keepdim=True)
-        cql_loss1 = (logsumexp_q1 - q1_pred_logits).mean()
-        cql_loss2 = (logsumexp_q2 - q2_pred_logits).mean()
-        cql_loss = cql_loss1 + cql_loss2
-
-        total_loss = bellman_loss + self._cql_alpha * cql_loss
-
-        self.critic_optim.zero_grad()
-        total_loss.backward()
-        self.critic_optim.step()
-        return total_loss.item()
-
-    def _update_actor(self, obs, acts=None):
-        logits = self.policy_net(obs)
-        probs = torch.softmax(logits, dim=-1)
-        log_probs = torch.log_softmax(logits, dim=-1)
-        with torch.no_grad():
+    @torch.compile
+    def _update_critic_compiled(self, obs, acts, rews, next_obs, dones, flags, next_flags):
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             q1_logits, q2_logits = self.critic_net1(obs), self.critic_net2(obs)
-            q_logits = torch.min(q1_logits, q2_logits)
-        policy_loss = (probs * (self._entropy_alpha * log_probs - q_logits)).sum(dim=1).mean()
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
+            q1_pred_logits, q2_pred_logits = q1_logits.gather(1, acts.long()), q2_logits.gather(1, acts.long())
+
+            with torch.no_grad():
+                next_multistep_discount = torch.where(next_flags == 1, 3, 1)
+                current_multistep_discount = torch.where(flags == 1, 2, 0)
+
+                next_policy_logits = self.policy_net(next_obs)
+                next_policy_probs = torch.softmax(next_policy_logits, dim=-1)
+
+                next_q1_logits, next_q2_logits = self.target_critic_net1(next_obs), self.target_critic_net2(next_obs)
+                next_q_logits = torch.min(next_q1_logits, next_q2_logits)
+
+                next_v_logits = (next_policy_probs * (next_q_logits - self._entropy_alpha * torch.log_softmax(next_policy_logits, dim=-1))).sum(dim=-1, keepdim=True)
+
+                r = self._gamma ** current_multistep_discount * rews.float()
+                q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * torch.sigmoid(next_v_logits)
+
+            q1_pred = torch.sigmoid(q1_pred_logits)
+            q2_pred = torch.sigmoid(q2_pred_logits)
+            bellman_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
+
+            # CQL loss
+            logsumexp_q1 = torch.logsumexp(q1_logits, dim=1, keepdim=True)
+            logsumexp_q2 = torch.logsumexp(q2_logits, dim=1, keepdim=True)
+            cql_loss1 = (logsumexp_q1 - q1_pred_logits).mean()
+            cql_loss2 = (logsumexp_q2 - q2_pred_logits).mean()
+            cql_loss = cql_loss1 + cql_loss2
+
+            total_loss = bellman_loss + self._cql_alpha * cql_loss
+
+        return total_loss
+
+    def _update_actor(self, *args):
+        policy_loss = self._update_actor_compiled(*args)
+        policy_loss = self.generic_update(policy_loss, self.policy_optim)
         return policy_loss.item()
+
+    @torch.compile
+    def _update_actor_compiled(self, obs, acts=None):
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
+            logits = self.policy_net(obs)
+            probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            with torch.no_grad():
+                q1_logits, q2_logits = self.critic_net1(obs), self.critic_net2(obs)
+                q_logits = torch.min(q1_logits, q2_logits)
+            policy_loss = (probs * (self._entropy_alpha * log_probs - q_logits)).sum(dim=1).mean()
+        return policy_loss
 
     def sync_target_networks(self, tau=None):
         tau = tau or self._tau_target
