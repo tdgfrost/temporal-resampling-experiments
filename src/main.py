@@ -223,6 +223,9 @@ if __name__ == "__main__":
                   f"+/- {dataset_rewards.std() / np.sqrt(dataset_n_episodes):.2f}")
 
             for seed_idx, seed in enumerate(experiment_seeds):
+
+                print(f'\n========== Starting seed {seed_idx + 1}/{len(experiment_seeds)} ==========\n')
+
                 # Alternately collect and training
                 algo = offline_model(observation_shape=base_env.observation_space.shape,
                                      action_size=base_env.action_space.n,

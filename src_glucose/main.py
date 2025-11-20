@@ -216,6 +216,8 @@ if __name__ == "__main__":
 
             for seed_idx, seed in enumerate(experiment_seeds):
 
+                print(f'\n========== Starting seed {seed_idx + 1}/{len(experiment_seeds)} ==========\n')
+
                 # Initialise offline model
                 algo = offline_model(observation_shape=dummy_env.observation_space.shape,
                                      hidden_dim=128,
