@@ -1,8 +1,9 @@
 import queue
 import threading
-from collections import deque
+from collections import deque, defaultdict
+from functools import partial
 from copy import deepcopy
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -671,6 +672,8 @@ class _RecurrentBase(nn.Module):
         # --- PLACEHOLDERS: These must be set by the child class ---
         self.actor_encoder: SharedRecurrentEncoder = None
         self.policy_net: RecurrentNet = None
+
+        self.update_funcs = dict()
         # ---
 
         self._sequence_length = sequence_length
@@ -701,7 +704,7 @@ class _RecurrentBase(nn.Module):
             evaluators_test=None,
             show_progress: bool = True,
             decoy_interval: int = 0,
-            early_stopping_limit: int = 3,
+            early_stopping_limit: Optional[int] = 3,
             dataset_kwargs: Optional[Dict] = None
     ):
         self.decoy_interval = decoy_interval
@@ -752,10 +755,8 @@ class _RecurrentBase(nn.Module):
                             break
 
                         # Update the networks
-                        if not self._cloning_only:
-                            loss_dict['critic_loss'].append(self.update_critic(*batch))
-                            loss_dict['value_loss'].append(self.update_value(*batch))
-                        loss_dict['policy_loss'].append(self.update_actor(*batch))
+                        for key, func in self.update_funcs.items():
+                            loss_dict[key].append(func(*batch))
 
                         if self.scaler is not None:
                             self.scaler.update()
@@ -766,12 +767,9 @@ class _RecurrentBase(nn.Module):
                         pbar.update(1)
                         if (step + 1) % 50 == 0:
                             pbar_dict = {'epoch': epoch_str,
-                                         'policy_loss': f"{torch.stack(list(loss_dict['policy_loss'])).mean().item():.5f}",
                                          'refresh': False}
-                            if not self._cloning_only:
-                                pbar_dict[
-                                    'critic_loss'] = f"{torch.stack(list(loss_dict['critic_loss'])).mean().item():.5f}"
-                                pbar_dict['value_loss'] = f"{torch.stack(list(loss_dict['value_loss'])).mean().item():.5f}"
+                            for key in loss_dict.keys():
+                                pbar_dict.update({key: f"{torch.stack(list(loss_dict[key])).mean().item():.5f}"})
 
                             pbar.set_postfix(**pbar_dict)
 
@@ -794,7 +792,7 @@ class _RecurrentBase(nn.Module):
                             else:
                                 stop_early_count += 1
 
-                            if stop_early_count >= early_stopping_limit:
+                            if early_stopping_limit is not None and stop_early_count >= early_stopping_limit:
                                 print(f"Early stopping triggered at epoch {epoch} "
                                       f"- loading previous best state at epoch {best_epoch}.")
                                 self._load_best_model_state()
@@ -818,15 +816,6 @@ class _RecurrentBase(nn.Module):
         new_obs[..., :-1] = new_obs[..., :-1] + noise[..., :-1] * 0.01
         return new_obs
 
-    def update_critic(self, *args):
-        return torch.nan
-
-    def update_value(self, *args):
-        return torch.nan
-
-    def update_actor(self, *args):
-        return torch.nan
-
     def generic_update(self, loss, optimizer, *nets):
         optimizer.zero_grad()
         if self.scaler:
@@ -846,8 +835,10 @@ class _RecurrentBase(nn.Module):
         pass
 
     def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                deterministic: bool = False, with_dist: bool = False) -> Tuple[
-        Optional[CustomBetaDistribution], np.ndarray, Tuple[torch.Tensor, torch.Tensor]]:
+                deterministic: bool = False, with_dist: bool = False) -> Union[
+        Tuple[CustomBetaDistribution, np.ndarray, Tuple[torch.Tensor, torch.Tensor]],
+        Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]
+    ]:
         """
         Predicts an action for a single observation and manages the recurrent state.
         Returns the action and the next hidden state.
@@ -981,6 +972,7 @@ class _RecurrentBase(nn.Module):
 
         log_rewards = {}
         eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
+        self.eval()
         if evaluators is not None:
             for key in evaluators.keys():
                 episodic_rewards = evaluators[key](self, seed=self._seed)
@@ -1000,16 +992,13 @@ class _RecurrentBase(nn.Module):
 
         eval_str += '=' * 40 + '\n'
         print(eval_str)
+        self.train()
 
         return log_rewards
 
     @staticmethod
     def _reset_loss_dict():
-        return {
-            'critic_loss': deque(maxlen=100),
-            'value_loss': deque(maxlen=100),
-            'policy_loss': deque(maxlen=100)
-        }
+        return defaultdict(partial(deque, maxlen=100))
 
     def _save_best_model_state(self):
         """Saves a deep copy of all nn.Module state_dicts in memory."""
@@ -1068,6 +1057,14 @@ class RecurrentIQL(_RecurrentBase):
         self._cloning_only = expectile == 0.5
         self._tau_target = tau_target
         self._beta = beta
+
+        # Set our update functions
+        if not self._cloning_only:
+            self.update_funcs.update({
+                'critic_loss': self.update_critic,
+                'value_loss': self.update_value
+            })
+        self.update_funcs.update({'policy_loss': self.update_actor})
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
@@ -1298,6 +1295,10 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._cql_alpha = torch.tensor(10.0, device=self._device)
         self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
                                                              device=self._device))
+
+        # Set our update functions
+        self.update_funcs.update({'policy_loss': self.update_actor,
+                                  'critic_loss': self.update_critic})
 
         # Kwargs for encoders and decoders
         encoder_kwargs = dict(
@@ -1584,3 +1585,164 @@ class RecurrentCQLSAC(_RecurrentBase):
         for target_param, param in zip(self.target_shared_critic_encoder.parameters(),
                                        self.shared_critic_encoder.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+
+class RecurrentFQE(_RecurrentBase):
+    def __init__(
+            self,
+            target_model: _RecurrentBase,
+            tau_target: float = 0.005,
+            *args,
+            **kwargs
+    ):
+        # We set gamma = 1.0 because we want the undiscounted estimated returns.
+        kwargs.pop('gamma', None)
+        super().__init__(gamma=1.0, *args, **kwargs)
+        self._tau_target = tau_target
+
+        # Set our update functions
+        self.update_funcs.update({'critic_loss': self.update_critic})
+
+        # 1. Handle the Target Model (The policy we are evaluating)
+        self.target_model = target_model
+        self.target_model.to(self._device)
+        self.target_model.eval()
+        # Freeze the target model parameters completely
+        for param in self.target_model.parameters():
+            param.requires_grad = False
+
+        # 2. Setup FQE Network Architecture
+        # We need a specific encoder/decoder for the Q-function we are learning
+        encoder_kwargs = dict(
+            input_dim=self._observation_shape[0],
+            hidden_dim=self._hidden_dim,
+            recurrent_hidden_size=self._recurrent_hidden_size,
+            device=self._device
+        )
+        decoder_kwargs = dict(
+            input_feature_size=self._recurrent_hidden_size,
+            device=self._device
+        )
+
+        # --- FQE Encoders (Current and Target) ---
+        self.fqe_encoder = SharedRecurrentEncoder(
+            feature_extractor=FeatureEncoder(**encoder_kwargs).to(self._device),
+            **encoder_kwargs
+        ).to(self._device)
+
+        self.fqe_target_encoder = SharedRecurrentEncoder(
+            feature_extractor=FeatureEncoder(**encoder_kwargs).to(self._device),
+            **encoder_kwargs
+        ).to(self._device)
+
+        # --- FQE Decoders (Current and Target) ---
+        # We use 2 critics by default to reduce overestimation bias, standard in FQE
+        self.q_net = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+        self.q_target_net = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
+
+        # --- Placeholders to satisfy Base Class calls ---
+        # FQE doesn't train a policy, but the base class might call self.policy_net in specific flows
+        # We point these to the target_model's nets just in case, though we won't optimize them.
+        self.actor_encoder = self.target_model.actor_encoder
+        self.policy_net = self.target_model.policy_net
+
+        # --- Optimizers ---
+        # We only optimize the FQE Q-networks
+        self.critic_optim = torch.optim.Adam(
+            list(self.fqe_encoder.parameters())
+            + list(self.q_net.parameters()),
+            lr=self._critic_lr
+        )
+
+        # Initialize target networks
+        self.sync_target_networks(tau=1.0)
+
+    def update_critic(self, *batch):
+        # Standard update wrapper
+        critic_loss = self._update_critic(*batch)
+
+        # Update parameters
+        critic_loss = self.generic_update(
+            critic_loss,
+            self.critic_optim,
+            self.q_net, self.fqe_encoder
+        )
+        return critic_loss
+
+    @torch.compile(mode='default')
+    def _update_critic_compiled(self, obs, acts, next_obs, train_mask):
+        # 1. Compute Current Q(s, a)
+        # Pass through FQE Encoder
+        lstm_out_q, _ = self.fqe_encoder(obs, train_mask=train_mask)
+        q_preds = self.q_net(lstm_out_q, actions=acts)
+
+        # 2. Compute Target Q(s', pi(s'))
+        with torch.no_grad():
+            # Get the next action from the target policy
+            next_action, _ = self.target_model.predict(next_obs, deterministic=True)
+
+            # Compute Q_target values using target Q nets
+            next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
+            next_q_preds = self.q_target_net(next_lstm_out_tgt, actions=next_action)
+
+        return q_preds, next_q_preds
+
+    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
+                       train_mask):
+        # Add noise (consistency with IQL/CQL classes)
+        obs = self.add_noise(obs)
+        next_obs = self.add_noise(next_obs)
+
+        with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
+            current_q, next_q = self._update_critic_compiled(obs, acts, next_obs, train_mask)
+
+            # Calculate Bellman Target
+            # y = r + gamma * (1-d) * Q_target
+            if self.decoy_interval == 0:
+                # If using specialized filtering from base class
+                q_target, train_mask = self._filter_to_correct_visibles(
+                    rews, next_q, dones, visible, next_visible, padding_mask, train_mask)
+            else:
+                q_target = rews + self._gamma * (1 - dones.float()) * next_q
+
+            # MSE Loss
+            critic_loss_unmasked = F.mse_loss(current_q, q_target, reduction='none')
+
+            # Apply Mask
+            # Use train_mask (which is False for padding AND burn-in)
+            masked_loss = critic_loss_unmasked * train_mask
+            critic_loss = masked_loss.sum() / (train_mask.sum() + self._eps)
+
+        return critic_loss
+
+    def sync_target_networks(self, tau=None):
+        """Soft updates for the FQE specific networks"""
+        tau = tau or self._tau_target
+
+        # Sync Encoder
+        for target_param, param in zip(self.fqe_target_encoder.parameters(), self.fqe_encoder.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+        # Sync Decoders
+        for target_param, param in zip(self.q_target_net.parameters(), self.q_net.parameters()):
+            target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
+
+    def predict(self, obs: np.ndarray, hidden_state=None, deterministic: bool = False, with_dist: bool = False):
+        """
+        Delegates prediction to the target model.
+        When we evaluate RecurrentFQE, we are evaluating the behavior of the target_model.
+        """
+        raise Exception("Not implemented for FQE")
+
+    def get_value_estimate(self, obs, acts):
+        """
+        Helper to get the FQE estimated Q-value for a specific batch.
+        Useful for debugging or plotting OPE results.
+        """
+        obs_tensor = self._to_tensors(obs)[0] if not isinstance(obs, torch.Tensor) else obs
+        acts_tensor = self._to_tensors(acts)[0] if not isinstance(acts, torch.Tensor) else acts
+
+        with torch.no_grad():
+            lstm_out, _ = self.fqe_encoder(obs_tensor, train_mask=None)
+            q_preds = self.q_net(lstm_out, actions=acts_tensor)
+        return q_preds

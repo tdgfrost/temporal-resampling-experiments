@@ -13,11 +13,12 @@ from ppo_trainer import *
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
 parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train offline agent')
+parser.add_argument('--train_fqe', default=False, type=parse_bool, help='Train FQE model')
 
-parser.add_argument('--offline_model', default='iql', type=str, choices=['iql', 'cql', 'ppo', 'random'],
-                    help='Type of offline RL model to train (iql or cql)')
-parser.add_argument('--target_ppo_agent', default="best_model05_33405.80.pth", type=str,
-                    help='Path to target PPO agent for dataset generation')
+parser.add_argument('--model_type', default='iql', type=str, choices=['iql', 'cql', 'ppo', 'random'],
+                    help='Type of model to train/evaluate (iql, cql, ppo, random)')
+parser.add_argument('--target_agent_path', default=None, type=str,
+                    help='Path to target agent')
 
 parser.add_argument('--expectile', default=0.9, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--beta', default=10., type=float, help='Beta parameter for IQL agent')
@@ -52,6 +53,19 @@ PPO_ARGS = {'train_env_creator_fn': make_glucose_env,
             'eval_episodes': 500,
             'device': DEVICE}
 
+OFFLINE_ARGS = {'hidden_dim': 128,
+                'recurrent_hidden_size': 128,
+                'batch_size': 1024,
+                'sequence_length': 64,
+                'gamma': GAMMA,
+                'value_lr': 3e-4,
+                'policy_lr': 3e-4,
+                'critic_lr': 3e-4,
+                'expectile': 0.5,
+                'beta': 10.0,
+                'seed': 123,
+                'device': DEVICE}
+
 torch.set_float32_matmul_precision('high')
 
 if __name__ == "__main__":
@@ -60,18 +74,102 @@ if __name__ == "__main__":
     # Establish training mode/parameters
     train_ppo = args.train_ppo
     train_offline = args.train_offline
+    train_fqe = args.train_fqe
 
-    is_iql = args.offline_model == 'iql'
-    is_cql = args.offline_model == 'cql'
-    is_ppo = args.offline_model == 'ppo'  # Used for evaluation only
-    is_random = args.offline_model == 'random'  # Used for evaluation only
+    is_iql = args.model_type == 'iql'
+    is_cql = args.model_type == 'cql'
+    is_ppo = args.model_type == 'ppo'  # Used for evaluation only
+    is_random = args.model_type == 'random'  # Used for evaluation only
+    model_type = 'bc' if is_iql and args.expectile == 0.5 else args.model_type
 
-    assert sum([train_ppo, train_offline]) == 1, \
-        "Please select only one option (train_ppo, train_offline)."
+    EXPECTILE = args.expectile
+    BETA = args.beta
+    DECOY_INTERVAL = args.decoy_interval
+
+    target_agent_path = args.target_agent_path
+
+    dummy_env = make_glucose_env()
+    offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
+    OFFLINE_ARGS.update({'observation_shape': dummy_env.observation_space.shape,
+                         'expectile': EXPECTILE,
+                         'beta': BETA})
+
+    assert sum([train_ppo, train_offline, train_fqe]) == 1, \
+        "Please select only one option (train_ppo, train_offline, train_fqe)."
 
     assert not train_offline or is_iql or is_cql or is_ppo or is_random, (
         "Please choose a valid offline model: 'iql', 'cql', 'ppo' (eval only), or 'random' (eval only).")
 
+    # Load the pre-trained agent if required
+    ppo_agent, offline_agent, seed = None, None, MASTER_SEED
+    if train_offline or train_fqe:
+        # Load PPO or offline agent
+        dataset_needs_generating = train_offline and not is_random and not os.path.exists(f'./replay_buffer/COMPLETE')
+        if is_ppo or dataset_needs_generating:
+            if target_agent_path is None:
+                target_agent_path = choose_ppo_agent()
+            ppo_agent = f'../logs_glucose/ppo_logs/{target_agent_path}'
+            assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
+            ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **PPO_ARGS)
+
+        # Load offline agent
+        elif train_fqe and not is_ppo:
+            if target_agent_path is None:
+                target_agent_path = choose_offline_agent(model_type, DECOY_INTERVAL)
+            offline_agent = f'../logs_glucose/iql_models/{model_type}/decoy_interval_{DECOY_INTERVAL}/{target_agent_path}'
+            assert os.path.exists(offline_agent), "Specified offline agent path does not exist."
+
+            # Load into the model
+            # - extract seed first
+            seed = int(target_agent_path.split('seed=')[-1].replace('.pt', ''))
+            OFFLINE_ARGS.update({'seed': seed})
+            offline_agent = offline_model(**OFFLINE_ARGS)
+            offline_agent.load_checkpoint(target_agent_path)
+
+    # ===== FQE Evaluation ===== #
+    if train_fqe:
+        """
+        Should we maybe get the list of 50 models and randomly select 5 models? and do FQE on each?
+        """
+        # Load our dataset
+        dataset_size = 1_000_000
+        dataset = RecurrentReplayBufferEnv(make_glucose_env(patient_ids=TRAIN_IDS), buffer_size=dataset_size * 2)
+        assert os.path.exists('./replay_buffer/COMPLETE'), \
+            "Replay buffer not found. Please generate it by training an offline agent first."
+        dataset.load(f'./replay_buffer')
+
+        # Specify our target agent
+        target_agent = ppo_agent if ppo_agent is not None else offline_agent
+        assert target_agent is not None, "No target agent loaded for FQE evaluation."
+
+        # Set up our FQE evaluator
+        evaluator = {'fqe_evaluation': FQEEvaluator(dataset=dataset,
+                                                    batch_size=1024)}
+
+        # Create our FQE model
+        OFFLINE_ARGS.update({'seed': seed})
+        algo = RecurrentFQE(**OFFLINE_ARGS)
+
+        # Fit our FQE model
+        log_dict = algo.fit(
+            dataset=dataset,
+            n_epochs_train=50,
+            n_epochs_per_eval=1,
+            evaluators=evaluator,
+            decoy_interval=DECOY_INTERVAL,
+            early_stopping_limit=None,
+            dataset_kwargs={},
+        )
+
+        print("\n====== CURRENTLY MISSING CODE TO SAVE THE FQE RESULTS ======\n")
+
+        # Save model state dicts in pytorch
+        model_save_path = f"../logs_glucose/iql_models/{model_type}/decoy_interval_{DECOY_INTERVAL}/fqe_models"
+        current_model_path = os.path.join(model_save_path, f'seed={seed}.pt')
+        os.makedirs(model_save_path, exist_ok=True)
+        algo.save_checkpoint(current_model_path)
+
+    # ===== Training PPO ===== #
     if train_ppo:
         print(f'\n\n====== Training PPO ======\n\n')
         train_env_creator_fn = partial(make_glucose_env, use_scaling=True, enforce_ppo_wrapper=True)
@@ -85,25 +183,11 @@ if __name__ == "__main__":
         agent.train_env.close()
         agent.eval_env.close()
 
+    # ===== Training Offline Agent (BC/IQL/CQL) ===== #
     if train_offline:
-        # --- Load our pre-trained PPO agent ----
-        if is_ppo or (not is_random and not os.path.exists(f'./replay_buffer/COMPLETE')):
-            ppo_agent = args.target_ppo_agent
-            if ppo_agent is None:
-                ppo_agent = choose_ppo_agent()
-            ppo_agent = f'../logs_glucose/ppo_logs/{ppo_agent}'
-            assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
-            ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **PPO_ARGS)
-        else:
-            ppo_agent = None
-
         # --- Set up our offline training ---
-        EXPECTILE = args.expectile
-        DECOY_INTERVAL = args.decoy_interval
-        algo_name = 'bc' if is_iql and EXPECTILE == 0.5 else args.offline_model
-
         if is_iql:
-            print(f"\n=====\nDECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {args.beta}\n=====\n")
+            print(f"\n=====\nDECOY_INTERVAL: {DECOY_INTERVAL}, EXPECTILE: {EXPECTILE}, BETA: {BETA}\n=====\n")
         elif is_ppo:
             print('\n=====\nSpecial case - evaluating pre-trained PPO agent only.\n=====\n')
         elif is_random:
@@ -117,16 +201,13 @@ if __name__ == "__main__":
         logs = defaultdict(list)
         all_scores = defaultdict(list)
 
-        logs['algo'].append(algo_name)
+        logs['algo'].append(model_type)
         logs['decoy_interval'].append(DECOY_INTERVAL)
 
         # Create our random seeds
         rng = np.random.default_rng(MASTER_SEED)
         n_runs = 50
         experiment_seeds = rng.integers(low=0, high=2**32 - 1, size=n_runs)
-
-        # Establish our val and test id setup
-        dummy_env = make_glucose_env()
 
         # Get our evaluators
         evaluators_val = dict()
@@ -205,33 +286,20 @@ if __name__ == "__main__":
                   f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
             # Set offline model template and training params
-            offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
-
             early_stopping_limit = 10 if DECOY_INTERVAL == 2 else 5
             n_train_epochs = 50
             n_epochs_per_eval = 1
 
             # Log meta data
-            model_save_path = f"../logs_glucose/iql_models/{algo_name}"
+            model_save_path = f"../logs_glucose/iql_models/{model_type}/decoy_interval_{DECOY_INTERVAL}"
 
             for seed_idx, seed in enumerate(experiment_seeds):
 
                 print(f'\n========== Starting seed {seed_idx + 1}/{len(experiment_seeds)} ==========\n')
 
                 # Initialise offline model
-                algo = offline_model(observation_shape=dummy_env.observation_space.shape,
-                                     hidden_dim=128,
-                                     recurrent_hidden_size=128,
-                                     batch_size=1024,
-                                     sequence_length=64,
-                                     expectile=EXPECTILE,
-                                     gamma=GAMMA,
-                                     value_lr=3e-4,
-                                     policy_lr=3e-4,
-                                     critic_lr=3e-4,
-                                     beta=args.beta,
-                                     seed=seed,
-                                     device=DEVICE)
+                OFFLINE_ARGS.update({'seed': seed})
+                algo = offline_model(**OFFLINE_ARGS)
 
                 log_dict = algo.fit(
                     dataset=dataset,
@@ -266,7 +334,7 @@ if __name__ == "__main__":
         # Save logs
         os.makedirs('../logs_glucose/iql_logs', exist_ok=True)
         if is_iql:
-            csv_path = f'../logs_glucose/iql_logs/decoy={DECOY_INTERVAL}_expectile={EXPECTILE}_beta={args.beta}.csv'
+            csv_path = f'../logs_glucose/iql_logs/decoy={DECOY_INTERVAL}_expectile={EXPECTILE}_beta={BETA}.csv'
         elif is_cql:
             csv_path = f'../logs_glucose/iql_logs/decoy={DECOY_INTERVAL}_CQL.csv'
         elif is_ppo:
