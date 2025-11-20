@@ -729,11 +729,11 @@ class _RecurrentBase(nn.Module):
         best_epoch = None
 
         if decoy_interval in [0, 1]:
-            steps_per_epoch = 2_000
+            steps_per_epoch = 1_000
         elif decoy_interval in [2]:
-            steps_per_epoch = 200
+            steps_per_epoch = 500
         else:
-            raise Exception(f"Invalid decoy interval: {decoy_interval}")
+            raise ValueError("decoy_interval must be 0, 1, or 2.")
 
         # Start training
         try:
