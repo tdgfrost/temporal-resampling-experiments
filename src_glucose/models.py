@@ -1,9 +1,7 @@
-import queue
-import threading
 from collections import deque, defaultdict
 from functools import partial
 from copy import deepcopy
-from typing import Tuple, Dict, Optional, Union
+from typing import Tuple, Dict, Optional, Union, Iterable
 
 import numpy as np
 import torch
@@ -17,71 +15,12 @@ from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
 from ppo_trainer import set_seed
 
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
-
-
-class DataPrefetcher:
-    """A simple prefetcher for custom dataset iterators."""
-
-    def __init__(self, dataset, prefetch_count: int = 2):
-        self.dataset_iter = iter(dataset)
-        self.prefetch_count = prefetch_count
-        # The queue will store batches that are *already on the GPU*.
-        self.queue = queue.Queue(maxsize=self.prefetch_count)
-
-        # Start the background thread
-        self.thread = threading.Thread(target=self._preload, daemon=True)
-        self.stopped = False
-        self.thread.start()
-
-    def _preload(self):
-        """Runs in the background thread."""
-        try:
-            while not self.stopped:
-                # 1. Get batch from the original dataset (CPU NumPy arrays)
-                #    This is where fetch_transition_batch() is called
-                batch = next(self.dataset_iter)
-
-                # 2. Put the batch into the queue.
-                #    The main thread will pull from this.
-                self.queue.put(batch)
-
-        except StopIteration:
-            self.queue.put(None)  # Send a "done" signal
-        except Exception as e:
-            print(f"Data prefetcher error: {e}")
-            self.queue.put(e)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        """Called by the main training loop `for batch in ...`."""
-        if self.stopped:
-            raise StopIteration
-
-        # Get the next batch from the queue (blocks if empty)
-        batch = self.queue.get()
-
-        if batch is None:
-            # Reached the end of the dataset
-            self.stop()
-            raise StopIteration
-        if isinstance(batch, Exception):
-            # An error occurred in the background thread
-            self.stop()
-            raise batch
-
-        return batch
-
-    def stop(self):
-        """Signal the thread to stop."""
-        self.stopped = True
-        # Clear the queue to unblock the thread if it's waiting
-        try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
+torch.backends.fp32_precision = "tf32"
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
+torch.backends.cudnn.rnn.fp32_precision = "tf32"
+torch.backends.cudnn.benchmark = True
 
 
 class FeatureEncoder(nn.Module):
@@ -204,12 +143,12 @@ class CustomBetaDistribution(nn.Module):
         entropy += self.log_scale * self.action_dim
         return entropy
 
-    def sample(self) -> torch.Tensor:
+    def sample(self, size: Iterable = (1,)) -> torch.Tensor:
         """
         Sample an action, using the reparameterization trick (rsample).
         """
         # Sample from Beta(alpha, beta) -> range [0, 1]
-        u = self.distribution.rsample()
+        u = self.distribution.rsample(size).squeeze(0)  # If size is 1, remove extra dim
 
         # Scale and shift to [low, high]
         return self.scale * u + self.bias
@@ -245,7 +184,7 @@ class CustomBetaDistribution(nn.Module):
         log_prob -= self.log_scale * self.action_dim
         return log_prob
 
-    def sample_and_logprob(self):
+    def sample_and_logprob(self, size: Iterable = (1,)):
         """
         Samples an action using the reparameterization trick AND computes
         its log-probability in a single, numerically stable pass.
@@ -253,7 +192,7 @@ class CustomBetaDistribution(nn.Module):
         :return: (actions, log_prob)
         """
         # 1. Sample from Beta(alpha, beta) -> range [0, 1]
-        u = self.distribution.rsample()
+        u = self.distribution.rsample(size).squeeze(0)  # If size is 1, remove extra dim
 
         # 2. Scale and shift to [low, high]
         actions = self.scale * u + self.bias
@@ -717,7 +656,8 @@ class _RecurrentBase(nn.Module):
         dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
                                     decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
                                     batch_size=self._batch_size, **dataset_kwargs)
-        dataloader = DataPrefetcher(dataset, prefetch_count=5)
+
+        dataloader = iter(dataset)
 
         # Set up our evaluators
         assert not (evaluators is not None and (evaluators_val is not None or evaluators_test is not None)), \
@@ -739,73 +679,65 @@ class _RecurrentBase(nn.Module):
             raise ValueError("decoy_interval must be 0, 1, or 2.")
 
         # Start training
-        try:
-            total_steps = n_epochs_train * steps_per_epoch
-            with tqdm(total=total_steps, desc="Progress", mininterval=2.0,
-                      disable=not show_progress) as pbar:
-                for epoch in range(1, n_epochs_train + 1):
-                    epoch_str = f"{epoch}/{n_epochs_train}"
+        total_steps = n_epochs_train * steps_per_epoch
+        with tqdm(total=total_steps, desc="Progress", mininterval=2.0,
+                  disable=not show_progress) as pbar:
+            for epoch in range(1, n_epochs_train + 1):
+                epoch_str = f"{epoch}/{n_epochs_train}"
 
-                    for step in range(steps_per_epoch):
-                        # Pull next batch from infinite stream
-                        try:
-                            batch = next(dataloader)
-                        except StopIteration:
-                            # Should not happen
+                for step in range(steps_per_epoch):
+                    # Pull next batch from infinite stream
+                    batch = next(dataloader)
+
+                    # Update the networks
+                    for key, func in self.update_funcs.items():
+                        loss_dict[key].append(func(*batch))
+
+                    if self.scaler is not None:
+                        self.scaler.update()
+
+                    # Soft update of target value network
+                    self.sync_target_networks()
+
+                    pbar.update(1)
+                    if (step + 1) % 50 == 0:
+                        pbar_dict = {'epoch': epoch_str,
+                                     'refresh': False}
+                        for key in loss_dict.keys():
+                            pbar_dict.update({key: f"{torch.stack(list(loss_dict[key])).mean().item():.5f}"})
+
+                        pbar.set_postfix(**pbar_dict)
+
+                # Logging
+                if epoch < n_epochs_train:
+                    do_eval = (epoch % n_epochs_per_eval == 0) and (evaluators_val is not None)
+                    if do_eval:
+                        log_dict = self._log_progress(
+                            epoch=epoch,
+                            evaluators=evaluators_val
+                        )
+
+                        current_return = log_dict['online_irregular_IQM']
+                        if current_return > best_online_return:
+                            best_online_return = current_return
+                            best_log_dict = log_dict
+                            best_epoch = epoch
+                            stop_early_count = 0
+                            self._save_best_model_state()
+                        else:
+                            stop_early_count += 1
+
+                        if early_stopping_limit is not None and stop_early_count >= early_stopping_limit:
+                            print(f"Early stopping triggered at epoch {epoch} "
+                                  f"- loading previous best state at epoch {best_epoch}.")
+                            self._load_best_model_state()
                             break
 
-                        # Update the networks
-                        for key, func in self.update_funcs.items():
-                            loss_dict[key].append(func(*batch))
-
-                        if self.scaler is not None:
-                            self.scaler.update()
-
-                        # Soft update of target value network
-                        self.sync_target_networks()
-
-                        pbar.update(1)
-                        if (step + 1) % 50 == 0:
-                            pbar_dict = {'epoch': epoch_str,
-                                         'refresh': False}
-                            for key in loss_dict.keys():
-                                pbar_dict.update({key: f"{torch.stack(list(loss_dict[key])).mean().item():.5f}"})
-
-                            pbar.set_postfix(**pbar_dict)
-
-                    # Logging
-                    if epoch < n_epochs_train:
-                        do_eval = (epoch % n_epochs_per_eval == 0) and (evaluators_val is not None)
-                        if do_eval:
-                            log_dict = self._log_progress(
-                                epoch=epoch,
-                                evaluators=evaluators_val
-                            )
-
-                            current_return = log_dict['online_irregular_IQM']
-                            if current_return > best_online_return:
-                                best_online_return = current_return
-                                best_log_dict = log_dict
-                                best_epoch = epoch
-                                stop_early_count = 0
-                                self._save_best_model_state()
-                            else:
-                                stop_early_count += 1
-
-                            if early_stopping_limit is not None and stop_early_count >= early_stopping_limit:
-                                print(f"Early stopping triggered at epoch {epoch} "
-                                      f"- loading previous best state at epoch {best_epoch}.")
-                                self._load_best_model_state()
-                                break
-
-                if (best_log_dict is None) or (evaluators_test is not evaluators_val):
-                    best_log_dict = self._log_progress(
-                        epoch="final",
-                        evaluators=evaluators_test
-                    )
-        finally:
-            # Clean up the prefetcher thread
-            dataloader.stop()
+            if (best_log_dict is None) or (evaluators_test is not evaluators_val):
+                best_log_dict = self._log_progress(
+                    epoch="final",
+                    evaluators=evaluators_test
+                )
 
         return best_log_dict
 
@@ -1422,7 +1354,7 @@ class RecurrentCQLSAC(_RecurrentBase):
             dist = self.dist.proba_distribution(params)
 
             # Sample policy and uniform actions -> [5, N, L, D]
-            cql_policy_actions = torch.stack([dist.sample() for _ in range(cql_n_samples)])
+            cql_policy_actions = dist.sample((cql_n_samples,))
             cql_uniform_actions = torch.empty(cql_n_samples, batch_size, seq_len, 1, device=obs.device)
             cql_uniform_actions.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
 

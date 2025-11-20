@@ -55,6 +55,11 @@ class RecurrentReplayBufferEnv:
         # This will store the valid start indices for each decoy interval
         self.sequence_info = {i: [] for i in range(3)}
 
+        # These will hold the huge lookup tables on Device (GPU/CPU)
+        self.indices_map = {i: None for i in range(3)}
+        self.padding_mask_map = {i: None for i in range(3)}
+        self.train_mask_map = {i: None for i in range(3)}
+
     def __iter__(self):
         return iter(self.generate())
 
@@ -70,6 +75,8 @@ class RecurrentReplayBufferEnv:
         self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
         self.max_sequence_length = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
         self.burn_in_length = burn_in_length if burn_in_length is not None else self.burn_in_length
+        # Record the device for later
+        self._device = device
 
         assert 0.0 < epoch_fraction <= 1.0, "epoch_fraction must be in the range (0, 1]"
 
@@ -131,37 +138,102 @@ class RecurrentReplayBufferEnv:
         # Set sequence info to numpy
         self.sequence_info[self.decoy_interval] = np.array(self.sequence_info[self.decoy_interval])
 
-        # n_samples is now the number of sequences in the buffer
-        self.n_samples = len(self.sequence_info[self.decoy_interval])
-        if self.n_samples == 0:
+        seq_info = self.sequence_info[self.decoy_interval]
+        if len(seq_info) == 0:
+            self.n_samples = 0
             self.segments = 0
-        else:
-            total_segments = self.n_samples // self.batch_size
-            if total_segments == 0:
-                self.segments = 0
-            else:
-                # Calculate segments based on the fraction
-                self.segments = int(total_segments * epoch_fraction)
-                # Ensure we always have at least one segment if data is available
-                if self.segments == 0:
-                    self.segments = 1
+            return
 
-        if self.segments == 0:
-            print(f"Warning: Not enough episodes for sampling. "
-                  f"Found {self.n_samples} episodes but batch size is {self.batch_size}.")
+        self.n_samples = len(seq_info)
 
-        # Record the device for later
-        self._device = device
+        # Calculate segments
+        total_segments = self.n_samples // self.batch_size
+        self.segments = int(total_segments * epoch_fraction) if total_segments > 0 else (1 if self.n_samples > 0 else 0)
+
+        # Dimensions
+        train_starts = seq_info[:, 0]  # Start of the training window
+        actual_lens = seq_info[:, 1]  # Length of the training window
+        ep_starts = seq_info[:, 2]  # Start of the episode (for burn-in clipping)
+
+        max_fetch = self.burn_in_length + self.max_sequence_length
+
+        # 1. Vectorized Index Grid
+        # Shape: [N_samples, Max_Fetch_Len]
+        # range_grid: [0, 1, 2, ... max_fetch-1]
+        range_grid = np.arange(max_fetch)
+
+        # Calculate the "Ideal" start index (Training Start - Burn In)
+        ideal_fetch_starts = train_starts - self.burn_in_length
+
+        # Calculate the "Actual" start index (Clamped at Episode Start)
+        # This handles the case where burn-in goes "before" the episode began
+        actual_fetch_starts = np.maximum(ep_starts, ideal_fetch_starts)
+
+        # Create the Master Index Map: broadcast (N, 1) + (1, L)
+        # This matrix contains the raw buffer indices for every timestep of every sample
+        indices_map = actual_fetch_starts[:, None] + range_grid[None, :]
+
+        # 2. Calculate Masks
+        # How much burn-in did we actually get?
+        actual_burn_in_lens = train_starts - actual_fetch_starts
+
+        # Total valid length (Actual Burn In + Actual Training Length)
+        total_valid_lens = actual_burn_in_lens + actual_lens
+
+        # Padding Mask: False where index > total_valid_length
+        # (1, L) < (N, 1)
+        padding_mask_map = range_grid[None, :] < total_valid_lens[:, None]
+
+        # Train Mask: True ONLY during the training phase (after burn-in)
+        # Must be valid data AND index >= burn_in_len
+        is_post_burnin = range_grid[None, :] >= actual_burn_in_lens[:, None]
+        train_mask_map = padding_mask_map & is_post_burnin
+
+        # 3. Convert to Tensors and Store on Device
+        # By moving these to GPU now, fetching becomes purely indexing VRAM
+        self.indices_map[self.decoy_interval] = torch.from_numpy(indices_map).long().to(device, non_blocking=True)
+
+        # Masks need to be stored as [N, L, 1] for easy multiplication later
+        self.padding_mask_map[self.decoy_interval] = torch.from_numpy(padding_mask_map).bool().unsqueeze(-1).to(device, non_blocking=True)
+        self.train_mask_map[self.decoy_interval] = torch.from_numpy(train_mask_map).bool().unsqueeze(-1).to(device, non_blocking=True)
+
+        # To avoid fetching indices that don't exist, set the padding mask 'false' indices to zero
+        self.indices_map[self.decoy_interval] *= self.padding_mask_map[self.decoy_interval].squeeze(-1).long()
+
+        # Ensure the raw data is on the device too (if not already)
+        if not self._tensors_set:
+            self.set_to_tensors(device=device)
 
     def generate(self):
         """
         Yields infinite batches of sequences for training.
+        Generates a large pool of indices on the GPU to minimize CPU-GPU communication.
         """
         assert self.segments > 0, "Not enough episodes to generate a batch. Call set_generate_params()."
 
+        # Configuration: How many batches to prepare in advance
+        # 1000 batches is usually a sweet spot between memory usage and compute frequency
+        batches_to_preload = 1000
+        preload_count = self.batch_size * batches_to_preload
+
         while True:
-            indices = np.random.randint(0, self.n_samples, size=self.batch_size)
-            yield self.fetch_transition_batch(indices, decoy_interval=self.decoy_interval)
+            # 1. Generate a massive tensor of random indices directly on the device
+            # This avoids Python for-loops and Host-to-Device transfers completely
+            indices_buffer = torch.randint(
+                low=0,
+                high=self.n_samples,
+                size=(preload_count,),
+                device=self._device,
+                dtype=torch.long
+            )
+
+            # 2. Iterate through the buffer in chunks
+            for i in range(0, preload_count, self.batch_size):
+                # Slicing a tensor is a "view" operation (zero overhead)
+                batch_indices = indices_buffer[i: i + self.batch_size]
+
+                # Pass the GPU tensor directly to fetch_transition_batch
+                yield self.fetch_transition_batch(batch_indices, decoy_interval=self.decoy_interval)
 
     def generate_initial_states(self, batch_size: int = 1024):
         """
@@ -277,85 +349,62 @@ class RecurrentReplayBufferEnv:
 
     def fetch_transition_batch(self, idxs: np.ndarray, decoy_interval: int = 0):
         """
-        Fetches data for a batch of sequences, pads them to max_sequence_length,
-        and returns the padded tensors along with a mask.
+        O(1) Fetching using pre-calculated GPU maps.
         """
-        batch_size = len(idxs)
-        # NEW: Total length is burn-in + max sequence length
-        max_train_len = self.max_sequence_length
-        burn_in_len = self.burn_in_length
-        max_fetch_len = burn_in_len + max_train_len
+        # 1. Convert requested sample indices to tensor
+        # (Using torch.tensor is fast for small arrays like batch_size=32)
+        batch_idxs = torch.as_tensor(idxs, device=self._device, dtype=torch.long)
 
-        obs_shape = self.observations[decoy_interval][0].shape
+        # 2. Retrieve the specific indices and masks for this batch from the Maps
+        # These lookups are extremely fast (GPU indexing)
+        # Shape: [Batch, Max_Fetch_Len]
+        gather_indices = self.indices_map[decoy_interval][batch_idxs]
 
-        # Create buffers with the new max_fetch_len
-        obs_batch_np = np.empty((batch_size, max_fetch_len, *obs_shape), dtype=np.float32)
-        next_obs_batch_np = np.empty_like(obs_batch_np)
-        action_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.float32)
-        reward_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.float32)
-        done_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.bool)
-        visible_batch_np = np.empty((batch_size, max_fetch_len, 1), dtype=np.bool)
+        # Shape: [Batch, Max_Fetch_Len, 1]
+        padding_mask = self.padding_mask_map[decoy_interval][batch_idxs]
+        train_mask = self.train_mask_map[decoy_interval][batch_idxs]
 
-        # 1. Get info from the sampled indices
-        seq_info_batch = self.sequence_info[decoy_interval][idxs]
-        train_starts = seq_info_batch[:, 0]
-        actual_train_lens = seq_info_batch[:, 1]
-        ep_starts = seq_info_batch[:, 2]
+        # 3. Retrieve Next Indices
+        # We simply shift the gather indices by 1.
+        max_possible_idx = self.indices_map[decoy_interval].max()
+        next_gather_indices = torch.clip(gather_indices + 1, max=max_possible_idx)
 
-        # 2. Calculate burn-in and fetch indices
-        # Find the real start of data to fetch (clipping at episode start)
-        fetch_starts = np.maximum(ep_starts, train_starts - burn_in_len)
-        # Calculate how many burn-in steps we *actually* got
-        actual_burn_in_lens = train_starts - fetch_starts
-        # Calculate total length of data to fetch
-        total_fetch_lens = actual_burn_in_lens + actual_train_lens
+        # 4. Gather Data
+        # We use standard PyTorch advanced indexing: Tensor[Tensor]
+        # This is highly optimized on GPU.
 
-        # 3. Create index grids. We will right-align all sequences.
-        base_indices = np.expand_dims(np.arange(max_fetch_len), 0)
-        # Mask for all valid data (burn-in + train)
-        # Data is valid from index 0 up to total_fetch_lens
-        padding_mask_np = base_indices < np.expand_dims(total_fetch_lens, 1)
+        obs = self.observations[decoy_interval][gather_indices]
+        next_obs = self.observations[decoy_interval][next_gather_indices]
 
-        # 4. Create index grids for fetching all data in one go
-        # This calculates the buffer index for each position in the output tensor
-        indices_np = np.expand_dims(fetch_starts, 1) + base_indices
-        next_indices_np = indices_np + 1
+        # Actions/Rewards/Dones usually need unsqueeze(-1) if stored as flat [N]
+        # If they are stored as [N, 1], remove the unsqueeze.
+        # Assuming they are stored as [N, dim] based on previous code.
 
-        # 5. Fetch all data using the masks and indices
-        obs_batch_np[padding_mask_np] = self.observations[decoy_interval][indices_np[padding_mask_np]]
-        action_batch_np[padding_mask_np] = np.expand_dims(self.actions[decoy_interval][indices_np[padding_mask_np]], -1)
-        reward_batch_np[padding_mask_np] = np.expand_dims(self.rewards[decoy_interval][indices_np[padding_mask_np]], -1)
-        done_batch_np[padding_mask_np] = np.expand_dims(self.dones[decoy_interval][indices_np[padding_mask_np]], -1)
-        visible_batch_np[padding_mask_np] = np.expand_dims(
-            self.visible_states[decoy_interval][indices_np[padding_mask_np]], -1)
-        next_obs_batch_np[padding_mask_np] = self.observations[decoy_interval][next_indices_np[padding_mask_np]]
+        def _gather_helper(source):
+            data = source[decoy_interval][gather_indices]
+            if data.ndim == 2:  # If [Batch, Seq], add feature dim
+                return data.unsqueeze(-1)
+            return data
 
-        # 7. Create the TRAINING mask (excludes padding AND burn-in)
-        # Training data starts *after* the actual burn-in
-        train_mask_start_idx = np.expand_dims(actual_burn_in_lens, -1)
-        # Mask is True from the start index up to the end of valid data (handled by padding_mask)
-        train_mask_bool = (base_indices >= train_mask_start_idx) & padding_mask_np
+        action = _gather_helper(self.actions)
+        reward = _gather_helper(self.rewards)
+        done = _gather_helper(self.dones)
+        visible = _gather_helper(self.visible_states)
 
-        # Add dimension to masks to match data [B, S, 1]
-        padding_mask_np = np.expand_dims(padding_mask_np, -1)
-        train_mask_np = np.expand_dims(train_mask_bool, -1)
+        # Next Visible (Just shift, pad last with False)
+        # Or gather using next_gather_indices
+        next_visible = self.visible_states[decoy_interval][next_gather_indices]
+        if next_visible.ndim == 2:
+            next_visible = next_visible.unsqueeze(-1)
 
-        # Get the next_padding_mask for next_obs
-        next_padding_mask_np = np.roll(padding_mask_np, shift=-1, axis=1)
-        next_padding_mask_np[:, -1, :] = False  # Last step does not have a next step
+        # 5. Create Next Padding Mask
+        # Shift padding mask one step to the left
+        next_padding_mask = torch.roll(padding_mask, shifts=-1, dims=1)
+        # The last step of a sequence never has a valid 'next', set to False
+        next_padding_mask[:, -1, :] = False
 
-        # This can be derived from the visible_batch after fetching
-        next_visible_batch_np = np.roll(visible_batch_np, shift=-1, axis=1)
-        next_visible_batch_np[:, -1] = False  # Last step does not have a next step
-
-        # Set tensors to correct device
-        all_arrs = (obs_batch_np, action_batch_np, reward_batch_np, next_obs_batch_np, done_batch_np,
-                    visible_batch_np, next_visible_batch_np, padding_mask_np, next_padding_mask_np, train_mask_np)
-        all_tensors_set = []
-        for some_arr in all_arrs:
-            all_tensors_set.append(torch.from_numpy(some_arr).to(self._device, non_blocking=True))
-
-        return tuple(all_tensors_set)
+        return (obs, action, reward, next_obs, done, visible, next_visible, padding_mask, next_padding_mask,
+                train_mask)
 
     def save(self, path: str):
         if os.path.exists(path):
