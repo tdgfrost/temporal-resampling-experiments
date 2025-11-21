@@ -286,7 +286,7 @@ if __name__ == "__main__":
                   f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
             # Set offline model template and training params
-            early_stopping_limit = 10 if DECOY_INTERVAL == 2 else 5
+            early_stopping_limit = 10 if DECOY_INTERVAL == 2 and not is_cql else 5
             n_train_epochs = 50
             n_epochs_per_eval = 1
 

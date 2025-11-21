@@ -596,6 +596,7 @@ class _RecurrentBase(nn.Module):
         self.scaler = None
         self._scaler_dtype = None
         self._batch_diff = None
+        self.steps_per_epoch = None
         self._critic_lr = critic_lr
         self._value_lr = value_lr
         self._actor_lr = actor_lr
@@ -671,12 +672,10 @@ class _RecurrentBase(nn.Module):
         best_log_dict = None
         best_epoch = None
 
-        if decoy_interval in [0, 1]:
-            steps_per_epoch = 1_000
-        elif decoy_interval in [2]:
-            steps_per_epoch = 500
-        else:
-            raise ValueError("decoy_interval must be 0, 1, or 2.")
+        assert self.steps_per_epoch is not None, \
+            "Please specify self.steps_per_epoch in the child class."
+
+        steps_per_epoch = self.steps_per_epoch[decoy_interval]
 
         # Start training
         total_steps = n_epochs_train * steps_per_epoch
@@ -991,6 +990,12 @@ class RecurrentIQL(_RecurrentBase):
         self._tau_target = tau_target
         self._beta = beta
 
+        # Define steps_per_epoch - should map based on decoy_interval
+        if self._cloning_only:
+            self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500}
+        else:
+            self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500}
+
         # Set our update functions
         if not self._cloning_only:
             self.update_funcs.update({
@@ -1239,9 +1244,12 @@ class RecurrentCQLSAC(_RecurrentBase):
         self._target_entropy_alpha = -1
         self._target_cql_alpha_gap = 0.
         self._entropy_alpha = torch.tensor(0.0, device=self._device)
-        self._cql_alpha = torch.tensor(10.0, device=self._device)
+        self._cql_alpha = torch.tensor(1.0, device=self._device)
         self.cql_uniform_log_probs = -torch.log(torch.tensor(INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW,
                                                              device=self._device))
+
+        # Define steps_per_epoch - should map based on decoy_interval
+        self.steps_per_epoch = {0: 500, 1: 500, 2: 250}
 
         # Set our update functions
         self.update_funcs.update({'policy_loss': self.update_actor,
@@ -1565,6 +1573,9 @@ class RecurrentFQE(_RecurrentBase):
         kwargs.pop('gamma', None)
         super().__init__(gamma=1.0, *args, **kwargs)
         self._tau_target = tau_target
+
+        # Define steps_per_epoch - should map based on decoy_interval
+        self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500}
 
         # Set our update functions
         self.update_funcs.update({'critic_loss': self.update_critic})
