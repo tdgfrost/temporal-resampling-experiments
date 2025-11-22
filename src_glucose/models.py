@@ -1330,7 +1330,7 @@ class RecurrentCQLSAC(_RecurrentBase):
 
     @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     def _update_critic_inference_compiled(self, obs, acts, visible, train_mask,
-                                          lstm_out_q, next_lstm_out_pi, next_lstm_out_tgt, cql_lstm_out_pi):
+                                          lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt):
         # -- Inference for Bellman loss -- #
         # lstm_out_q, _ = self.shared_critic_encoder(obs, train_mask=train_mask)
         q1_pred = self.critic_net1(lstm_out_q, actions=acts)
@@ -1357,54 +1357,73 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         # -- Inference for CQL loss -- #
         batch_size, seq_len, obs_dim = obs.shape
-        cql_n_samples = 10  # for each of policy and uniform
+
+        # Define sample counts (Split 3 ways)
+        n_curr = 7
+        n_next = 7
+        n_unif = 6
 
         with torch.no_grad():
-            # 5. Sample our actions
-            params = self.policy_net(cql_lstm_out_pi, actions=None)
+            # A. Uniform Samples
+            cql_unif_actions = torch.empty(n_unif, batch_size, seq_len, 1, device=obs.device)
+            cql_unif_actions.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+            cql_unif_log_probs = torch.log(
+                torch.tensor(1.0 / (INSULIN_ACTION_HIGH - INSULIN_ACTION_LOW), device=obs.device))
+            cql_unif_log_probs = cql_unif_log_probs.expand(n_unif, batch_size, seq_len, 1)
 
-            # Create the Beta distribution
-            dist = self.dist.proba_distribution(params)
+            # B. Current Policy Samples (using cql_lstm_out_pi)
+            params_curr = self.policy_net(lstm_out_pi, actions=None)
+            dist_curr = self.dist.proba_distribution(params_curr)
+            cql_curr_actions = dist_curr.sample((n_curr,))
+            cql_curr_log_probs = dist_curr.log_prob(cql_curr_actions)
 
-            # Sample policy and uniform actions -> [5, N, L, D]
-            cql_policy_actions = dist.sample((cql_n_samples,))
-            cql_uniform_actions = torch.empty(cql_n_samples, batch_size, seq_len, 1, device=obs.device)
-            cql_uniform_actions.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+            # C. Next Policy Samples (using next_lstm_out_pi)
+            # Note: We reuse the next_lstm_out_pi passed in for the Bellman step
+            params_next = self.policy_net(next_lstm_out_pi, actions=None)
+            dist_next = self.dist.proba_distribution(params_next)
+            cql_next_actions = dist_next.sample((n_next,))
+            cql_next_log_probs = dist_next.log_prob(cql_next_actions)
 
-            # Get the log_probs for these actions
-            cql_policy_log_probs = dist.log_prob(cql_policy_actions)
-            cql_uniform_log_probs = self.cql_uniform_log_probs.expand_as(cql_policy_log_probs)
+            # Concatenate all sampled actions
+            cql_sampled_actions = torch.cat([cql_curr_actions, cql_next_actions, cql_unif_actions], 0)
+            cql_sampled_log_probs = torch.cat([cql_curr_log_probs, cql_next_log_probs, cql_unif_log_probs], 0)
 
-            # Concat together and reshape back to N,L,D
-            cql_sampled_actions = torch.cat([cql_policy_actions, cql_uniform_actions], 0)
-            cql_sampled_log_probs = torch.cat([cql_policy_log_probs, cql_uniform_log_probs], 0)
+        # Calculate the Q values for sampled actions
+        total_samples = n_curr + n_next + n_unif
 
-        # Calculate the Q values for these sampled actions -> [10, N, L]
-        total_samples = cql_n_samples * 2
+        # Expand hidden state to match sample dimension
         lstm_out_q_expanded = lstm_out_q.unsqueeze(0).expand(total_samples, -1, -1, -1)
 
+        # Flatten for batch processing
         flat_hidden = lstm_out_q_expanded.reshape(-1, seq_len, lstm_out_q.shape[-1])
         flat_actions = cql_sampled_actions.reshape(-1, seq_len, cql_sampled_actions.shape[-1])
 
-        # Run critics
         flat_q1 = self.critic_net1(flat_hidden, actions=flat_actions)
         flat_q2 = self.critic_net2(flat_hidden, actions=flat_actions)
 
-        # Unflatten back to (total_samples, batch, seq, 1)
+        # Reshape back to [n_samples, batch, seq, 1]
         cql_q1_sampled = flat_q1.view(total_samples, batch_size, seq_len, 1)
         cql_q2_sampled = flat_q2.view(total_samples, batch_size, seq_len, 1)
 
-        # Standard CQL Loss calculation
+        # Importance sampling correct (Q - log_pi)
         cql_q1_sampled = cql_q1_sampled - cql_sampled_log_probs
         cql_q2_sampled = cql_q2_sampled - cql_sampled_log_probs
 
+        # Add in the current data Q values
+        cql_q1_combined = torch.cat([cql_q1_sampled, q1_pred.unsqueeze(0)], dim=0)
+        cql_q2_combined = torch.cat([cql_q2_sampled, q2_pred.unsqueeze(0)], dim=0)
+
         # Calculate the logsumexp
         temperature = 1.0
-        cql_q1_sampled = cql_q1_sampled / temperature
-        cql_q2_sampled = cql_q2_sampled / temperature
+        cql_q1_combined = cql_q1_combined / temperature
+        cql_q2_combined = cql_q2_combined / temperature
 
-        cql_q1_logsumexp = torch.logsumexp(cql_q1_sampled, dim=0) * temperature - np.log(total_samples)
-        cql_q2_logsumexp = torch.logsumexp(cql_q2_sampled, dim=0) * temperature - np.log(total_samples)
+        cql_q1_logsumexp = torch.logsumexp(cql_q1_combined / temperature, dim=0) * temperature
+        cql_q2_logsumexp = torch.logsumexp(cql_q2_combined / temperature, dim=0) * temperature
+
+        # Log(N) normalization:
+        cql_q1_logsumexp = cql_q1_logsumexp - np.log(total_samples + 1)
+        cql_q2_logsumexp = cql_q2_logsumexp - np.log(total_samples + 1)
 
         # Subtract the mean dataset Q from the logsumexp Q
         cql_loss1 = cql_q1_logsumexp - q1_pred
@@ -1454,13 +1473,13 @@ class RecurrentCQLSAC(_RecurrentBase):
             # Do our LSTM inferences (already optimised under cudnn, slows down .compile)
             lstm_out_q, _ = self.shared_critic_encoder(obs, train_mask=train_mask)
             with torch.no_grad():
+                lstm_out_pi, _ = self.actor_encoder(obs, train_mask=None)
                 next_lstm_out_pi, _ = self.actor_encoder(next_obs, train_mask=None)
                 next_lstm_out_tgt, _ = self.target_shared_critic_encoder(next_obs, train_mask=None)
-                cql_lstm_out_pi, _ = self.actor_encoder(obs, train_mask=None)
 
             q1_pred, q2_pred, next_v, cql_loss = self._update_critic_inference_compiled(
                 obs, acts, visible, train_mask,
-                lstm_out_q, next_lstm_out_pi, next_lstm_out_tgt, cql_lstm_out_pi
+                lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt
             )
 
             # Create the Bellman loss
