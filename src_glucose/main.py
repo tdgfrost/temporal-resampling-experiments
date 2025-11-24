@@ -85,8 +85,17 @@ if __name__ == "__main__":
     EXPECTILE = args.expectile
     BETA = args.beta
     DECOY_INTERVAL = args.decoy_interval
-
     target_agent_path = args.target_agent_path
+
+    logs = defaultdict(list)
+    all_scores = defaultdict(list)
+    logs['algo'].append(model_type)
+    logs['decoy_interval'].append(DECOY_INTERVAL)
+
+    # Set random seeds for experiments
+    rng = np.random.default_rng(MASTER_SEED)
+    n_runs = 50
+    experiment_seeds = rng.integers(low=0, high=2 ** 32 - 1, size=n_runs)
 
     dummy_env = make_glucose_env()
     offline_model = RecurrentIQL if is_iql else (RecurrentCQLSAC if is_cql else None)
@@ -112,24 +121,13 @@ if __name__ == "__main__":
             assert os.path.exists(ppo_agent), "Specified PPO agent path does not exist."
             ppo_agent = RecurrentPPO.load_checkpoint(ppo_agent, **PPO_ARGS)
 
-        # Load offline agent
-        elif train_fqe and not is_ppo:
-            if target_agent_path is None:
-                target_agent_path = choose_offline_agent(model_type, DECOY_INTERVAL)
-            offline_agent = f'../logs_glucose/iql_models/{model_type}/decoy_interval_{DECOY_INTERVAL}/{target_agent_path}'
-            assert os.path.exists(offline_agent), "Specified offline agent path does not exist."
-
-            # Load into the model
-            # - extract seed first
-            seed = int(target_agent_path.split('seed=')[-1].replace('.pt', ''))
-            OFFLINE_ARGS.update({'seed': seed})
-            offline_agent = offline_model(**OFFLINE_ARGS)
-            offline_agent.load_checkpoint(target_agent_path)
-
     # ===== FQE Evaluation ===== #
     if train_fqe:
         """
-        Should we maybe get the list of 50 models and randomly select 5 models? and do FQE on each?
+        We will iterate through all 50 models (for a given experiment) and train FQE ONCE (using the same random seed).
+
+        To-do:
+        - Create validation dataset(?) for FQE early stopping
         """
         # Load our dataset
         dataset_size = 1_000_000
@@ -138,36 +136,67 @@ if __name__ == "__main__":
             "Replay buffer not found. Please generate it by training an offline agent first."
         dataset.load(f'./replay_buffer')
 
-        # Specify our target agent
-        target_agent = ppo_agent if ppo_agent is not None else offline_agent
-        assert target_agent is not None, "No target agent loaded for FQE evaluation."
-
         # Set up our FQE evaluator
+        early_stopping_key = 'fqe_evaluation_IQM'
         evaluator = {'fqe_evaluation': FQEEvaluator(dataset=dataset,
                                                     batch_size=1024)}
 
-        # Create our FQE model
-        OFFLINE_ARGS.update({'seed': seed})
-        algo = RecurrentFQE(**OFFLINE_ARGS)
+        # Get our list of trained models
+        if is_ppo or is_random:
+            # Get seeds
+            model_file_list = experiment_seeds
+        else:
+            target_model_path = f'../logs_glucose/iql_models/{model_type}/decoy_interval_{DECOY_INTERVAL}'
+            model_file_list = os.listdir(target_model_path)
 
-        # Fit our FQE model
-        log_dict = algo.fit(
-            dataset=dataset,
-            n_epochs_train=50,
-            n_epochs_per_eval=1,
-            evaluators=evaluator,
-            decoy_interval=DECOY_INTERVAL,
-            early_stopping_limit=None,
-            dataset_kwargs={},
-        )
+        for target_model_name in model_file_list:
+            if is_ppo or is_random:
+                seed = target_model_name
+                offline_agent = ppo_agent if is_ppo else CallableRandomAgent(dummy_env=dummy_env, **OFFLINE_ARGS)
+            else:
+                # Extract the seed and load the pretrained agent
+                seed = int(target_model_name.split('seed=')[-1].replace('.pt', ''))
 
-        print("\n====== CURRENTLY MISSING CODE TO SAVE THE FQE RESULTS ======\n")
+                target_agent_path = os.path.join(target_model_path, target_model_name)
+                OFFLINE_ARGS.update({'seed': seed})
+                offline_agent = offline_model(**OFFLINE_ARGS)
+                offline_agent.load_checkpoint(target_agent_path)
 
-        # Save model state dicts in pytorch
-        model_save_path = f"../logs_glucose/iql_models/{model_type}/decoy_interval_{DECOY_INTERVAL}/fqe_models"
-        current_model_path = os.path.join(model_save_path, f'seed={seed}.pt')
-        os.makedirs(model_save_path, exist_ok=True)
-        algo.save_checkpoint(current_model_path)
+            # Create our FQE model
+            OFFLINE_ARGS.update({'target_model': offline_agent})
+            algo = RecurrentFQE(**OFFLINE_ARGS)
+
+            # Fit our FQE model
+            log_dict = algo.fit(
+                dataset=dataset,
+                n_epochs_train=10,
+                n_epochs_per_eval=10,
+                evaluators=evaluator,
+                early_stopping_key=early_stopping_key,
+                decoy_interval=DECOY_INTERVAL,
+                early_stopping_limit=None,
+                dataset_kwargs={},
+            )
+
+            # Add to our list of run scores
+            for key in evaluator.keys():
+                all_scores[key].append(log_dict[key])
+
+        # Calculate our bootstrap IQM for each evaluator
+        for key, scores in all_scores.items():
+            scores = np.array(scores)
+            bootstrap_scores = np.random.choice(scores, size=(100_000, n_runs), replace=True)
+            bootstrap_iqm = trim_mean(bootstrap_scores, proportiontocut=0.25, axis=-1)
+            bootstrap_low_q = np.percentile(bootstrap_iqm, 2.5)
+            bootstrap_high_q = np.percentile(bootstrap_iqm, 97.5)
+            logs[f'{key}_iqm'] = np.mean(bootstrap_iqm)
+            logs[f'{key}_2.5%'] = bootstrap_low_q
+            logs[f'{key}_97.5%'] = bootstrap_high_q
+
+        # Save logs
+        os.makedirs('../logs_glucose/fqe_logs', exist_ok=True)
+        csv_path = f'../logs_glucose/fqe_logs/decoy={DECOY_INTERVAL}_{model_type}.csv'
+        pl.DataFrame(logs).write_csv(csv_path)
 
     # ===== Training PPO ===== #
     if train_ppo:
@@ -198,22 +227,12 @@ if __name__ == "__main__":
         else:
             raise ValueError("Invalid offline model type.")
 
-        logs = defaultdict(list)
-        all_scores = defaultdict(list)
-
-        logs['algo'].append(model_type)
-        logs['decoy_interval'].append(DECOY_INTERVAL)
-
-        # Create our random seeds
-        rng = np.random.default_rng(MASTER_SEED)
-        n_runs = 50
-        experiment_seeds = rng.integers(low=0, high=2**32 - 1, size=n_runs)
-
         # Get our evaluators
         evaluators_val = dict()
         evaluators_test = dict()
 
         # - Online evaluation
+        early_stopping_key = 'online_irregular_IQM'
         for key, interval in [
             ["online_irregular", 0],
             ["online_interpolated", 1],
@@ -307,6 +326,7 @@ if __name__ == "__main__":
                     n_epochs_per_eval=n_epochs_per_eval,
                     evaluators_val=evaluators_val,
                     evaluators_test=evaluators_test,
+                    early_stopping_key=early_stopping_key,
                     decoy_interval=DECOY_INTERVAL,
                     early_stopping_limit=early_stopping_limit,
                     dataset_kwargs={},

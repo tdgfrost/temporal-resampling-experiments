@@ -897,15 +897,17 @@ class FQEEvaluator:
                 # Get Q-values
                 fqe_preds = algo.get_value_estimate(obs, acts)
 
-            all_fqe_preds.append(fqe_preds)
+            all_fqe_preds.append(fqe_preds.squeeze())
 
-        all_fqe_preds = torch.cat(all_fqe_preds, dim=0).flatten().cpu().numpy()  # [N]
+        all_fqe_preds = torch.cat(all_fqe_preds).cpu().numpy()  # [N]
 
         # We need to rescale q_preds back to original reward scale
         # V_raw = V_norm * sigma + (mu * length)
         # We do this per-prediction to get the distribution of raw returns
         raw_fqe_preds = all_fqe_preds * sigma + (mu * mean_ep_length)
-        iqr_fqe_preds = trimboth(raw_fqe_preds, proportiontocut=0.25)
+        # Temporarily disabled IQR trimming for FQE predictions
+        # iqr_fqe_preds = trimboth(raw_fqe_preds, proportiontocut=0.25)
+        iqr_fqe_preds = raw_fqe_preds
 
         return iqr_fqe_preds
 

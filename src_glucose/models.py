@@ -23,6 +23,23 @@ torch.backends.cudnn.rnn.fp32_precision = "tf32"
 torch.backends.cudnn.benchmark = True
 
 
+class CallableRandomAgent(nn.Module):
+    def __init__(self, batch_size: int = 1024, device: str = 'cpu', *args, **kwargs):
+        super().__init__()
+        self.register_buffer('action_samples', torch.empty(batch_size, 1, device=device))
+        self.current_batch_size = 1024
+        self.action_samples.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+
+    def predict(self, obs, *args, **kwargs):
+        batch_size = len(obs)
+        device = obs.device
+        if batch_size != self.current_batch_size:
+            self.current_batch_size = batch_size
+            self.register_buffer('action_samples', torch.empty(batch_size, 1, device=device))
+        self.action_samples.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH).to(device)
+        return self.action_samples, None
+
+
 class FeatureEncoder(nn.Module):
     """
     A feature extractor that uses self-attention on the input features.
@@ -559,6 +576,10 @@ class RecurrentNet(nn.Module):
             "Action encoder must be provided if actions are used."
 
         if actions is not None:
+            assert actions.size(0) == input_features.size(0), \
+                "Batch size mismatch between input_features and actions."
+            if actions.ndim < input_features.ndim:
+                actions = actions.unsqueeze(1).expand(-1, input_features.size(1), -1)
             encoded_actions = self.action_encoder(actions)
             input_features = torch.concat((input_features, encoded_actions), -1)
 
@@ -642,6 +663,7 @@ class _RecurrentBase(nn.Module):
             evaluators=None,
             evaluators_val=None,
             evaluators_test=None,
+            early_stopping_key: Optional[str] = None,
             show_progress: bool = True,
             decoy_interval: int = 0,
             early_stopping_limit: Optional[int] = 3,
@@ -665,6 +687,8 @@ class _RecurrentBase(nn.Module):
             "Please specify either 'evaluators' OR 'evaluators_val/evaluators_test', not both."
         evaluators_val = evaluators_val or evaluators
         evaluators_test = evaluators_test or evaluators
+        assert early_stopping_limit == 0 or early_stopping_key is not None, \
+            "Please specify 'early_stopping_key' if using early stopping."
 
         loss_dict = self._reset_loss_dict()
         stop_early_count = 0
@@ -716,7 +740,7 @@ class _RecurrentBase(nn.Module):
                             evaluators=evaluators_val
                         )
 
-                        current_return = log_dict['online_irregular_IQM']
+                        current_return = log_dict[early_stopping_key]
                         if current_return > best_online_return:
                             best_online_return = current_return
                             best_log_dict = log_dict
@@ -766,7 +790,8 @@ class _RecurrentBase(nn.Module):
         pass
 
     def predict(self, obs: np.ndarray, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                deterministic: bool = False, with_dist: bool = False) -> Union[
+                deterministic: bool = False, with_dist: bool = False, action_as_tensor: bool = False,
+                *args, **kwargs) -> Union[
         Tuple[CustomBetaDistribution, np.ndarray, Tuple[torch.Tensor, torch.Tensor]],
         Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor]]
     ]:
@@ -799,10 +824,13 @@ class _RecurrentBase(nn.Module):
         else:
             action = dist.sample()
 
-        if with_dist:
-            return dist, action.detach().squeeze(-1).cpu().numpy(), next_hidden_state
+        if not action_as_tensor:
+            action = action.detach().cpu().numpy()
 
-        return action.detach().squeeze(-1).cpu().numpy(), next_hidden_state
+        if with_dist:
+            return dist, action, next_hidden_state
+
+        return action, next_hidden_state
 
     @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     def _filter_to_correct_visibles(self, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
@@ -1594,7 +1622,7 @@ class RecurrentFQE(_RecurrentBase):
         self._tau_target = tau_target
 
         # Define steps_per_epoch - should map based on decoy_interval
-        self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500}
+        self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 1_000}
 
         # Set our update functions
         self.update_funcs.update({'critic_loss': self.update_critic})
@@ -1636,12 +1664,6 @@ class RecurrentFQE(_RecurrentBase):
         self.q_net = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
         self.q_target_net = RecurrentNet(output_size=1, has_action_encoder=True, **decoder_kwargs).to(self._device)
 
-        # --- Placeholders to satisfy Base Class calls ---
-        # FQE doesn't train a policy, but the base class might call self.policy_net in specific flows
-        # We point these to the target_model's nets just in case, though we won't optimize them.
-        self.actor_encoder = self.target_model.actor_encoder
-        self.policy_net = self.target_model.policy_net
-
         # --- Optimizers ---
         # We only optimize the FQE Q-networks
         self.critic_optim = torch.optim.Adam(
@@ -1675,7 +1697,8 @@ class RecurrentFQE(_RecurrentBase):
         # 2. Compute Target Q(s', pi(s'))
         with torch.no_grad():
             # Get the next action from the target policy
-            next_action, _ = self.target_model.predict(next_obs, deterministic=True)
+            next_action, _ = self.target_model.predict(next_obs, deterministic=True, action_as_tensor=True,
+                                                       return_last_output=False)
 
             # Compute Q_target values using target Q nets
             next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
@@ -1723,12 +1746,13 @@ class RecurrentFQE(_RecurrentBase):
         for target_param, param in zip(self.q_target_net.parameters(), self.q_net.parameters()):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
 
-    def predict(self, obs: np.ndarray, hidden_state=None, deterministic: bool = False, with_dist: bool = False):
+    def predict(self, obs: np.ndarray, hidden_state=None, deterministic: bool = False, with_dist: bool = False,
+                action_as_tensor: bool = False):
         """
         Delegates prediction to the target model.
         When we evaluate RecurrentFQE, we are evaluating the behavior of the target_model.
         """
-        raise Exception("Not implemented for FQE")
+        raise NotImplementedError("Not implemented for FQE")
 
     def get_value_estimate(self, obs, acts):
         """

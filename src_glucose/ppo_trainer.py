@@ -285,13 +285,18 @@ class EncoderActorCriticLSTM(nn.Module):
 
         return lstm_out, last_outputs, new_hidden
 
-    def forward(self, x, hidden_state=None, deterministic=False, unsorted_indices=None):
+    def forward(self, x, hidden_state=None, deterministic=False, unsorted_indices=None, return_last_output: bool = True):
         lstm_out, last_outputs, new_hidden = self.forward_lstm(
             x, hidden_state=hidden_state, unsorted_indices=unsorted_indices
         )
 
-        value = self.critic_head(last_outputs)
-        actor_out = self.actor_head(last_outputs)
+        if return_last_output:
+            encoded_x = last_outputs
+        else:
+            encoded_x = lstm_out
+
+        value = self.critic_head(encoded_x)
+        actor_out = self.actor_head(encoded_x)
 
         dist = self.dist.proba_distribution(actor_out)
 
@@ -310,7 +315,7 @@ class EncoderActorCriticLSTM(nn.Module):
                                                                                   self.hidden_dim)
 
 
-class RecurrentPPO:
+class RecurrentPPO(nn.Module):
     def __init__(
             self,
             # Env params
@@ -339,6 +344,7 @@ class RecurrentPPO:
             eval_freq=10000,
             eval_episodes=500,
             log_dir="../logs_glucose/ppo_logs"):
+        super().__init__()
         # Store device, but keep everything on CPU initially
         self.device = device
         # Set the seed
@@ -474,13 +480,16 @@ class RecurrentPPO:
 
         return new_agent
 
-    def predict(self, obs, hidden_state=None, deterministic=True):
+    def predict(self, obs, hidden_state=None, deterministic=True, action_as_tensor: bool = False,
+                return_last_output: bool = True):
         """
         Get the model's action for a given observation.
 
         :param obs: The current observation (should be a sequence)
         :param hidden_state: The last hidden state of the LSTM
         :param deterministic: Whether to return a deterministic or stochastic action
+        :param action_as_tensor: Whether to return the action as a torch tensor
+        :param return_last_output: Whether to use the last LSTM output or the full sequence
         :return: the model's action and the next hidden state
         """
         # obs is expected to be of shape (seq_len, features)
@@ -495,19 +504,22 @@ class RecurrentPPO:
                 action, _, new_hidden_state = self.ac_network(
                     obs_tensor,
                     hidden_state=hidden_state,
-                    deterministic=True
+                    deterministic=True,
+                    return_last_output=return_last_output
                 )
             else:
                 # Sample for stochastic action
                 dist, _, new_hidden_state = self.ac_network(
                     obs_tensor,
                     hidden_state=hidden_state,
-                    deterministic=False
+                    deterministic=False,
+                    return_last_output=return_last_output
                 )
                 action = dist.sample()
 
         # The environment expects a flattened numpy array
-        action = action.cpu().numpy().flatten()
+        if not action_as_tensor:
+            action = action.cpu().numpy().flatten()
         return action, new_hidden_state
 
     def _compute_advantages_and_returns(self, rewards, values, dones, steps_taken):
