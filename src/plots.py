@@ -152,5 +152,5 @@ g.fig.legend(
     title_fontsize=14
 )
 
-plt.savefig('../logs/iql_minigrid_logs/final_plot.png', dpi=1200, bbox_inches='tight')
+plt.savefig('../logs/iql_minigrid_logs/final_plot.png', dpi=1200)#, bbox_inches='tight')
 plt.show()
