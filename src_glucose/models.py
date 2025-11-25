@@ -12,7 +12,7 @@ from torch.distributions import Beta, Normal
 from tqdm import tqdm
 
 from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
-from ppo_trainer import set_seed
+from ppo_trainer import set_seed, RecurrentPPO
 
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
 torch.backends.fp32_precision = "tf32"
@@ -23,21 +23,63 @@ torch.backends.cudnn.rnn.fp32_precision = "tf32"
 torch.backends.cudnn.benchmark = True
 
 
-class CallableRandomAgent(nn.Module):
-    def __init__(self, batch_size: int = 1024, device: str = 'cpu', *args, **kwargs):
+class CallableDummyDist(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.register_buffer('action_samples', torch.empty(batch_size, 1, device=device))
-        self.current_batch_size = 1024
-        self.action_samples.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+        self.params = None
+
+    def proba_distribution(self, params: torch.Tensor, *args, **kwargs):
+        self.params = params
+        return self
+
+    def sample(self, size: Tuple = (1,), *args, **kwargs):
+        (batch_size,) = size  # Must be tuple of length 1
+        if batch_size > 1:
+            self.params = self.params.new_empty(batch_size, *self.params.shape)
+        self.params.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+        return self.params
+
+    def mode(self, *args, **kwargs):
+        return self.sample()
+
+
+class CallableRandomAgentForFQE(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.dist = CallableDummyDist()
 
     def predict(self, obs, *args, **kwargs):
-        batch_size = len(obs)
-        device = obs.device
-        if batch_size != self.current_batch_size:
-            self.current_batch_size = batch_size
-            self.register_buffer('action_samples', torch.empty(batch_size, 1, device=device))
-        self.action_samples.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH).to(device)
-        return self.action_samples, None
+        params = self.policy_net(obs)
+        self.dist.proba_distribution(params)
+        actions = self.dist.sample()
+        return actions, None
+
+    @staticmethod
+    def actor_encoder(obs, *args, **kwargs):
+        return obs, None
+
+    @staticmethod
+    def policy_net(obs, *args, **kwargs):
+        batch_size, seq_len, _ = obs.shape
+        return torch.empty(batch_size, seq_len, 1, device=obs.device)
+
+
+class CallablePPOAgentForFQE(nn.Module):
+    def __init__(self, ppo_agent: RecurrentPPO, *args, **kwargs):
+        super().__init__()
+        self.ppo_agent = ppo_agent
+        self.dist = self.ppo_agent.ac_network.dist
+
+    def predict(self, *args, **kwargs):
+        return self.ppo_agent.predict(*args, **kwargs)
+
+    def actor_encoder(self, obs, *args, **kwargs):
+        lstm_out, _, _ = self.ppo_agent.ac_network.forward_lstm(obs)
+        return lstm_out, None
+
+    def policy_net(self, lstm_out, *args, **kwargs):
+        actor_out = self.ppo_agent.ac_network.actor_head(lstm_out)
+        return actor_out
 
 
 class FeatureEncoder(nn.Module):
@@ -160,7 +202,7 @@ class CustomBetaDistribution(nn.Module):
         entropy += self.log_scale * self.action_dim
         return entropy
 
-    def sample(self, size: Iterable = (1,)) -> torch.Tensor:
+    def sample(self, size: Tuple = (1,)) -> torch.Tensor:
         """
         Sample an action, using the reparameterization trick (rsample).
         """
@@ -575,15 +617,18 @@ class RecurrentNet(nn.Module):
         assert actions is None or self._has_action_encoder, \
             "Action encoder must be provided if actions are used."
 
+        batch_size, seq_len = input_features.shape[0], input_features.shape[1]
+
         if actions is not None:
             assert actions.size(0) == input_features.size(0), \
-                "Batch size mismatch between input_features and actions."
-            if actions.ndim < input_features.ndim:
-                actions = actions.unsqueeze(1).expand(-1, input_features.size(1), -1)
+            f"Batch size mismatch between input_features and actions - {input_features.size(0)} vs {actions.size(0)}."
+            assert seq_len == 1 or actions.size(1) == input_features.size(1), \
+            f"Sequence length mismatch between input_features and actions - {input_features.size(1)} vs {actions.size(1)}."
+            while actions.ndim < input_features.ndim:
+                actions = actions.unsqueeze(-1)
+
             encoded_actions = self.action_encoder(actions)
             input_features = torch.concat((input_features, encoded_actions), -1)
-
-        batch_size, seq_len = input_features.shape[0], input_features.shape[1]
 
         # Reshape for the decoder
         # (N, T, input_feature_size) -> (N * T, input_feature_size)
@@ -825,7 +870,7 @@ class _RecurrentBase(nn.Module):
             action = dist.sample()
 
         if not action_as_tensor:
-            action = action.detach().cpu().numpy()
+            action = action.detach().flatten().cpu().numpy()
 
         if with_dist:
             return dist, action, next_hidden_state
@@ -1611,8 +1656,9 @@ class RecurrentCQLSAC(_RecurrentBase):
 class RecurrentFQE(_RecurrentBase):
     def __init__(
             self,
-            target_model: _RecurrentBase,
+            target_model: Union[RecurrentIQL, RecurrentCQLSAC],
             tau_target: float = 0.005,
+            cql_alpha: float = 0.01,
             *args,
             **kwargs
     ):
@@ -1620,9 +1666,10 @@ class RecurrentFQE(_RecurrentBase):
         kwargs.pop('gamma', None)
         super().__init__(gamma=1.0, *args, **kwargs)
         self._tau_target = tau_target
+        self._cql_alpha = torch.tensor(cql_alpha, device=self._device)
 
         # Define steps_per_epoch - should map based on decoy_interval
-        self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 1_000}
+        self.steps_per_epoch = {0: 5_000, 1: 5_000, 2: 5_000}
 
         # Set our update functions
         self.update_funcs.update({'critic_loss': self.update_critic})
@@ -1687,24 +1734,82 @@ class RecurrentFQE(_RecurrentBase):
         )
         return critic_loss
 
-    @torch.compile(mode='default')
-    def _update_critic_compiled(self, obs, acts, next_obs, train_mask):
+    @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
+    def _update_critic_compiled(self, obs, acts, visible, train_mask,
+                                lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt):
         # 1. Compute Current Q(s, a)
-        # Pass through FQE Encoder
-        lstm_out_q, _ = self.fqe_encoder(obs, train_mask=train_mask)
         q_preds = self.q_net(lstm_out_q, actions=acts)
 
         # 2. Compute Target Q(s', pi(s'))
         with torch.no_grad():
             # Get the next action from the target policy
-            next_action, _ = self.target_model.predict(next_obs, deterministic=True, action_as_tensor=True,
-                                                       return_last_output=False)
+            next_params = self.target_model.policy_net(next_lstm_out_pi, actions=None)
+
+            # Create the Beta distribution
+            next_dist = self.target_model.dist.proba_distribution(next_params)
+
+            # Get the deterministic next action
+            next_action = next_dist.mode()
 
             # Compute Q_target values using target Q nets
-            next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
             next_q_preds = self.q_target_net(next_lstm_out_tgt, actions=next_action)
 
-        return q_preds, next_q_preds
+        # CQL OOD Penalty calcuation
+        # We want to penalise LogSumExp(Q(s, a_sampled)) - Q(s, a_data)
+        batch_size, seq_len, _ = obs.shape
+        n_unif = 5
+        n_policy = 5
+        total_samples = n_unif + n_policy
+
+        with torch.no_grad():
+            # Uniform Samples (Global OOD)
+            cql_unif_actions = torch.empty(n_unif, batch_size, seq_len, 1, device=obs.device)
+            cql_unif_actions.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+
+            # Target Policy Samples
+            # We use the current state policy hidden state passed in (lstm_out_pi_target)
+            params = self.target_model.policy_net(lstm_out_pi, actions=None)
+            dist = self.target_model.dist.proba_distribution(params)
+            cql_policy_actions = dist.sample((n_policy,))
+
+            # Concatenate
+            cql_sampled_actions = torch.cat([cql_policy_actions, cql_unif_actions], 0)
+
+        # Expand hidden state to match sample dimension
+        lstm_out_q_expanded = lstm_out_q.unsqueeze(0).expand(total_samples, -1, -1, -1)
+
+        # Flatten for batch processing
+        flat_hidden = lstm_out_q_expanded.reshape(-1, seq_len, lstm_out_q.shape[-1])
+        flat_actions = cql_sampled_actions.reshape(-1, seq_len, cql_sampled_actions.shape[-1])
+
+        # Get Q-values for sampled actions
+        flat_q_ood = self.q_net(flat_hidden, actions=flat_actions)
+
+        # Reshape back to [n_samples, batch, seq, 1]
+        cql_q_sampled = flat_q_ood.view(total_samples, batch_size, seq_len, 1)
+
+        # Add in current data for the LogSumExp
+        cql_q_combined = torch.cat([cql_q_sampled, q_preds.unsqueeze(0)], dim=0)
+
+        # Calculate the logsumexp
+        temperature = 1.0
+        cql_q_combined = cql_q_combined / temperature
+        cql_q_logsumexp = torch.logsumexp(cql_q_combined / temperature, dim=0) * temperature
+
+        # Log(N) normalization
+        cql_q_logsumexp = cql_q_logsumexp - np.log(total_samples + 1)
+
+        # CQL Loss
+        cql_loss = self._cql_alpha * (cql_q_logsumexp - q_preds)
+
+        # Use train_mask (which is False for padding AND burn-in)
+        final_mask = train_mask * visible  # Shape (N, T)
+        valid_count = final_mask.sum() + self._eps
+
+        scaled_cql_loss = cql_loss * final_mask
+        scaled_cql_loss = scaled_cql_loss.sum() / valid_count
+
+        return q_preds, next_q_preds, scaled_cql_loss
 
     def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
                        train_mask):
@@ -1713,7 +1818,18 @@ class RecurrentFQE(_RecurrentBase):
         next_obs = self.add_noise(next_obs)
 
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
-            current_q, next_q = self._update_critic_compiled(obs, acts, next_obs, train_mask)
+            # Do LSTM inference outside of compiled loop
+            lstm_out_q, _ = self.fqe_encoder(obs, train_mask=train_mask)
+            with torch.no_grad():
+                # Get the next action from the target policy
+                lstm_out_pi, _ = self.target_model.actor_encoder(obs, train_mask=None)
+                next_lstm_out_pi, _ = self.target_model.actor_encoder(next_obs, train_mask=None)
+                next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
+
+            current_q, next_q, scaled_cql_loss = self._update_critic_compiled(
+                obs, acts, visible, train_mask,
+                lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt
+            )
 
             # Calculate Bellman Target
             # y = r + gamma * (1-d) * Q_target
@@ -1732,7 +1848,7 @@ class RecurrentFQE(_RecurrentBase):
             masked_loss = critic_loss_unmasked * train_mask
             critic_loss = masked_loss.sum() / (train_mask.sum() + self._eps)
 
-        return critic_loss
+        return critic_loss + scaled_cql_loss
 
     def sync_target_networks(self, tau=None):
         """Soft updates for the FQE specific networks"""
@@ -1747,7 +1863,7 @@ class RecurrentFQE(_RecurrentBase):
             target_param.data.copy_((1 - tau) * target_param.data + tau * param.data)
 
     def predict(self, obs: np.ndarray, hidden_state=None, deterministic: bool = False, with_dist: bool = False,
-                action_as_tensor: bool = False):
+                action_as_tensor: bool = False, *args, **kwargs):
         """
         Delegates prediction to the target model.
         When we evaluate RecurrentFQE, we are evaluating the behavior of the target_model.

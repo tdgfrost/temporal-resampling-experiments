@@ -4,6 +4,7 @@ from functools import partial
 import polars as pl
 from scipy.stats import trim_mean
 from tqdm import tqdm
+from copy import deepcopy
 
 from gym_wrappers import *
 from models import *
@@ -129,6 +130,10 @@ if __name__ == "__main__":
         To-do:
         - Create validation dataset(?) for FQE early stopping
         """
+        FQE_ARGS = deepcopy(OFFLINE_ARGS)
+        # Update the hidden dims
+        FQE_ARGS.update({'hidden_dim': 32,
+                         'recurrent_hidden_size': 32})
         # Load our dataset
         dataset_size = 1_000_000
         dataset = RecurrentReplayBufferEnv(make_glucose_env(patient_ids=TRAIN_IDS), buffer_size=dataset_size * 2)
@@ -152,7 +157,7 @@ if __name__ == "__main__":
         for target_model_name in model_file_list:
             if is_ppo or is_random:
                 seed = target_model_name
-                offline_agent = ppo_agent if is_ppo else CallableRandomAgent(dummy_env=dummy_env, **OFFLINE_ARGS)
+                offline_agent = CallablePPOAgentForFQE(ppo_agent) if is_ppo else CallableRandomAgentForFQE()
             else:
                 # Extract the seed and load the pretrained agent
                 seed = int(target_model_name.split('seed=')[-1].replace('.pt', ''))
@@ -163,14 +168,14 @@ if __name__ == "__main__":
                 offline_agent.load_checkpoint(target_agent_path)
 
             # Create our FQE model
-            OFFLINE_ARGS.update({'target_model': offline_agent})
-            algo = RecurrentFQE(**OFFLINE_ARGS)
+            FQE_ARGS.update({'target_model': offline_agent})
+            algo = RecurrentFQE(**FQE_ARGS)
 
             # Fit our FQE model
             log_dict = algo.fit(
                 dataset=dataset,
-                n_epochs_train=10,
-                n_epochs_per_eval=10,
+                n_epochs_train=50,
+                n_epochs_per_eval=1,
                 evaluators=evaluator,
                 early_stopping_key=early_stopping_key,
                 decoy_interval=DECOY_INTERVAL,

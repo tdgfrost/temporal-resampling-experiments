@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -159,12 +159,12 @@ class CustomBetaDistribution(nn.Module):
         entropy += self.log_scale * self.action_dim
         return entropy
 
-    def sample(self) -> torch.Tensor:
+    def sample(self, size: Tuple = (1,)) -> torch.Tensor:
         """
         Sample an action, using the reparameterization trick (rsample).
         """
         # Sample from Beta(alpha, beta) -> range [0, 1]
-        u = self.distribution.rsample()
+        u = self.distribution.rsample(size).squeeze(0)  # If size is 1, remove extra dim
 
         # Scale and shift to [low, high]
         return self.scale * u + self.bias

@@ -794,8 +794,10 @@ class ParallelEnvironmentEvaluator:
                 except AttributeError:
                     action_np = action
 
-                if action_np.ndim == 1:
-                    action_np = np.expand_dims(action_np, axis=-1)
+                try:
+                    action_np = action_np.reshape(-1, 1)
+                except ValueError:
+                    raise ValueError("Action could not be reshaped to (-1, 1). Check action dimensions.")
 
                 next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
                 dones = terminated | truncated
@@ -893,7 +895,7 @@ class FQEEvaluator:
 
             with torch.no_grad():
                 # Sample action
-                acts, _ = algo.target_model.predict(obs, deterministic=True)
+                acts, _ = algo.target_model.predict(obs, deterministic=True, action_as_tensor=True)
                 # Get Q-values
                 fqe_preds = algo.get_value_estimate(obs, acts)
 
