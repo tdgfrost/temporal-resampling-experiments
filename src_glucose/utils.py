@@ -630,7 +630,7 @@ class RecurrentReplayBufferEnv:
 
         actions = [np.mean(chunk, axis=0) for chunk in action_splits if chunk.size > 0]
         dones = [np.any(chunk) for chunk in done_splits if chunk.size > 0]
-        rewards = [np.mean(chunk) for chunk in reward_splits if chunk.size > 0]
+        rewards = [np.sum(chunk) for chunk in reward_splits if chunk.size > 0]
 
         if not dones or not dones[-1]:
             # Skip this episode - too short
