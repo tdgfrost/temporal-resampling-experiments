@@ -16,7 +16,8 @@ parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train P
 parser.add_argument('--train_offline', default=False, type=parse_bool, help='Train offline agent')
 parser.add_argument('--train_fqe', default=False, type=parse_bool, help='Train FQE model')
 
-parser.add_argument('--model_type', default='iql', type=str, choices=['iql', 'cql', 'ppo', 'random'],
+parser.add_argument('--model_type', default='dataset', type=str,
+                    choices=['iql', 'cql', 'ppo', 'random', 'dataset'],
                     help='Type of model to train/evaluate (iql, cql, ppo, random)')
 parser.add_argument('--target_agent_path', default=None, type=str,
                     help='Path to target agent')
@@ -81,6 +82,8 @@ if __name__ == "__main__":
     is_cql = args.model_type == 'cql'
     is_ppo = args.model_type == 'ppo'  # Used for evaluation only
     is_random = args.model_type == 'random'  # Used for evaluation only
+    is_dataset = args.model_type == 'dataset'  # Used for evaluation only
+    assert (is_dataset and train_fqe) or not is_dataset, "Dataset model type can only be used for FQE evaluation."
     model_type = 'bc' if is_iql and args.expectile == 0.5 else args.model_type
 
     EXPECTILE = args.expectile
@@ -147,7 +150,7 @@ if __name__ == "__main__":
                                                     batch_size=1024)}
 
         # Get our list of trained models
-        if is_ppo or is_random:
+        if is_ppo or is_random or is_dataset:
             # Get seeds
             model_file_list = experiment_seeds
         else:
@@ -155,9 +158,12 @@ if __name__ == "__main__":
             model_file_list = os.listdir(target_model_path)
 
         for target_model_name in model_file_list:
-            if is_ppo or is_random:
+            if is_ppo or is_random or is_dataset:
                 seed = target_model_name
-                offline_agent = CallablePPOAgentForFQE(ppo_agent) if is_ppo else CallableRandomAgentForFQE()
+                if is_random or is_dataset:
+                    offline_agent = CallableRandomAgentForFQE(use_dataset=is_dataset)
+                else:
+                    offline_agent = CallablePPOAgentForFQE(ppo_agent)
             else:
                 # Extract the seed and load the pretrained agent
                 seed = int(target_model_name.split('seed=')[-1].replace('.pt', ''))

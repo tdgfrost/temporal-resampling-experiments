@@ -322,6 +322,7 @@ class RecurrentReplayBufferEnv:
             next_obs = _get_tensor(self.observations, next_buffer_idxs)
 
             action = _get_tensor(self.actions, buffer_idxs)
+            next_action = _get_tensor(self.actions, next_buffer_idxs)
             reward = _get_tensor(self.rewards, buffer_idxs)
 
             # Dones/Visible need to be Bool/Long, not Float
@@ -344,7 +345,7 @@ class RecurrentReplayBufferEnv:
             train_mask = torch.ones((current_bs, 1, 1), dtype=torch.bool, device=device)
 
             # Yield tuple (Standard R2D2/Recurrent format)
-            yield (obs, action, reward, next_obs, done,
+            yield (obs, action, reward, done, next_obs, next_action,
                    visible, next_visible, padding_mask, next_padding_mask, train_mask)
 
     def fetch_transition_batch(self, idxs: np.ndarray, decoy_interval: int = 0):
@@ -391,7 +392,12 @@ class RecurrentReplayBufferEnv:
         done = _gather_helper(self.dones)
         visible = _gather_helper(self.visible_states)
 
-        # Next Visible (Just shift, pad last with False)
+        # Next Action
+        next_action = self.actions[decoy_interval][next_gather_indices]
+        if next_action.ndim == 2:
+            next_action = next_action.unsqueeze(-1)
+
+        # Next Visible
         # Or gather using next_gather_indices
         next_visible = self.visible_states[decoy_interval][next_gather_indices]
         if next_visible.ndim == 2:
@@ -403,7 +409,7 @@ class RecurrentReplayBufferEnv:
         # The last step of a sequence never has a valid 'next', set to False
         next_padding_mask[:, -1, :] = False
 
-        return (obs, action, reward, next_obs, done, visible, next_visible, padding_mask, next_padding_mask,
+        return (obs, action, reward, done, next_obs, next_action, visible, next_visible, padding_mask, next_padding_mask,
                 train_mask)
 
     def save(self, path: str):
@@ -890,14 +896,15 @@ class FQEEvaluator:
         # Iterate over all initial states
         all_fqe_preds = []
         for batch in self.dataset.generate_initial_states(batch_size=self.batch_size):
-            (obs, action, reward, next_obs, done, visible, next_visible,
-             padding_mask, next_padding_mask, train_mask) = batch
+            (obs, acts, _, _, _, _, _, _, _, _, _) = batch
 
             with torch.no_grad():
                 # Sample action
-                acts, _ = algo.target_model.predict(obs, deterministic=True, action_as_tensor=True)
+                acts_preds, _ = algo.target_model.predict(obs, deterministic=True, action_as_tensor=True)
+                if acts_preds is None:
+                    acts_preds = acts
                 # Get Q-values
-                fqe_preds = algo.get_value_estimate(obs, acts)
+                fqe_preds = algo.get_value_estimate(obs, acts_preds)
 
             all_fqe_preds.append(fqe_preds.squeeze())
 

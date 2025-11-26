@@ -24,9 +24,10 @@ torch.backends.cudnn.benchmark = True
 
 
 class CallableDummyDist(nn.Module):
-    def __init__(self):
+    def __init__(self, use_dataset: bool = False):
         super().__init__()
         self.params = None
+        self.use_dataset = use_dataset
 
     def proba_distribution(self, params: torch.Tensor, *args, **kwargs):
         self.params = params
@@ -40,26 +41,34 @@ class CallableDummyDist(nn.Module):
         return self.params
 
     def mode(self, *args, **kwargs):
-        return self.sample()
+        if self.use_dataset:
+            return None
+        self.params.uniform_(INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH)
+        return self.params
 
 
 class CallableRandomAgentForFQE(nn.Module):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, use_dataset: bool = False, *args, **kwargs):
         super().__init__()
-        self.dist = CallableDummyDist()
+        self.dist = CallableDummyDist(use_dataset=use_dataset)
+        self.use_dataset = use_dataset
 
-    def predict(self, obs, *args, **kwargs):
+    def predict(self, obs, deterministic: bool = False, *args, **kwargs):
         params = self.policy_net(obs)
         self.dist.proba_distribution(params)
-        actions = self.dist.sample()
+        if deterministic:
+            actions = self.dist.mode()
+        else:
+            actions = self.dist.sample()
         return actions, None
 
     @staticmethod
     def actor_encoder(obs, *args, **kwargs):
         return obs, None
 
-    @staticmethod
-    def policy_net(obs, *args, **kwargs):
+    def policy_net(self, obs, *args, **kwargs):
+        if self.use_dataset:
+            return None
         batch_size, seq_len, _ = obs.shape
         return torch.empty(batch_size, seq_len, 1, device=obs.device)
 
@@ -1178,8 +1187,8 @@ class RecurrentIQL(_RecurrentBase):
 
         return q1, q2, v_next
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                       train_mask):
+    def _update_critic(self, obs, acts, rews, dones, next_obs, next_acts,
+                   visible, next_visible, padding_mask, next_padding_mask, train_mask):
         # Add some noise
         obs = self.add_noise(obs)
         next_obs = self.add_noise(next_obs)
@@ -1233,8 +1242,8 @@ class RecurrentIQL(_RecurrentBase):
 
         return q, v
 
-    def _update_value(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                      train_mask):
+    def _update_value(self, obs, acts, rews, dones, next_obs, next_acts,
+                   visible, next_visible, padding_mask, next_padding_mask, train_mask):
         # Add some noise
         obs = self.add_noise(obs)
 
@@ -1281,8 +1290,8 @@ class RecurrentIQL(_RecurrentBase):
 
         return policy_loss_unmasked
 
-    def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                      train_mask, diff):
+    def _update_actor(self, obs, acts, rews, dones, next_obs, next_acts,
+                   visible, next_visible, padding_mask, next_padding_mask, train_mask, diff):
         # Add some noise
         obs = self.add_noise(obs)
 
@@ -1516,8 +1525,8 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         return q1_pred, q2_pred, next_v, scaled_cql_loss
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                       train_mask):
+    def _update_critic(self, obs, acts, rews, dones, next_obs, next_acts,
+                   visible, next_visible, padding_mask, next_padding_mask, train_mask):
         '''
         CQL Q-loss: logsumexp_loss + bellman_error_loss
         1) bellman_error_loss = MSE(Q(s,a), r + gamma * (1 - done) * V(s'))
@@ -1611,8 +1620,8 @@ class RecurrentCQLSAC(_RecurrentBase):
 
         return log_pi_sampled, q_sampled, q_values
 
-    def _update_actor(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                      train_mask):
+    def _update_actor(self, obs, acts, rews, dones, next_obs, next_acts,
+                   visible, next_visible, padding_mask, next_padding_mask, train_mask):
         # Add some noise
         obs = self.add_noise(obs)
 
@@ -1735,7 +1744,7 @@ class RecurrentFQE(_RecurrentBase):
         return critic_loss
 
     @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
-    def _update_critic_compiled(self, obs, acts, visible, train_mask,
+    def _update_critic_compiled(self, obs, acts, next_acts, visible, train_mask,
                                 lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt):
         # 1. Compute Current Q(s, a)
         q_preds = self.q_net(lstm_out_q, actions=acts)
@@ -1750,6 +1759,9 @@ class RecurrentFQE(_RecurrentBase):
 
             # Get the deterministic next action
             next_action = next_dist.mode()
+
+            if next_action is None:
+                next_action = next_acts
 
             # Compute Q_target values using target Q nets
             next_q_preds = self.q_target_net(next_lstm_out_tgt, actions=next_action)
@@ -1811,8 +1823,8 @@ class RecurrentFQE(_RecurrentBase):
 
         return q_preds, next_q_preds, scaled_cql_loss
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, visible, next_visible, padding_mask, next_padding_mask,
-                       train_mask):
+    def _update_critic(self, obs, acts, rews, dones, next_obs, next_acts,
+                   visible, next_visible, padding_mask, next_padding_mask, train_mask):
         # Add noise (consistency with IQL/CQL classes)
         obs = self.add_noise(obs)
         next_obs = self.add_noise(next_obs)
@@ -1827,7 +1839,7 @@ class RecurrentFQE(_RecurrentBase):
                 next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
 
             current_q, next_q, scaled_cql_loss = self._update_critic_compiled(
-                obs, acts, visible, train_mask,
+                obs, acts, next_acts, visible, train_mask,
                 lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt
             )
 
