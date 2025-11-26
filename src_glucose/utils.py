@@ -1,3 +1,4 @@
+import glob
 from functools import partial
 from typing import Union, Callable, Optional, Tuple, List
 import numpy as np
@@ -18,24 +19,12 @@ from gymnasium.vector import AsyncVectorEnv
 
 class RecurrentReplayBufferEnv:
     def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20):
-        self.observations = {
-            i: deque(maxlen=buffer_size) for i in range(3)
-        }
-        self.actions = {
-            i: deque(maxlen=buffer_size) for i in range(3)
-        }
-        self.rewards = {
-            i: deque(maxlen=buffer_size) for i in range(3)
-        }
-        self.dones = {
-            i: deque(maxlen=buffer_size) for i in range(3)
-        }
-        self.sample_bool = {
-            i: deque(maxlen=buffer_size) for i in range(3)
-        }
-        self.visible_states = {
-            i: deque(maxlen=buffer_size) for i in range(3)
-        }
+        self.observations = {i: deque(maxlen=buffer_size) for i in range(3)}
+        self.actions = {i: deque(maxlen=buffer_size) for i in range(3)}
+        self.rewards = {i: deque(maxlen=buffer_size) for i in range(3)}
+        self.dones = {i: deque(maxlen=buffer_size) for i in range(3)}
+        self.sample_bool = {i: deque(maxlen=buffer_size) for i in range(3)}
+        self.visible_states = {i: deque(maxlen=buffer_size) for i in range(3)}
 
         self.buffer_size = buffer_size
         self.env = env
@@ -44,7 +33,7 @@ class RecurrentReplayBufferEnv:
         self.batch_size = 32
         self.decoy_interval = 0
         self.n_samples = 0
-        self.segments = self.n_samples // self.batch_size
+        self.segments = 0
         self.dataset_IQR_return = None
         self.dataset_IQR_std = None
         self.dataset_IQR_n_episodes = None
@@ -52,10 +41,7 @@ class RecurrentReplayBufferEnv:
         self.reward_std = {i: None for i in range(3)}
         self.max_sequence_length = sequence_length
         self.burn_in_length = burn_in_length
-        # This will store the valid start indices for each decoy interval
         self.sequence_info = {i: [] for i in range(3)}
-
-        # These will hold the huge lookup tables on Device (GPU/CPU)
         self.indices_map = {i: None for i in range(3)}
         self.padding_mask_map = {i: None for i in range(3)}
         self.train_mask_map = {i: None for i in range(3)}
@@ -413,9 +399,6 @@ class RecurrentReplayBufferEnv:
                 train_mask)
 
     def save(self, path: str):
-        if os.path.exists(path):
-            print(f"Warning: Overwriting existing replay buffer at {path}")
-            shutil.rmtree(path)
         os.makedirs(path, exist_ok=True)
         for key, value in [
             ('observations', self.observations),
@@ -493,9 +476,25 @@ class RecurrentReplayBufferEnv:
             'visible_state': [True]
         }
 
-    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None):
+    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, save_path: str = "./replay_buffer",
+                    chunk_size: int = 20000):
+        """
+        Generates data and saves to temporary chunks to avoid memory overflow.
+        At the end, loads chunks, normalizes, and saves the final dataset.
+        """
+        # Create a temporary directory for chunks
+        temp_dir = os.path.join(save_path, "temp_chunks")
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Initialize temporary in-memory storage for the current chunk
+        # We use lists here because they are faster for appending than deques for temporary storage
+        chunk_storage = self._init_storage_dict()
+
         with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
             frame_count = 0
+            chunk_idx = 0
             if seed is None:
                 seed = 123
 
@@ -508,12 +507,15 @@ class RecurrentReplayBufferEnv:
                 done = False
                 lstm_states = model.ac_network.init_hidden_state(batch_size=1)
                 total_reward = 0
+
                 while not done:
                     action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states,
                                                         deterministic=False)
                     obs, reward, term, trunc, info = self.env.step(action)
-                    # Get the real action delivered
+
+                    # Get the real action delivered to the patient
                     real_action = obs[1] * INSULIN_SCALE
+
                     done = term or trunc
                     total_reward += reward
 
@@ -525,44 +527,145 @@ class RecurrentReplayBufferEnv:
 
                     pbar.update(1)
                     if len(total_rewards) >= 1:
-                        pbar_dict = {'avg_episode_reward': f"{np.mean(total_rewards):.2f}",
-                                     'avg_episode_IQM_reward': f"{trimboth(np.array(total_rewards), proportiontocut=0.25).mean():.2f}",
-                                     'avg_episode_length': f"{np.mean(total_lengths):.2f}",
-                                     'refresh': False}
+                        iqm = np.mean(trimboth(np.array(total_rewards), 0.25))
+
+                        pbar_dict = {
+                            'avg_ep_r': f"{np.mean(total_rewards):.2f}",
+                            'avg_ep_IQM': f"{iqm:.2f}",
+                            'refresh': False
+                        }
                         pbar.set_postfix(**pbar_dict)
+
                     frame_count += 1
                     model.set_random_seed(seed + frame_count)
 
-                # Keep track of total rewards for stats
+                # Keep track of total rewards for stats (this is small, keep in RAM)
                 total_rewards.append(total_reward)
                 total_lengths.append(len(ep_buffer['all_done']))
 
-                # Add ep_buffer to permanent buffer
-                self.update_permanent_buffer(ep_buffer)
-                # Reset ep_buffer and add 'obs' to it
+                # Add ep_buffer to our TEMPORARY chunk storage
+                self.update_permanent_buffer(ep_buffer, storage=chunk_storage)
+
+                # Reset ep_buffer
                 ep_buffer = self._reset_ep_buffer(obs)
 
-            # Add a garbage all-zeros "final obs"
+                # --- CHECK IF CHUNK IS FULL ---
+                # Check size of observations[0]
+                if len(chunk_storage['observations'][0]) >= chunk_size:
+                    self._save_chunk(chunk_storage, temp_dir, chunk_idx)
+                    chunk_idx += 1
+                    # Reset storage
+                    chunk_storage = self._init_storage_dict()
+
+            # Save any remaining data in the final partial chunk
+            if len(chunk_storage['observations'][0]) > 0:
+                self._save_chunk(chunk_storage, temp_dir, chunk_idx)
+
+        print("Data collection complete. Merging chunks and normalizing...")
+
+        # --- FINALIZE ---
+        # 1. Calculate IQR stats
+        total_rewards = np.array(total_rewards)
+        IQR = trimboth(total_rewards, proportiontocut=0.25)
+        self.dataset_IQR_return = IQR.mean()
+        self.dataset_IQR_std = IQR.std()
+        self.dataset_IQR_n_episodes = len(IQR)
+
+        # 2. Load all chunks, merge, normalize, and save final
+        self._finalize_dataset(temp_dir, save_path)
+
+        # Cleanup temp dir
+        shutil.rmtree(temp_dir)
+        print(f"Dataset saved to {save_path}")
+
+    @staticmethod
+    def _init_storage_dict():
+        """Creates an empty dictionary structure mimicking self.observations etc."""
+        return {
+            'observations': {i: [] for i in range(3)},
+            'actions': {i: [] for i in range(3)},
+            'rewards': {i: [] for i in range(3)},
+            'dones': {i: [] for i in range(3)},
+            'sample_bool': {i: [] for i in range(3)},
+            'visible_states': {i: [] for i in range(3)}
+        }
+
+    @staticmethod
+    def _save_chunk(storage, temp_dir, chunk_idx):
+        """Saves the current dictionary of lists to an NPZ file."""
+        save_dict = {}
+        for key in ['observations', 'actions', 'rewards', 'dones', 'sample_bool', 'visible_states']:
             for i in range(3):
-                self.observations[i] += [np.zeros_like(self.observations[0][0])]
+                # Convert list to array for saving
+                save_dict[f"{key}_{i}"] = np.array(storage[key][i])
 
-            # Save the IQR dataset return
-            total_rewards = np.array(total_rewards)
-            IQR = trimboth(total_rewards, proportiontocut=0.25)
+        filename = os.path.join(temp_dir, f"chunk_{chunk_idx}.npz")
+        np.savez_compressed(filename, **save_dict)
 
-            self.dataset_IQR_return = IQR.mean()
-            self.dataset_IQR_std = IQR.std()
-            self.dataset_IQR_n_episodes = len(IQR)
+    def _finalize_dataset(self, temp_dir, save_path):
+        """Loads all chunks, merges them, normalizes rewards, and saves permanently."""
+        chunk_files = sorted(glob.glob(os.path.join(temp_dir, "chunk_*.npz")),
+                             key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split('_')[1]))
 
-            # Scale the rewards for training
-            for i in [0, 1, 2]:
-                all_rewards = np.array(self.rewards[i])
-                r_mean, r_std = all_rewards.mean(), all_rewards.std()
-                # Standardise rewards
-                norm_rewards = (all_rewards - r_mean) / (r_std + 1e-8)
-                self.rewards[i] = deque(norm_rewards.tolist(), maxlen=self.buffer_size)
+        if not chunk_files:
+            print("No chunks found!")
+            return
+
+        # We will load keys one by one to save memory, merge, and put into self
+        keys = ['observations', 'actions', 'rewards', 'dones', 'sample_bool', 'visible_states']
+
+        # Temporary holding for merged arrays
+        merged_data = {k: {i: [] for i in range(3)} for k in keys}
+
+        print("Loading chunks...")
+        for cf in chunk_files:
+            data = np.load(cf, allow_pickle=True)
+            for k in keys:
+                for i in range(3):
+                    arr = data[f"{k}_{i}"]
+                    if len(arr) > 0:
+                        merged_data[k][i].append(arr)
+
+        print("Concatenating and Normalizing...")
+        for i in range(3):
+            # Concatenate arrays
+            # For observations, we might want to add the "final zero obs" here if needed
+            # The original code added a zero obs at the very end.
+
+            # --- REWARDS (Normalize) ---
+            r_list = merged_data['rewards'][i]
+            if r_list:
+                full_rewards = np.concatenate(r_list, axis=0)
+
+                r_mean, r_std = full_rewards.mean(), full_rewards.std()
+                norm_rewards = (full_rewards - r_mean) / (r_std + 1e-8)
+
+                self.rewards[i] = deque(norm_rewards, maxlen=self.buffer_size)
                 self.reward_mean[i] = r_mean
                 self.reward_std[i] = r_std
+            else:
+                self.rewards[i] = deque([], maxlen=self.buffer_size)
+
+            # --- OTHERS (Just load) ---
+            for k in ['observations', 'actions', 'dones', 'sample_bool', 'visible_states']:
+                arr_list = merged_data[k][i]
+                if arr_list:
+                    full_arr = np.concatenate(arr_list, axis=0)
+
+                    # Special handling for observations padding if required by original logic
+                    # (Original code added one zero-obs at the end of fill_buffer)
+                    if k == 'observations' and i < 3:
+                        # Only add the padding to the very end of the concatenated array
+                        # if strict compatibility with original "final obs" logic is needed
+                        zero_pad = np.zeros_like(full_arr[0:1])
+                        full_arr = np.concatenate([full_arr, zero_pad], axis=0)
+
+                    self.__dict__[k][i] = deque(full_arr, maxlen=self.buffer_size)
+                else:
+                    self.__dict__[k][i] = deque([], maxlen=self.buffer_size)
+
+        # Now save using the existing save method
+        self.save(save_path)
 
     def set_to_tensors(self, device: str = 'cpu', i: int = None, *args):
         def _set_device(some_arr):
@@ -593,29 +696,50 @@ class RecurrentReplayBufferEnv:
         ep_buffer['all_done'] += [term or trunc]
         ep_buffer['visible_state'] += [info['steps_until_action_available'] == 0]
 
-    def update_permanent_buffer(self, ep_buffer: dict):
+    def update_permanent_buffer(self, ep_buffer: dict, storage=None):
+        """
+        Added `storage` argument.
+        If storage is None, behaves like original (writes to self).
+        If storage is provided (dict), writes to that dict (used for chunking).
+        """
+        # Select target container
+        if storage is None:
+            target_obs = self.observations
+            target_act = self.actions
+            target_rew = self.rewards
+            target_don = self.dones
+            target_smp = self.sample_bool
+            target_vis = self.visible_states
+        else:
+            target_obs = storage['observations']
+            target_act = storage['actions']
+            target_rew = storage['rewards']
+            target_don = storage['dones']
+            target_smp = storage['sample_bool']
+            target_vis = storage['visible_states']
+
         visible_idxs = ep_buffer['visible_state']
         for i in range(2):
-            for arr, key in [
-                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')
-            ]:
-                arr[i] += ep_buffer[f'all_{key}']
-
-            self.sample_bool[i] += [True for _ in range(len(ep_buffer[f'all_done']))]
+            target_obs[i] += ep_buffer['all_obs']
+            target_act[i] += ep_buffer['all_action']
+            target_rew[i] += ep_buffer['all_reward']
+            target_don[i] += ep_buffer['all_done']
+            target_smp[i] += [True for _ in range(len(ep_buffer['all_done']))]
 
         # Update visible states
-        self.visible_states[0] += visible_idxs
-        self.visible_states[1] += [True for _ in range(len(ep_buffer[f'all_done']))]
+        target_vis[0] += visible_idxs
+        target_vis[1] += [True for _ in range(len(ep_buffer['all_done']))]
 
         # Generate our aggregated datapoints for decoy_interval = 2
         # e.g., for window_size = 3, we use the following aggregates:
         # for i in [3, 6, 9, ...]
-        #      [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
+        # [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
         # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
         # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
         # rew:             |---------|    |-------     (t2-t4, t5-t7, etc)
         # (reward calculated from next obs)
 
+        # Aggregate for interval 2 (Decoy)
         agg_window = AGGREGATE_WINDOW_SIZE
 
         obs_data = np.array(ep_buffer['all_obs'])
@@ -623,30 +747,30 @@ class RecurrentReplayBufferEnv:
         done_data = np.array(ep_buffer['all_done'])
         reward_data = np.array(ep_buffer['all_reward'])
 
-        # --- Aggregage obs ---
+        # --- Aggregate obs ---
         obs_indices = range(agg_window, len(obs_data) + 1, agg_window)
-        obs_splits = np.array_split(obs_data, obs_indices, axis=0)[:-1]  # Exclude last partial window
+        obs_splits = np.array_split(obs_data, obs_indices, axis=0)[:-1]
         obs = [np.mean(chunk, axis=0) for chunk in obs_splits if chunk.size > 0]
 
         # --- Aggregate actions / dones / rewards ---
         slice_indices = range(agg_window - 1, len(obs_data), agg_window)
-        action_splits = np.array_split(action_data, slice_indices, axis=0)[1:]  # Exclude first partial window
-        done_splits = np.array_split(done_data, slice_indices, axis=0)[1:]  # Exclude first partial window
-        reward_splits = np.array_split(reward_data, slice_indices, axis=0)[1:]  # Exclude first partial window
+        action_splits = np.array_split(action_data, slice_indices, axis=0)[1:]
+        done_splits = np.array_split(done_data, slice_indices, axis=0)[1:]
+        reward_splits = np.array_split(reward_data, slice_indices, axis=0)[1:]
 
         actions = [np.mean(chunk, axis=0) for chunk in action_splits if chunk.size > 0]
         dones = [np.any(chunk) for chunk in done_splits if chunk.size > 0]
         rewards = [np.sum(chunk) for chunk in reward_splits if chunk.size > 0]
 
         if not dones or not dones[-1]:
-            # Skip this episode - too short
             return
-        self.observations[2] += obs
-        self.actions[2] += actions
-        self.rewards[2] += rewards
-        self.dones[2] += dones
-        self.sample_bool[2] += [True for _ in range(len(dones))]
-        self.visible_states[2] += [True for _ in range(len(dones))]
+
+        target_obs[2] += obs
+        target_act[2] += actions
+        target_rew[2] += rewards
+        target_don[2] += dones
+        target_smp[2] += [True for _ in range(len(dones))]
+        target_vis[2] += [True for _ in range(len(dones))]
 
 
 class ParallelEnvironmentEvaluator:
