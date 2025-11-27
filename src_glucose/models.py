@@ -67,9 +67,8 @@ class CallableRandomAgentForFQE(nn.Module):
     def actor_encoder(obs, *args, **kwargs):
         return obs, None
 
-    def policy_net(self, obs, *args, **kwargs):
-        if self.use_dataset:
-            return None
+    @staticmethod
+    def policy_net(obs, *args, **kwargs):
         batch_size, seq_len, _ = obs.shape
         return torch.empty(batch_size, seq_len, 1, device=obs.device)
 
