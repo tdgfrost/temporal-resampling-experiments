@@ -22,6 +22,11 @@ INSULIN_ACTION_HIGH = 0.5
 INSULIN_SCALE = 1.0
 CHO_SCALE = 300.0
 
+# Train ids for PPO training and dataset generation
+TRAIN_IDS = [i for i in range(1, 19)]
+VAL_IDS = [i for i in range(19, 25)]
+TEST_IDS = [i for i in range(25, 31)]
+
 # Seed
 MASTER_SEED = 123
 

@@ -29,11 +29,6 @@ parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interva
 GAMMA = 0.99
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Train ids for PPO training and dataset generation
-TRAIN_IDS = [i for i in range(1, 19)]
-VAL_IDS = [i for i in range(19, 25)]
-TEST_IDS = [i for i in range(25, 31)]
-
 PPO_ARGS = {'train_env_creator_fn': make_glucose_env,
             'eval_env_creator_fn': make_glucose_env,
             'train_envs_per_id': 1,
