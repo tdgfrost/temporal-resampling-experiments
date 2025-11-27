@@ -1061,7 +1061,7 @@ def choose_ppo_agent():
     # Use inquirer to let the user select a folder
     message = "Please select PPO agent using UP/DOWN/ENTER."
     options = os.listdir("../logs_glucose/ppo_logs")
-    options = [i for i in options if i.endswith('.zip')]
+    options = [i for i in options if i.endswith('.pt')]
     question = [inquirer.List('option',
                               message=message,
                               choices=options)]
