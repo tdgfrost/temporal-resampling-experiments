@@ -39,10 +39,9 @@ def set_seed(seed: int):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # for multi-GPU
 
-    # Set deterministic algorithms for PyTorch (can impact performance)
-    # This is crucial for full reproducibility with CUDA
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # Set deterministic algorithms for PyTorch
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
     # You might also want to set this for newer PyTorch versions
     # torch.use_deterministic_algorithms(True)

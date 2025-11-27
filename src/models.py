@@ -33,8 +33,8 @@ def set_seed(seed: int):
 
     # Set deterministic algorithms for PyTorch (can impact performance)
     # This is crucial for full reproducibility with CUDA
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
     # You might also want to set this for newer PyTorch versions
     # torch.use_deterministic_algorithms(True)
