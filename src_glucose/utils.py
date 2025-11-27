@@ -482,6 +482,8 @@ class RecurrentReplayBufferEnv:
         Generates data and saves to temporary chunks to avoid memory overflow.
         At the end, loads chunks, normalizes, and saves the final dataset.
         """
+        def create_new_seed(base_seed, offset):
+            return np.random.SeedSequence([base_seed, offset]).generate_state(1)[0].item()
         # Create a temporary directory for chunks
         temp_dir = os.path.join(save_path, "temp_chunks")
         if os.path.exists(temp_dir):
@@ -497,13 +499,14 @@ class RecurrentReplayBufferEnv:
             chunk_idx = 0
             if seed is None:
                 seed = 123
+            current_seed = create_new_seed(seed, frame_count)
 
-            obs, info, ep_buffer = self.reset(seed=seed)
-            model.set_random_seed(seed)
+            obs, info, ep_buffer = self.reset(seed=current_seed)
             total_rewards = []
             total_lengths = []
 
             while frame_count < n_frames:
+                model.set_random_seed(current_seed)
                 done = False
                 lstm_states = model.ac_network.init_hidden_state(batch_size=1)
                 total_reward = 0
@@ -522,26 +525,31 @@ class RecurrentReplayBufferEnv:
                     self.update_episode_buffer(obs, real_action, reward, term, trunc, info, ep_buffer)
 
                     if done:
+                        # Update our frame count seed
+                        current_seed = create_new_seed(seed, frame_count)
+                        # Reset our buffer and environment
                         ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
-                        obs, info = self.env.reset(seed=seed + frame_count)
+                        obs, info = self.env.reset(seed=current_seed)
 
                     pbar.update(1)
-                    if len(total_rewards) >= 1:
-                        iqm = np.mean(trimboth(np.array(total_rewards), 0.25))
-
-                        pbar_dict = {
-                            'avg_ep_r': f"{np.mean(total_rewards):.2f}",
-                            'avg_ep_IQM': f"{iqm:.2f}",
-                            'refresh': False
-                        }
-                        pbar.set_postfix(**pbar_dict)
 
                     frame_count += 1
-                    model.set_random_seed(seed + frame_count)
 
                 # Keep track of total rewards for stats (this is small, keep in RAM)
                 total_rewards.append(total_reward)
                 total_lengths.append(len(ep_buffer['all_done']))
+
+                # Update progress bar with stats (every 500 episodes)
+                if (len(total_rewards) + 1) % 500 == 0:
+                    # This is a slow operation, so we do it infrequently
+                    iqm = np.mean(trimboth(np.array(total_rewards), 0.25))
+
+                    pbar_dict = {
+                        'avg_ep_r': f"{np.mean(total_rewards):.2f}",
+                        'avg_ep_IQM': f"{iqm:.2f}",
+                        'refresh': False
+                    }
+                    pbar.set_postfix(**pbar_dict)
 
                 # Add ep_buffer to our TEMPORARY chunk storage
                 self.update_permanent_buffer(ep_buffer, storage=chunk_storage)
