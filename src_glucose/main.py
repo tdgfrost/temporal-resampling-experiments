@@ -130,8 +130,9 @@ if __name__ == "__main__":
         """
         FQE_ARGS = deepcopy(OFFLINE_ARGS)
         # Update the hidden dims
-        FQE_ARGS.update({'hidden_dim': 32,
-                         'recurrent_hidden_size': 32})
+        FQE_ARGS.update({'hidden_dim': 64,
+                         'recurrent_hidden_size': 64,
+                         'critic_lr': 5e-3})  # Higher LR for FQE training
         # Load our dataset
         datasets = load_buffer_datasets()
 
