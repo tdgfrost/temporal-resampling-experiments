@@ -752,7 +752,6 @@ class _RecurrentBase(nn.Module):
         assert early_stopping_limit == 0 or early_stopping_key is not None, \
             "Please specify 'early_stopping_key' if using early stopping."
 
-        loss_dict = self._reset_loss_dict()
         stop_early_count = 0
         best_online_return = -1 * float('inf')
         best_log_dict = None
@@ -762,6 +761,7 @@ class _RecurrentBase(nn.Module):
             "Please specify self.steps_per_epoch in the child class."
 
         steps_per_epoch = self.steps_per_epoch[decoy_interval]
+        loss_dict = self._reset_loss_dict(steps_per_epoch)
 
         # Start training
         total_steps = n_epochs_train * steps_per_epoch
@@ -1019,8 +1019,8 @@ class _RecurrentBase(nn.Module):
         return log_rewards
 
     @staticmethod
-    def _reset_loss_dict():
-        return defaultdict(partial(deque, maxlen=100))
+    def _reset_loss_dict(max_length: int = 100):
+        return defaultdict(partial(deque, maxlen=max_length))
 
     def _save_best_model_state(self):
         """Saves a deep copy of all nn.Module state_dicts in memory."""
