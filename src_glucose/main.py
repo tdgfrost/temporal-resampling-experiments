@@ -110,9 +110,11 @@ if __name__ == "__main__":
 
     # Load the pre-trained agent if required
     ppo_agent, offline_agent, seed = None, None, MASTER_SEED
+    dataset_needs_generating = False
     if train_offline or train_fqe:
         # Load PPO or offline agent
-        dataset_needs_generating = train_offline and not is_random and not os.path.exists(f'./replay_buffer/COMPLETE')
+        dataset_needs_generating = train_offline and not is_random and not all([os.path.exists(f'./replay_buffer_{key}/COMPLETE')
+                                                                                for key in ['train', 'val', 'test']])
         if is_ppo or dataset_needs_generating:
             if target_agent_path is None:
                 target_agent_path = choose_ppo_agent()
@@ -123,26 +125,23 @@ if __name__ == "__main__":
     # ===== FQE Evaluation ===== #
     if train_fqe:
         """
-        We will iterate through all 50 models (for a given experiment) and train FQE ONCE (using the same random seed).
-
-        To-do:
-        - Create validation dataset(?) for FQE early stopping
+        We will iterate through all 50 models (for a given experiment) and train FQE ONCE (using the same random seed)
+        on the relevant train_dataset. We use the validation_dataset for early stopping, and the test dataset for evaluation.
         """
         FQE_ARGS = deepcopy(OFFLINE_ARGS)
         # Update the hidden dims
         FQE_ARGS.update({'hidden_dim': 32,
                          'recurrent_hidden_size': 32})
         # Load our dataset
-        dataset_size = 1_000_000
-        dataset = RecurrentReplayBufferEnv(make_glucose_env(patient_ids=TRAIN_IDS), buffer_size=dataset_size * 2)
-        assert os.path.exists('./replay_buffer/COMPLETE'), \
-            "Replay buffer not found. Please generate it by training an offline agent first."
-        dataset.load(f'./replay_buffer')
+        datasets = load_buffer_datasets()
 
         # Set up our FQE evaluator
-        early_stopping_key = 'fqe_evaluation_IQM'
-        evaluator = {'fqe_evaluation': FQEEvaluator(dataset=dataset,
-                                                    batch_size=1024)}
+        early_stopping_key = 'fqe_evaluation_negative_loss'
+        val_evaluator = {'fqe_evaluation_negative_loss': FQEEvaluator(dataset=datasets['val'],
+                                                                      batch_size=1024,
+                                                                      return_loss=True)}
+        test_evaluator = {'fqe_evaluation': FQEEvaluator(dataset=datasets['test'],
+                                                         batch_size=1024)}
 
         # Get our list of trained models
         if is_ppo or is_random or is_dataset:
@@ -174,18 +173,20 @@ if __name__ == "__main__":
 
             # Fit our FQE model
             log_dict = algo.fit(
-                dataset=dataset,
+                dataset=datasets['train'],
+                accessory_datasets=[datasets[key] for key in ['val', 'test']],
                 n_epochs_train=50,
                 n_epochs_per_eval=1,
-                evaluators=evaluator,
+                evaluators_val=val_evaluator,
+                evaluators_test=test_evaluator,
                 early_stopping_key=early_stopping_key,
                 decoy_interval=DECOY_INTERVAL,
-                early_stopping_limit=None,
+                early_stopping_limit=10,
                 dataset_kwargs={},
             )
 
             # Add to our list of run scores
-            for key in evaluator.keys():
+            for key in test_evaluator.keys():
                 all_scores[key].append(log_dict[key])
 
         # Calculate our bootstrap IQM for each evaluator
@@ -293,21 +294,14 @@ if __name__ == "__main__":
 
         else:
             # Load our dataset
-            dataset_size = 1_000_000
-            dataset = RecurrentReplayBufferEnv(make_glucose_env(patient_ids=TRAIN_IDS), buffer_size=dataset_size * 2)
-
-            if not os.path.exists(f'./replay_buffer/COMPLETE'):
-                # Load PPO agent and fill buffer
-                dataset.fill_buffer(model=ppo_agent, n_frames=dataset_size)
-                dataset.save(f'./replay_buffer')
-            else:
-                dataset.load(f'./replay_buffer')
+            datasets = load_buffer_datasets(fill_if_absent=dataset_needs_generating, ppo_agent=ppo_agent)
+            train_dataset = datasets['train']
 
             # Print dataset stats
-            dataset_sem = dataset.dataset_IQR_std / np.sqrt(dataset.dataset_IQR_n_episodes)
-            mean_ep_duration = np.array(dataset.observations[0]).shape[0] / sum(dataset.dones[0])
+            dataset_sem = train_dataset.dataset_IQR_std / np.sqrt(train_dataset.dataset_IQR_n_episodes)
+            mean_ep_duration = np.array(train_dataset.observations[0]).shape[0] / sum(train_dataset.dones[0])
             print(f"\n=================\nBaseline IQR return of the dataset: "
-                  f"{dataset.dataset_IQR_return:.2f}"
+                  f"{train_dataset.dataset_IQR_return:.2f}"
                   f"+/- {dataset_sem:.2f}\nMean duration: {int(mean_ep_duration)} steps\n=================\n")
 
             # Set offline model template and training params
@@ -327,7 +321,7 @@ if __name__ == "__main__":
                 algo = offline_model(**OFFLINE_ARGS)
 
                 log_dict = algo.fit(
-                    dataset=dataset,
+                    dataset=train_dataset,
                     n_epochs_train=n_train_epochs,
                     n_epochs_per_eval=n_epochs_per_eval,
                     evaluators_val=evaluators_val,

@@ -13,7 +13,7 @@ import os
 import shutil
 from scipy.stats import trimboth
 
-from gym_wrappers import AGGREGATE_WINDOW_SIZE, INSULIN_SCALE, MASTER_SEED
+from gym_wrappers import *
 from gymnasium.vector import AsyncVectorEnv
 
 
@@ -333,6 +333,27 @@ class RecurrentReplayBufferEnv:
             # Yield tuple (Standard R2D2/Recurrent format)
             yield (obs, action, reward, done, next_obs, next_action,
                    visible, next_visible, padding_mask, next_padding_mask, train_mask)
+
+    def generate_all_trajectories(self, batch_size: int = 1024, decoy_interval: int = None):
+        """
+        Generator that yields ALL valid sliding window sequences in the dataset
+        sequentially (not shuffled), exactly once.
+        """
+        if decoy_interval is None:
+            decoy_interval = self.decoy_interval
+
+        # Ensure parameters are set
+        if self.n_samples == 0:
+            print("Warning: No samples found. Did you call set_generate_params()?")
+            return
+
+        # Create sequential indices [0, 1, 2, ... N]
+        indices = np.arange(self.n_samples)
+
+        # Iterate in chunks
+        for start_idx in range(0, self.n_samples, batch_size):
+            batch_indices = indices[start_idx: start_idx + batch_size]
+            yield self.fetch_transition_batch(batch_indices, decoy_interval=decoy_interval)
 
     def fetch_transition_batch(self, idxs: np.ndarray, decoy_interval: int = 0):
         """
@@ -1002,14 +1023,26 @@ class FQEEvaluator:
             self,
             dataset,
             batch_size: int = 1024,
+            return_loss: bool = False
     ):
         self.dataset = dataset
         self.batch_size = batch_size
+        self.return_loss = return_loss
 
     def __call__(self, algo, seed=None):
         """
         Goal should be to iterate through the whole dataset once (first state only), calculating the FQE estimate.
         """
+        if self.return_loss:
+            losses = []
+            # Iterate through the entire dataset once
+            for batch in self.dataset.generate_all_trajectories(batch_size=self.batch_size):
+                loss = algo.get_validation_loss(batch)
+                # Set the loss to be negative for maximisation, consistent with maximising scores for early stopping
+                losses.append(-1 * loss)
+
+            return np.array(losses)
+
         # Get scaling data (to unnormalise the predicted return)
         decoy_interval = self.dataset.decoy_interval
         mu = self.dataset.reward_mean[decoy_interval]
@@ -1087,3 +1120,35 @@ def choose_offline_agent(model_type: str, decoy_interval: int):
                               choices=options)]
     answer = inquirer.prompt(question)
     return {answer['option']}
+
+
+def load_buffer_datasets(fill_if_absent: bool = False, ppo_agent=None, dataset_size: int = 10_000_000):
+    assert not fill_if_absent or ppo_agent is not None, \
+        "PPO agent must be provided if not filling buffers."
+
+    def create_empty_dataset(patient_ids: List[int]):
+        return RecurrentReplayBufferEnv(
+            make_glucose_env(patient_ids=patient_ids),
+            buffer_size=dataset_size * 2
+        )
+
+    datasets = {'train': [create_empty_dataset(patient_ids=TRAIN_IDS), dataset_size],
+                # Val and test datasets have 1/3 of the patients, thus 1/3 size
+                'val': [create_empty_dataset(patient_ids=VAL_IDS), dataset_size // 3],
+                'test': [create_empty_dataset(patient_ids=TEST_IDS), dataset_size // 3]}
+
+    for key, (dataset, n_frames) in datasets.items():
+        if not os.path.exists(f'./replay_buffer_{key}/COMPLETE'):
+            if fill_if_absent:
+                print(f"n=== Generating replay buffer for {key} dataset ===\n")
+                # Load PPO agent and fill buffer
+                dataset.fill_buffer(model=ppo_agent, n_frames=n_frames, save_path=f'./replay_buffer_{key}')
+            else:
+                raise FileNotFoundError(f"Replay buffer for {key} dataset not found at "
+                                        f"'./replay_buffer_{key}/COMPLETE'. "
+                                        f"Please run offline training to generate the datasets.")
+        else:
+            dataset.load(f'./replay_buffer_{key}')
+
+        datasets[key] = dataset
+    return datasets

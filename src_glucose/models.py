@@ -1,7 +1,7 @@
 from collections import deque, defaultdict
 from functools import partial
 from copy import deepcopy
-from typing import Tuple, Dict, Optional, Union, Iterable
+from typing import Tuple, Dict, Optional, Union, Iterable, List
 
 import numpy as np
 import torch
@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from gym_wrappers import INSULIN_ACTION_LOW, INSULIN_ACTION_HIGH
 from ppo_trainer import set_seed, RecurrentPPO
+from utils import RecurrentReplayBufferEnv
 
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
 torch.backends.fp32_precision = "tf32"
@@ -712,6 +713,7 @@ class _RecurrentBase(nn.Module):
     def fit(
             self,
             dataset,
+            accessory_datasets: Optional[List[RecurrentReplayBufferEnv]] = None,
             n_epochs_train: int = 1,
             n_epochs_per_eval: int = 1,
             evaluators=None,
@@ -733,6 +735,12 @@ class _RecurrentBase(nn.Module):
         dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
                                     decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
                                     batch_size=self._batch_size, **dataset_kwargs)
+
+        if accessory_datasets is not None:
+            for acc_dataset in accessory_datasets:
+                acc_dataset.set_generate_params(self._device, max_sequence_length=self._sequence_length,
+                                               decoy_interval=decoy_interval, burn_in_length=self._burn_in_length,
+                                               batch_size=self._batch_size, **dataset_kwargs)
 
         dataloader = iter(dataset)
 
@@ -1894,3 +1902,24 @@ class RecurrentFQE(_RecurrentBase):
             lstm_out, _ = self.fqe_encoder(obs_tensor, train_mask=None)
             q_preds = self.q_net(lstm_out, actions=acts_tensor)
         return q_preds
+
+    def get_validation_loss(self, batch):
+        """
+        Computes the loss for a batch without updating parameters.
+        """
+        self.eval()  # Set to evaluation mode (disable dropout, etc.)
+
+        with torch.no_grad():
+            # Unpack the batch (standard R2D2 tuple)
+            (obs, acts, rews, dones, next_obs, next_acts,
+             visible, next_visible, padding_mask, next_padding_mask, train_mask) = batch
+
+            # Reuse the existing internal loss calculation logic
+            # This returns (MSE + CQL Loss)
+            loss = self._update_critic(
+                obs, acts, rews, dones, next_obs, next_acts,
+                visible, next_visible, padding_mask, next_padding_mask, train_mask
+            )
+
+        self.train()  # Reset to training mode
+        return loss.item()
