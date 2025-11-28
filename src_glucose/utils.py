@@ -221,13 +221,16 @@ class RecurrentReplayBufferEnv:
                 # Pass the GPU tensor directly to fetch_transition_batch
                 yield self.fetch_transition_batch(batch_indices, decoy_interval=self.decoy_interval)
 
-    def generate_initial_states(self, batch_size: int = 1024):
+    def generate_initial_states(self, batch_size: int = 1024, burn_in_window: int = 1):
         """
-        Generator that strictly yields batches containing only the very first state
-        of every episode found in the buffer.
+        Generator that yields batches containing the first 'burn_in_window' states
+        of every valid episode found in the buffer.
+
+        Episodes shorter than 'burn_in_window' are excluded.
 
         Yields:
-            Tuple matching fetch_transition_batch output, but with Sequence Length = 1.
+             Tuple matching fetch_transition_batch output.
+             Observations will have shape [Batch, burn_in_window, Obs_Dim]
         """
         # Resolve device
         device = self._device if self._device else 'cpu'
@@ -244,93 +247,110 @@ class RecurrentReplayBufferEnv:
         if len(dones_np) == 0:
             return
 
-        # 2. Identify Start Indices
-        # Index 0 is always a start.
-        # Elsewhere, if index i is Done, index i+1 is a new start.
-        # We verify i+1 is within bounds.
-        episode_starts = [0]
-        term_indices = np.where(dones_np)[0]
+        # 2. Identify Start Indices and Episode Lengths
+        done_idxs = np.where(dones_np)[0]
 
-        # Calculate potential starts (one step after a done)
-        potential_starts = term_indices + 1
+        # Starts are 0 and one step after every done (that isn't the last index)
+        potential_starts = np.concatenate(([0], done_idxs + 1))
 
-        # Filter out starts that are out of bounds (e.g., if the very last frame was Done)
-        valid_starts = potential_starts[potential_starts < len(dones_np)]
-        episode_starts.extend(valid_starts.tolist())
+        # We need corresponding ends to calculate length
+        # If the last index in buffer isn't a done, it's still an end of a segment
+        if len(done_idxs) > 0 and done_idxs[-1] == len(dones_np) - 1:
+            ends = done_idxs
+        else:
+            # Append the end of the buffer as a virtual end for the last episode
+            ends = np.concatenate((done_idxs, [len(dones_np) - 1]))
 
-        episode_starts = np.array(episode_starts, dtype=np.int64)
-        n_starts = len(episode_starts)
+        # Ensure starts and ends are aligned.
+        # Potential starts might have one extra if the last done was the last frame.
+        if len(potential_starts) > len(ends):
+            potential_starts = potential_starts[:len(ends)]
 
-        # 3. Create batches
-        # We simply iterate through the found starts in chunks
+        lengths = ends - potential_starts + 1
+
+        # 3. Filter Episodes based on Burn-In Window
+        valid_mask = lengths >= burn_in_window
+        valid_starts = potential_starts[valid_mask]
+        n_starts = len(valid_starts)
+
+        if n_starts == 0:
+            return
+
+        # 4. Create batches
         indices = np.arange(n_starts)
-        # Optional: np.random.shuffle(indices) # Uncomment if you want random order
 
         for start_i in range(0, n_starts, batch_size):
             batch_indices = indices[start_i: start_i + batch_size]
-            # Get the actual buffer indices for these episodes
-            buffer_idxs = episode_starts[batch_indices]
+            # Get the actual buffer indices for the *start* of these episodes
+            start_buffer_idxs = valid_starts[batch_indices]
 
-            current_bs = len(buffer_idxs)
+            current_bs = len(start_buffer_idxs)
 
-            # 4. Fetch and Format Data
-            # Helper to extract data, add Time dim (T=1), and move to device
-            def _get_tensor(source_dict, idxs, cast_float=True):
+            # Create the 2D grid of indices: [Batch, Time]
+            # Shape: (Batch, burn_in_window)
+            time_offset = np.arange(burn_in_window)
+            buffer_idxs_2d = start_buffer_idxs[:, None] + time_offset[None, :]
+
+            # Flatten for fetching, then we will reshape
+            flat_buffer_idxs = buffer_idxs_2d.flatten()
+
+            # 5. Fetch and Format Data
+            def _get_tensor(source_dict, flat_idxs, cast_float=True):
                 data = source_dict[self.decoy_interval]
 
                 # Slicing logic depending on container type
                 if isinstance(data, (list, deque)):
-                    # Slow list comprehension for deque, but robust
-                    batch_data = np.array([data[i] for i in idxs])
+                    batch_data = np.array([data[i] for i in flat_idxs])
                 elif isinstance(data, torch.Tensor):
-                    batch_data = data[idxs].cpu().numpy()  # Move to CPU for consistency momentarily
+                    batch_data = data[flat_idxs].cpu().numpy()
                 else:
-                    # Numpy
-                    batch_data = data[idxs]
+                    batch_data = data[flat_idxs]
 
-                # Add Sequence Dimension: [Batch, Obs_Dim] -> [Batch, 1, Obs_Dim]
+                # Reshape back to [Batch, Time, Dim]
+                # Note: Raw data might be (N,) or (N, D)
                 if batch_data.ndim > 1:
-                    batch_data = np.expand_dims(batch_data, 1)
+                    # (N*T, D) -> (N, T, D)
+                    batch_data = batch_data.reshape(current_bs, burn_in_window, -1)
                 else:
-                    # Scalar case (actions/rewards often stored as scalars)
-                    batch_data = batch_data.reshape(current_bs, 1, 1)
+                    # (N*T,) -> (N, T, 1)
+                    batch_data = batch_data.reshape(current_bs, burn_in_window, 1)
 
                 t = torch.from_numpy(batch_data).to(device, non_blocking=True)
                 return t.float() if cast_float else t
 
-            # Fetch data
-            obs = _get_tensor(self.observations, buffer_idxs)
+            # Fetch data using the grid
+            obs = _get_tensor(self.observations, flat_buffer_idxs)
+            action = _get_tensor(self.actions, flat_buffer_idxs)
+            reward = _get_tensor(self.rewards, flat_buffer_idxs)
 
-            # For next_obs, we must be careful not to go out of bounds
-            # If an episode is length 1, next_obs exists.
-            # If buffer_idx is the VERY LAST index, next_idx is invalid (clamp it, mask handles validity)
-            next_buffer_idxs = np.minimum(buffer_idxs + 1, len(dones_np) - 1)
-            next_obs = _get_tensor(self.observations, next_buffer_idxs)
+            # Next Obs logic: Shift the whole grid by 1
+            # Clamp to buffer end to avoid crash, though masks handle validity
+            flat_next_idxs = np.minimum(flat_buffer_idxs + 1, len(dones_np) - 1)
+            next_obs = _get_tensor(self.observations, flat_next_idxs)
+            next_action = _get_tensor(self.actions, flat_next_idxs)
 
-            action = _get_tensor(self.actions, buffer_idxs)
-            next_action = _get_tensor(self.actions, next_buffer_idxs)
-            reward = _get_tensor(self.rewards, buffer_idxs)
+            # Dones/Visible
+            done = _get_tensor(self.dones, flat_buffer_idxs, cast_float=False).bool()
+            visible = _get_tensor(self.visible_states, flat_buffer_idxs, cast_float=False).bool()
+            next_visible = _get_tensor(self.visible_states, flat_next_idxs, cast_float=False).bool()
 
-            # Dones/Visible need to be Bool/Long, not Float
-            done = _get_tensor(self.dones, buffer_idxs, cast_float=False).bool()
-            visible = _get_tensor(self.visible_states, buffer_idxs, cast_float=False).bool()
+            # 6. Construct Masks
+            # Since we filtered for validity, the whole window is valid "Train" data
+            # Padding is False (we guaranteed data exists), Train is True
 
-            # Next visible (shifted)
-            next_visible = _get_tensor(self.visible_states, next_buffer_idxs, cast_float=False).bool()
+            # Shape: [Batch, T, 1]
+            padding_mask = torch.zeros((current_bs, burn_in_window, 1), dtype=torch.bool, device=device)
 
-            # 5. Construct Masks
-            # Since we are grabbing 1 real state, padding is False, Train is True
-            # Shape: [Batch, 1, 1]
-            padding_mask = torch.zeros((current_bs, 1, 1), dtype=torch.bool, device=device)
-            next_padding_mask = torch.zeros((current_bs, 1, 1), dtype=torch.bool, device=device)
+            # Next padding mask: The last step of the sequence has no valid next step in this context
+            next_padding_mask = torch.zeros_like(padding_mask)
 
-            # If we clamped the next_obs index because we were at the end of buffer, mask it out
-            at_buffer_limit = torch.tensor(buffer_idxs == (len(dones_np) - 1), device=device).reshape(current_bs, 1, 1)
+            # For the very last index of the buffer, next is invalid
+            at_buffer_limit = torch.tensor(flat_buffer_idxs == (len(dones_np) - 1), device=device)
+            at_buffer_limit = at_buffer_limit.reshape(current_bs, burn_in_window, 1)
             next_padding_mask = next_padding_mask | at_buffer_limit
 
-            train_mask = torch.ones((current_bs, 1, 1), dtype=torch.bool, device=device)
+            train_mask = torch.ones((current_bs, burn_in_window, 1), dtype=torch.bool, device=device)
 
-            # Yield tuple (Standard R2D2/Recurrent format)
             yield (obs, action, reward, done, next_obs, next_action,
                    visible, next_visible, padding_mask, next_padding_mask, train_mask)
 
@@ -1060,8 +1080,27 @@ class FQEEvaluator:
 
             return np.array(losses)
 
-        # Get scaling data (to unnormalise the predicted return)
+        # --- Initial State Evaluation (with 4-hour burn-in) ---
+
+        # 1. Determine Burn-in Window based on Decoy Interval
+        # Goal: Treat S_0 as the state after 4 hours of behavior policy.
         decoy_interval = self.dataset.decoy_interval
+        assert AGGREGATE_WINDOW_SIZE * SAMPLE_TIME // 60 == 4, \
+            ("Current code assumes aggregation window size corresponds to 4 hours. "
+             "Is SAMPLE_TIME still 10 minutes? If so, the following code needs to be checked carefully.")
+
+        if decoy_interval == 2:
+            # 1 step = 4 hours.
+            burn_in_steps = 1
+        elif decoy_interval == 3:
+            # 1 step = 2 hours.
+            burn_in_steps = 2
+        else:
+            # Raw data (Interval 0 or 1).
+            # AGGREGATE_WINDOW_SIZE corresponds to 4 hours in raw steps.
+            burn_in_steps = AGGREGATE_WINDOW_SIZE
+
+        # 2. Get Scaling Data
         mu = self.dataset.reward_mean[decoy_interval]
         sigma = self.dataset.reward_std[decoy_interval]
 
@@ -1075,32 +1114,45 @@ class FQEEvaluator:
         total_steps = len(dones_np)
         mean_ep_length = total_steps / n_episodes if n_episodes > 0 else 0
 
-        # Iterate over all initial states
+        # 3. Iterate over valid episodes
         all_fqe_preds = []
-        for batch in self.dataset.generate_initial_states(batch_size=self.batch_size):
+
+        # We pass the calculated burn_in_steps here
+        gen = self.dataset.generate_initial_states(batch_size=self.batch_size, burn_in_window=burn_in_steps)
+
+        for batch in gen:
             (obs, acts, _, _, _, _, _, _, _, _, _) = batch
 
+            # Obs is shape [Batch, burn_in_steps, Dim]
+
             with torch.no_grad():
-                # Sample action
+                # Predict sequence of actions
+                # algo.target_model.predict returns actions for the whole sequence
                 acts_preds, _ = algo.target_model.predict(obs, deterministic=True, action_as_tensor=True)
+
                 if acts_preds is None:
                     acts_preds = acts
-                # Get Q-values
-                fqe_preds = algo.get_value_estimate(obs, acts_preds)
+
+                # Get Q-values for the whole sequence
+                # Shape: [Batch, burn_in_steps, 1]
+                fqe_preds_seq = algo.get_value_estimate(obs, acts_preds)
+
+                # We only want the value estimate at the END of the burn-in period (i.e., after 4 hours)
+                # Take the last timestep
+                fqe_preds = fqe_preds_seq[:, -1, :]
 
             all_fqe_preds.append(fqe_preds.squeeze())
 
-        all_fqe_preds = torch.cat(all_fqe_preds).cpu().numpy()  # [N]
+        if len(all_fqe_preds) > 0:
+            all_fqe_preds = torch.cat(all_fqe_preds).cpu().numpy()  # [N]
+        else:
+            print("Warning: No episodes found with sufficient length for 4-hour burn-in.")
+            return np.array([0.0])
 
-        # We need to rescale q_preds back to original reward scale
-        # V_raw = V_norm * sigma + (mu * length)
-        # We do this per-prediction to get the distribution of raw returns
+        # Rescale q_preds back to original reward scale
         raw_fqe_preds = all_fqe_preds * sigma + (mu * mean_ep_length)
-        # Temporarily disabled IQR trimming for FQE predictions
-        # iqr_fqe_preds = trimboth(raw_fqe_preds, proportiontocut=0.25)
-        iqr_fqe_preds = raw_fqe_preds
 
-        return iqr_fqe_preds
+        return raw_fqe_preds
 
 
 def parse_bool(value, name: str = ''):
