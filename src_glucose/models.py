@@ -1081,9 +1081,9 @@ class RecurrentIQL(_RecurrentBase):
 
         # Define steps_per_epoch - should map based on decoy_interval
         if self._cloning_only:
-            self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500}
+            self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500, 3: 500}
         else:
-            self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500}
+            self.steps_per_epoch = {0: 1_000, 1: 1_000, 2: 500, 3: 500}
 
         # Set our update functions
         if not self._cloning_only:
@@ -1338,7 +1338,7 @@ class RecurrentCQLSAC(_RecurrentBase):
                                                              device=self._device))
 
         # Define steps_per_epoch - should map based on decoy_interval
-        self.steps_per_epoch = {0: 500, 1: 500, 2: 250}
+        self.steps_per_epoch = {0: 500, 1: 500, 2: 250, 3: 250}
 
         # Set our update functions
         self.update_funcs.update({'policy_loss': self.update_actor,
@@ -1685,7 +1685,7 @@ class RecurrentFQE(_RecurrentBase):
         self._cql_alpha = torch.tensor(cql_alpha, device=self._device)
 
         # Define steps_per_epoch - should map based on decoy_interval
-        self.steps_per_epoch = {0: 5_000, 1: 5_000, 2: 5_000}
+        self.steps_per_epoch = {0: 5_000, 1: 5_000, 2: 5_000, 3: 5_000}
 
         # Set our update functions
         self.update_funcs.update({'critic_loss': self.update_critic})

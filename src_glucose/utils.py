@@ -19,12 +19,12 @@ from gymnasium.vector import AsyncVectorEnv
 
 class RecurrentReplayBufferEnv:
     def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20):
-        self.observations = {i: deque(maxlen=buffer_size) for i in range(3)}
-        self.actions = {i: deque(maxlen=buffer_size) for i in range(3)}
-        self.rewards = {i: deque(maxlen=buffer_size) for i in range(3)}
-        self.dones = {i: deque(maxlen=buffer_size) for i in range(3)}
-        self.sample_bool = {i: deque(maxlen=buffer_size) for i in range(3)}
-        self.visible_states = {i: deque(maxlen=buffer_size) for i in range(3)}
+        self.observations = {i: deque(maxlen=buffer_size) for i in range(4)}
+        self.actions = {i: deque(maxlen=buffer_size) for i in range(4)}
+        self.rewards = {i: deque(maxlen=buffer_size) for i in range(4)}
+        self.dones = {i: deque(maxlen=buffer_size) for i in range(4)}
+        self.sample_bool = {i: deque(maxlen=buffer_size) for i in range(4)}
+        self.visible_states = {i: deque(maxlen=buffer_size) for i in range(4)}
 
         self.buffer_size = buffer_size
         self.env = env
@@ -37,14 +37,14 @@ class RecurrentReplayBufferEnv:
         self.dataset_IQR_return = None
         self.dataset_IQR_std = None
         self.dataset_IQR_n_episodes = None
-        self.reward_mean = {i: None for i in range(3)}
-        self.reward_std = {i: None for i in range(3)}
+        self.reward_mean = {i: None for i in range(4)}
+        self.reward_std = {i: None for i in range(4)}
         self.max_sequence_length = sequence_length
         self.burn_in_length = burn_in_length
-        self.sequence_info = {i: [] for i in range(3)}
-        self.indices_map = {i: None for i in range(3)}
-        self.padding_mask_map = {i: None for i in range(3)}
-        self.train_mask_map = {i: None for i in range(3)}
+        self.sequence_info = {i: [] for i in range(4)}
+        self.indices_map = {i: None for i in range(4)}
+        self.padding_mask_map = {i: None for i in range(4)}
+        self.train_mask_map = {i: None for i in range(4)}
 
     def __iter__(self):
         return iter(self.generate())
@@ -429,15 +429,15 @@ class RecurrentReplayBufferEnv:
             ('sample_bool', self.sample_bool),
             ('visible_states', self.visible_states)
         ]:
-            save_dict = {i: list(value[i]) for i in range(3)}
+            save_dict = {i: list(value[i]) for i in range(4)}
             np.savez(os.path.join(path, f'{key}.npz'),
                      **{str(k): v for k, v in save_dict.items()})
 
         # Save dataset IQR return and scaling
         save_dict = {'dataset_iqr_avg': self.dataset_IQR_return, 'dataset_iqr_std': self.dataset_IQR_std,
                      'dataset_iqr_n_episodes': self.dataset_IQR_n_episodes}
-        save_dict.update({f'reward_mean_{i}': self.reward_mean[i] for i in range(3)})
-        save_dict.update({f'reward_std_{i}': self.reward_std[i] for i in range(3)})
+        save_dict.update({f'reward_mean_{i}': self.reward_mean[i] for i in range(4)})
+        save_dict.update({f'reward_std_{i}': self.reward_std[i] for i in range(4)})
         np.savez(os.path.join(path, 'rewards_scale.npz'), **save_dict)
 
         # Mark saving as complete
@@ -462,14 +462,15 @@ class RecurrentReplayBufferEnv:
         self.dataset_IQR_return = float(loaded_scale['dataset_iqr_avg'])
         self.dataset_IQR_std = float(loaded_scale['dataset_iqr_std'])
         self.dataset_IQR_n_episodes = int(loaded_scale['dataset_iqr_n_episodes'])
-        for i in range(3):
+
+        for i in range(4):
             self.reward_mean[i] = float(loaded_scale[f'reward_mean_{i}'])
             self.reward_std[i] = float(loaded_scale[f'reward_std_{i}'])
 
         # Tweak to shorten from 1M to 500k steps (if needed)
         """
         print(f"Trimming 1M to ~500k steps for dataset...")
-        for i in range(3):
+        for i in range(4):
             done_indices = np.where(self.dones[i])[0]
             n_episodes = done_indices.shape[0] // 2
             start_idx = 0
@@ -611,12 +612,12 @@ class RecurrentReplayBufferEnv:
     def _init_storage_dict():
         """Creates an empty dictionary structure mimicking self.observations etc."""
         return {
-            'observations': {i: [] for i in range(3)},
-            'actions': {i: [] for i in range(3)},
-            'rewards': {i: [] for i in range(3)},
-            'dones': {i: [] for i in range(3)},
-            'sample_bool': {i: [] for i in range(3)},
-            'visible_states': {i: [] for i in range(3)}
+            'observations': {i: [] for i in range(4)},
+            'actions': {i: [] for i in range(4)},
+            'rewards': {i: [] for i in range(4)},
+            'dones': {i: [] for i in range(4)},
+            'sample_bool': {i: [] for i in range(4)},
+            'visible_states': {i: [] for i in range(4)}
         }
 
     @staticmethod
@@ -624,7 +625,7 @@ class RecurrentReplayBufferEnv:
         """Saves the current dictionary of lists to an NPZ file."""
         save_dict = {}
         for key in ['observations', 'actions', 'rewards', 'dones', 'sample_bool', 'visible_states']:
-            for i in range(3):
+            for i in range(4):
                 # Convert list to array for saving
                 save_dict[f"{key}_{i}"] = np.array(storage[key][i])
 
@@ -644,19 +645,19 @@ class RecurrentReplayBufferEnv:
         keys = ['observations', 'actions', 'rewards', 'dones', 'sample_bool', 'visible_states']
 
         # Temporary holding for merged arrays
-        merged_data = {k: {i: [] for i in range(3)} for k in keys}
+        merged_data = {k: {i: [] for i in range(4)} for k in keys}
 
         print("Loading chunks...")
         for cf in chunk_files:
             data = np.load(cf, allow_pickle=True)
             for k in keys:
-                for i in range(3):
+                for i in range(4):
                     arr = data[f"{k}_{i}"]
                     if len(arr) > 0:
                         merged_data[k][i].append(arr)
 
         print("Concatenating and Normalizing...")
-        for i in range(3):
+        for i in range(4):
             # Concatenate arrays
             # For observations, we might want to add the "final zero obs" here if needed
             # The original code added a zero obs at the very end.
@@ -725,6 +726,40 @@ class RecurrentReplayBufferEnv:
         ep_buffer['all_done'] += [term or trunc]
         ep_buffer['visible_state'] += [info['steps_until_action_available'] == 0]
 
+    @staticmethod
+    def _get_aggregated_episode(ep_buffer, window_size):
+        # Helper function for update_permanent_buffer
+        obs_data = np.array(ep_buffer['all_obs'])
+        action_data = np.array(ep_buffer['all_action'])
+        done_data = np.array(ep_buffer['all_done'])
+        reward_data = np.array(ep_buffer['all_reward'])
+
+        # Generate our aggregated datapoints for decoy_interval = 2 and 3
+        # e.g., for window_size = 3, we use the following aggregates:
+        # for i in [3, 6, 9, ...]
+        # [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
+        # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
+        # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
+        # rew:             |---------|    |-------     (t2-t4, t5-t7, etc)
+        # (reward calculated from next obs)
+
+        # Aggregate obs
+        obs_indices = range(window_size, len(obs_data) + 1, window_size)
+        obs_splits = np.array_split(obs_data, obs_indices, axis=0)[:-1]
+        obs = [np.mean(chunk, axis=0) for chunk in obs_splits if chunk.size > 0]
+
+        # Aggregate actions / dones / rewards
+        slice_indices = range(window_size - 1, len(obs_data), window_size)
+        action_splits = np.array_split(action_data, slice_indices, axis=0)[1:]
+        done_splits = np.array_split(done_data, slice_indices, axis=0)[1:]
+        reward_splits = np.array_split(reward_data, slice_indices, axis=0)[1:]
+
+        actions = [np.mean(chunk, axis=0) for chunk in action_splits if chunk.size > 0]
+        dones = [np.any(chunk) for chunk in done_splits if chunk.size > 0]
+        rewards = [np.sum(chunk) for chunk in reward_splits if chunk.size > 0]
+
+        return obs, actions, rewards, dones
+
     def update_permanent_buffer(self, ep_buffer: dict, storage=None):
         """
         Added `storage` argument.
@@ -759,47 +794,29 @@ class RecurrentReplayBufferEnv:
         target_vis[0] += visible_idxs
         target_vis[1] += [True for _ in range(len(ep_buffer['all_done']))]
 
-        # Generate our aggregated datapoints for decoy_interval = 2
-        # e.g., for window_size = 3, we use the following aggregates:
-        # for i in [3, 6, 9, ...]
-        # [t0,  t1,  t2,  t3,  t4,  t5,  t6,  ...]
-        # obs:  |----------|    |---------|    |----   (t0-t2, t3-t5, etc)
-        # act:             |---------|    |-------     (t2-t4, t5-t7, etc)
-        # rew:             |---------|    |-------     (t2-t4, t5-t7, etc)
-        # (reward calculated from next obs)
+        # Calculate Index 2 (4 Hour, using AGGREGATE_WINDOW_SIZE)
+        # Calculate Index 3 (2 Hour, using AGGREGATE_WINDOW_SIZE // 2)
 
-        # Aggregate for interval 2 (Decoy)
-        agg_window = AGGREGATE_WINDOW_SIZE
+        assert AGGREGATE_WINDOW_SIZE * SAMPLE_TIME // 60 == 4, \
+            ("Current code assumes aggregation window size corresponds to 4 hours. "
+             "Is SAMPLE_TIME still 10 minutes? If so, the following code needs to be checked.")
 
-        obs_data = np.array(ep_buffer['all_obs'])
-        action_data = np.array(ep_buffer['all_action'])
-        done_data = np.array(ep_buffer['all_done'])
-        reward_data = np.array(ep_buffer['all_reward'])
+        windows = {
+            2: AGGREGATE_WINDOW_SIZE,  # 4 hours
+            3: max(1, AGGREGATE_WINDOW_SIZE // 2)  # 2 hours
+        }
 
-        # --- Aggregate obs ---
-        obs_indices = range(agg_window, len(obs_data) + 1, agg_window)
-        obs_splits = np.array_split(obs_data, obs_indices, axis=0)[:-1]
-        obs = [np.mean(chunk, axis=0) for chunk in obs_splits if chunk.size > 0]
+        for idx, win_size in windows.items():
+            obs, actions, rewards, dones = self._get_aggregated_episode(ep_buffer, win_size)
 
-        # --- Aggregate actions / dones / rewards ---
-        slice_indices = range(agg_window - 1, len(obs_data), agg_window)
-        action_splits = np.array_split(action_data, slice_indices, axis=0)[1:]
-        done_splits = np.array_split(done_data, slice_indices, axis=0)[1:]
-        reward_splits = np.array_split(reward_data, slice_indices, axis=0)[1:]
-
-        actions = [np.mean(chunk, axis=0) for chunk in action_splits if chunk.size > 0]
-        dones = [np.any(chunk) for chunk in done_splits if chunk.size > 0]
-        rewards = [np.sum(chunk) for chunk in reward_splits if chunk.size > 0]
-
-        if not dones or not dones[-1]:
-            return
-
-        target_obs[2] += obs
-        target_act[2] += actions
-        target_rew[2] += rewards
-        target_don[2] += dones
-        target_smp[2] += [True for _ in range(len(dones))]
-        target_vis[2] += [True for _ in range(len(dones))]
+            # Make sure this is a valid minimum-length episode we are saving
+            if dones and dones[-1]:
+                target_obs[idx] += obs
+                target_act[idx] += actions
+                target_rew[idx] += rewards
+                target_don[idx] += dones
+                target_smp[idx] += [True for _ in range(len(dones))]
+                target_vis[idx] += [True for _ in range(len(dones))]
 
 
 class ParallelEnvironmentEvaluator:

@@ -264,7 +264,7 @@ if __name__ == "__main__":
             .with_columns(
                 pl.col('decoy_interval')
                 .cast(pl.Utf8)
-                .replace({'0': 'Unprocessed', '1': 'Interpolated', '2': 'Binned'})
+                .replace({'0': 'Unprocessed', '1': 'Interpolated', '2': 'Binned (4hr)', '3': 'Binned (2hr)'})
                 .alias('Training Dataset')
             )
         )
@@ -291,7 +291,7 @@ if __name__ == "__main__":
         # 4. Plotting
         sns.set_theme(style="whitegrid")
         algo_order = ['BC', 'IQL', 'CQL']
-        dataset_order = ['Unprocessed', 'Interpolated', 'Binned']
+        dataset_order = ['Unprocessed', 'Interpolated', 'Binned (2hr)', 'Binned (4hr)']
         env_order = ['UVA/Padova Irregular', 'UVA/Padova Regular']
 
         g = sns.catplot(
@@ -376,5 +376,5 @@ if __name__ == "__main__":
             title_fontsize=14
         )
 
-        plt.savefig('../logs_glucose/iql_logs/final_plot.png', dpi=1200) #, bbox_inches='tight')
+        plt.savefig('../logs_glucose/iql_logs/final_plot.png', dpi=2000)
         plt.show()
