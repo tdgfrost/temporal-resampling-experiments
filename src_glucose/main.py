@@ -12,7 +12,7 @@ parser.add_argument('--train_fqe', default=False, type=parse_bool, help='Train F
 parser.add_argument('--model_type', default='dataset', type=str,
                     choices=['iql', 'cql', 'ppo', 'random', 'dataset'],
                     help='Type of model to train/evaluate (iql, cql, ppo, random)')
-parser.add_argument('--target_agent_path', default=None, type=str,
+parser.add_argument('--target_agent_path', default="best_model04_15507.53.pth", type=str,
                     help='Path to target agent')
 
 parser.add_argument('--expectile', default=0.9, type=float, help='Expectile value for IQL training (0.5 is BC)')
