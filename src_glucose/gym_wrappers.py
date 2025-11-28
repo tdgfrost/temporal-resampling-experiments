@@ -84,8 +84,9 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
 
 class T1DPatientEnv(Wrapper):
 
-    def __init__(self, patient_ids: Iterable[int] = range(1, 31), **kwargs):
+    def __init__(self, patient_ids: Iterable[int] = range(1, 31), max_hours: int = 48, **kwargs):
         self.kwargs = kwargs
+        self.max_hours = max_hours
 
         # Ensure _id_choices is a list for consistent indexing
         if not isinstance(patient_ids, Iterable):
@@ -99,7 +100,7 @@ class T1DPatientEnv(Wrapper):
         self._current_id = id_choice  # Set the current ID
 
         identity = f"simglucose/{id_choice}-v0"
-        env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
+        env = gym.make(identity, max_episode_steps=(self.max_hours * 60) // SAMPLE_TIME, **self.kwargs)
         super().__init__(env)
 
         # Set the action space to 0 - 0.5
@@ -135,7 +136,7 @@ class T1DPatientEnv(Wrapper):
         self._current_id = id_choice
 
         identity = f"simglucose/{id_choice}-v0"
-        self.env = gym.make(identity, max_episode_steps=(48 * 60) // SAMPLE_TIME, **self.kwargs)
+        self.env = gym.make(identity, max_episode_steps=(self.max_hours * 60) // SAMPLE_TIME, **self.kwargs)
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -323,7 +324,7 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         )
 
     def observation(self, obs):
-        hour_float = self.env.get_wrapper_attr('get_time')() / 48
+        hour_float = self.env.get_wrapper_attr('get_time')() / 48  # Keep fixed at 48 for simplicity
         return np.concatenate([obs, [hour_float]], axis=-1)
 
 
@@ -389,8 +390,8 @@ class EnforcePPOWrapper(Wrapper):
 
 def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_rewards: bool = False, gamma: float = 1.0,
                      forced_interval: int = 0, use_scaling: bool = False, enforce_ppo_wrapper: bool = False,
-                     n_envs: int = 1, **kwargs):
-    env = T1DPatientEnv(patient_ids=patient_ids, **kwargs)
+                     n_envs: int = 1, max_hours: int = 48, **kwargs):
+    env = T1DPatientEnv(patient_ids=patient_ids, max_hours=max_hours, **kwargs)
     # env = AddPatientState(env)
     env = SampleTimeWrapper(env)
     if use_scaling:

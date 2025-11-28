@@ -1,15 +1,8 @@
-from collections import defaultdict
-from functools import partial
-
-import polars as pl
 from scipy.stats import trim_mean
-from tqdm import tqdm
-from copy import deepcopy
 
-from gym_wrappers import *
 from models import *
-from utils import *
 from ppo_trainer import *
+from utils import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
@@ -113,8 +106,9 @@ if __name__ == "__main__":
     dataset_needs_generating = False
     if train_offline or train_fqe:
         # Load PPO or offline agent
-        dataset_needs_generating = train_offline and not is_random and not all([os.path.exists(f'./replay_buffer_{key}/COMPLETE')
-                                                                                for key in ['train', 'val', 'test']])
+        dataset_needs_generating = train_offline and not is_random and not all(
+            [os.path.exists(f'./replay_buffer_{key}/COMPLETE')
+             for key in ['train', 'val', 'test']])
         if is_ppo or dataset_needs_generating:
             if target_agent_path is None:
                 target_agent_path = choose_ppo_agent()
@@ -252,8 +246,18 @@ if __name__ == "__main__":
                                                                 gamma=GAMMA,
                                                                 verbose=is_ppo or is_random,
                                                                 test_ids=TEST_IDS)
+            # Add a custom 4-hour-truncated evaluator (for comparison with FQE)
+            evaluators_test[key + "_44_hrs"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
+                                                                                    forced_interval=interval,
+                                                                                    max_hours=44),
+                                                                            n_eval_envs=24,
+                                                                            n_eval_episodes_per_id=30,
+                                                                            gamma=GAMMA,
+                                                                            verbose=is_ppo or is_random,
+                                                                            test_ids=TEST_IDS)
 
             if key == "online_irregular":
+                # Add a dedicated validation evaluator
                 evaluators_val[key] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                            forced_interval=interval),
                                                                    n_eval_envs=30,
