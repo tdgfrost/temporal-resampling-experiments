@@ -827,6 +827,8 @@ class _RecurrentBase(nn.Module):
 
     @staticmethod
     def add_noise(obs):
+        if not torch.is_grad_enabled():
+            return obs
         batch_dims = obs.shape[:-1]
         noise = torch.randn_like(obs) * obs.view(*batch_dims, -1).std(0)
         new_obs = obs.clone()  # necessary for cudagraphs
@@ -900,7 +902,14 @@ class _RecurrentBase(nn.Module):
         return action, next_hidden_state
 
     @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
-    def _filter_to_correct_visibles(self, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
+    def _filter_to_correct_visibles(self, *args):
+        return self._filter_to_correct_visibles_precompiled(*args)
+
+    @torch.compile  # Better to avoid CUDA graphs when no gradient required
+    def _filter_to_correct_visibles_no_grad(self, *args):
+        return self._filter_to_correct_visibles_precompiled(*args)
+
+    def _filter_to_correct_visibles_precompiled(self, r, v_next, dones, visible, next_visible, padding_mask, train_mask):
         # shapes: q1,q2 (N,T,1 or N,T,*), r,v_next,dones,visible,next_visible (N,T,1)
         N, T = visible.shape[:2]
         dtype = r.dtype
@@ -993,7 +1002,7 @@ class _RecurrentBase(nn.Module):
         c_0 = torch.zeros(1, batch_size, self._recurrent_hidden_size, device=self._device)
         return h_0, c_0
 
-    def _log_progress(self, epoch: int, evaluators: dict = None):
+    def _log_progress(self, epoch: Union[int | str], evaluators: dict = None):
         assert evaluators is not None, \
             "Evaluators must be provided for logging."
 
@@ -1015,9 +1024,9 @@ class _RecurrentBase(nn.Module):
 
                 log_rewards[key + '_IQM'] = iqr_mean
 
-                eval_str += f"\n     {key} = {iqr_mean:.2f} +/- {iqr_std / np.sqrt(iqr_n_samples):.2f}"
+                eval_str += f"\n     {key} = {iqr_mean:.5f} +/- {iqr_std / np.sqrt(iqr_n_samples):.5f}"
 
-        eval_str += '=' * 40 + '\n'
+        eval_str += '\n' + '=' * 40 + '\n'
         print(eval_str)
         self.train()
 
@@ -1691,7 +1700,7 @@ class RecurrentFQE(_RecurrentBase):
         self._cql_alpha = torch.tensor(cql_alpha, device=self._device)
 
         # Define steps_per_epoch - should map based on decoy_interval
-        self.steps_per_epoch = {0: 5_000, 1: 5_000, 2: 5_000, 3: 5_000}
+        self.steps_per_epoch = {0: 3_000, 1: 3_000, 2: 3_000, 3: 3_000}
 
         # Set our update functions
         self.update_funcs.update({'critic_loss': self.update_critic})
@@ -1757,8 +1766,15 @@ class RecurrentFQE(_RecurrentBase):
         return critic_loss
 
     @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
-    def _update_critic_compiled(self, obs, acts, next_acts, visible, train_mask,
-                                lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt):
+    def _update_critic_compiled(self, *args):
+        return self._update_critic_precompiled(*args, skip_cql=False)
+
+    @torch.compile  # Better to avoid CUDA graphs when no gradient required
+    def _update_critic_compiled_no_grad(self, *args):
+        return self._update_critic_precompiled(*args, skip_cql=True)
+
+    def _update_critic_precompiled(self, obs, acts, next_acts, visible, train_mask,
+                                lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt, skip_cql: bool = False):
         # 1. Compute Current Q(s, a)
         q_preds = self.q_net(lstm_out_q, actions=acts)
 
@@ -1778,6 +1794,9 @@ class RecurrentFQE(_RecurrentBase):
 
             # Compute Q_target values using target Q nets
             next_q_preds = self.q_target_net(next_lstm_out_tgt, actions=next_action)
+
+        if skip_cql:
+            return q_preds, next_q_preds, None
 
         # CQL OOD Penalty calcuation
         # We want to penalise LogSumExp(Q(s, a_sampled)) - Q(s, a_data)
@@ -1846,16 +1865,27 @@ class RecurrentFQE(_RecurrentBase):
         target_obs = obs[..., :-1]
         target_next_obs = next_obs[..., :-1]
 
+        if torch.is_grad_enabled():
+            skip_cql = False
+            update_critic_fn = self._update_critic_compiled
+            filter_fn = self._filter_to_correct_visibles
+        else:
+            skip_cql = True
+            update_critic_fn = self._update_critic_compiled_no_grad
+            filter_fn = self._filter_to_correct_visibles_no_grad
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Do LSTM inference outside of compiled loop
             lstm_out_q, _ = self.fqe_encoder(obs, train_mask=train_mask)
             with torch.no_grad():
-                # Get the next action from the target policy
-                lstm_out_pi, _ = self.target_model.actor_encoder(target_obs, train_mask=None)
+                if not skip_cql:
+                    lstm_out_pi, _ = self.target_model.actor_encoder(target_obs, train_mask=None)
+                else:
+                    lstm_out_pi = None
                 next_lstm_out_pi, _ = self.target_model.actor_encoder(target_next_obs, train_mask=None)
                 next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
 
-            current_q, next_q, scaled_cql_loss = self._update_critic_compiled(
+            current_q, next_q, scaled_cql_loss = update_critic_fn(
                 obs, acts, next_acts, visible, train_mask,
                 lstm_out_q, lstm_out_pi, next_lstm_out_pi, next_lstm_out_tgt
             )
@@ -1864,7 +1894,7 @@ class RecurrentFQE(_RecurrentBase):
             # y = r + gamma * (1-d) * Q_target
             if self.decoy_interval == 0:
                 # If using specialized filtering from base class
-                q_target, train_mask = self._filter_to_correct_visibles(
+                q_target, train_mask = filter_fn(
                     rews, next_q, dones, visible, next_visible, padding_mask, train_mask)
             else:
                 q_target = rews + self._gamma * (1 - dones.float()) * next_q
@@ -1877,6 +1907,8 @@ class RecurrentFQE(_RecurrentBase):
             masked_loss = critic_loss_unmasked * train_mask
             critic_loss = masked_loss.sum() / (train_mask.sum() + self._eps)
 
+        if scaled_cql_loss is None:
+            return critic_loss
         return critic_loss + scaled_cql_loss
 
     def sync_target_networks(self, tau=None):
@@ -1912,23 +1944,16 @@ class RecurrentFQE(_RecurrentBase):
             q_preds = self.q_net(lstm_out, actions=acts_tensor)
         return q_preds
 
-    def get_validation_loss(self, batch):
+    def get_validation_loss(self, *batch):
         """
         Computes the loss for a batch without updating parameters.
         """
         self.eval()  # Set to evaluation mode (disable dropout, etc.)
 
         with torch.no_grad():
-            # Unpack the batch (standard R2D2 tuple)
-            (obs, acts, rews, dones, next_obs, next_acts,
-             visible, next_visible, padding_mask, next_padding_mask, train_mask) = batch
-
             # Reuse the existing internal loss calculation logic
             # This returns (MSE + CQL Loss)
-            loss = self._update_critic(
-                obs, acts, rews, dones, next_obs, next_acts,
-                visible, next_visible, padding_mask, next_padding_mask, train_mask
-            )
+            loss = self._update_critic(*batch)
 
         self.train()  # Reset to training mode
         return loss.item()

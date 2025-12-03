@@ -132,7 +132,7 @@ if __name__ == "__main__":
         FQE_ARGS.update({'observation_shape': new_observation_shape})
 
         # Load our dataset
-        datasets = load_buffer_datasets()
+        datasets = load_buffer_datasets(reduce_fraction={'val': 0.5})
 
         # Set up our FQE evaluator
         early_stopping_key = 'fqe_evaluation_negative_loss'

@@ -379,11 +379,12 @@ class RecurrentReplayBufferEnv:
             print("Warning: No samples found. Did you call set_generate_params()?")
             return
 
-        # Create sequential indices [0, 1, 2, ... N]
-        indices = np.arange(self.n_samples)
+        # Create sequential indices [0, 1, 2, ... N] - final truncated batch is dropped
+        n_samples = (self.n_samples // batch_size) * batch_size
+        indices = np.arange(n_samples)
 
         # Iterate in chunks
-        for start_idx in range(0, self.n_samples, batch_size):
+        for start_idx in range(0, n_samples, batch_size):
             batch_indices = indices[start_idx: start_idx + batch_size]
             yield self.fetch_transition_batch(batch_indices, decoy_interval=decoy_interval)
 
@@ -492,7 +493,7 @@ class RecurrentReplayBufferEnv:
         with open(os.path.join(path, 'COMPLETE'), 'w') as f:
             f.close()
 
-    def load(self, path: str):
+    def load(self, path: str, reduce_fraction: Optional[float] = None):
         for key, value in [
             ('observations', self.observations),
             ('actions', self.actions),
@@ -516,19 +517,20 @@ class RecurrentReplayBufferEnv:
             self.reward_mean[i] = float(loaded_scale[f'reward_mean_{i}'])
             self.reward_std[i] = float(loaded_scale[f'reward_std_{i}'])
 
-        # Tweak to shorten from 1M to 500k steps (if needed)
-        """
-        print(f"Trimming 1M to ~500k steps for dataset...")
-        for i in range(4):
-            done_indices = np.where(self.dones[i])[0]
-            n_episodes = done_indices.shape[0] // 2
-            start_idx = 0
-            end_idx = done_indices[n_episodes] + 1
-            self.observations[i] = self.observations[i][start_idx:end_idx + 1]
-            for arr in [self.actions, self.rewards, self.dones,
-                        self.sample_bool, self.visible_states]:
-                arr[i] = arr[i][start_idx:end_idx]
-        """
+        # Tweak to shorten dataset for faster evaluation if required
+        if reduce_fraction is not None:
+            assert 0 < reduce_fraction < 1.0, "reduce_fraction must be between 0 and 1"
+            for i in range(4):
+                done_indices = np.where(self.dones[i])[0]
+                n_episodes = int(done_indices.shape[0] * reduce_fraction)
+                if i == 0:
+                    print(f"Trimming {done_indices.shape[0]} to {n_episodes} episodes for {path}...")
+                start_idx = 0
+                end_idx = done_indices[n_episodes] + 1
+                self.observations[i] = self.observations[i][start_idx:end_idx + 1]
+                for arr in [self.actions, self.rewards, self.dones,
+                            self.sample_bool, self.visible_states]:
+                    arr[i] = arr[i][start_idx:end_idx]
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
@@ -1127,10 +1129,13 @@ class FQEEvaluator:
         if self.return_loss:
             losses = []
             # Iterate through the entire dataset once
-            for batch in self.dataset.generate_all_trajectories(batch_size=self.batch_size):
-                loss = algo.get_validation_loss(batch)
-                # Set the loss to be negative for maximisation, consistent with maximising scores for early stopping
-                losses.append(-1 * loss)
+            with tqdm(total=self.dataset.segments, desc="Calculating validation loss...", mininterval=2.0,
+                      leave=False) as pbar:
+                for batch in self.dataset.generate_all_trajectories(batch_size=self.batch_size):
+                    loss = algo.get_validation_loss(*batch)
+                    # Set the loss to be negative for maximisation, consistent with maximising scores for early stopping
+                    losses.append(-1 * loss)
+                    pbar.update(1)
 
             return np.array(losses)
 
@@ -1248,7 +1253,8 @@ def choose_offline_agent(model_type: str, decoy_interval: int):
     return {answer['option']}
 
 
-def load_buffer_datasets(fill_if_absent: bool = False, ppo_agent=None, dataset_size: int = 10_000_000):
+def load_buffer_datasets(fill_if_absent: bool = False, ppo_agent=None, dataset_size: int = 10_000_000,
+                         reduce_fraction: Optional[Dict[str, float]] = None):
     assert not fill_if_absent or ppo_agent is not None, \
         "PPO agent must be provided if not filling buffers."
 
@@ -1274,7 +1280,11 @@ def load_buffer_datasets(fill_if_absent: bool = False, ppo_agent=None, dataset_s
                                         f"'./replay_buffer_{key}/COMPLETE'. "
                                         f"Please run offline training to generate the datasets.")
         else:
-            dataset.load(f'./replay_buffer_{key}')
+            if isinstance(reduce_fraction, dict):
+                current_reduce_fraction = reduce_fraction.get(key, None)
+            else:
+                current_reduce_fraction = reduce_fraction
+            dataset.load(f'./replay_buffer_{key}', reduce_fraction=current_reduce_fraction)
 
         datasets[key] = dataset
     return datasets
