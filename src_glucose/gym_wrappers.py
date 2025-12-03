@@ -14,6 +14,8 @@ import polars as pl
 SAMPLE_TIME = 10.0  # minutes
 AGGREGATE_WINDOW_SIZE = 24  # 24 * 10 minutes = 240 minutes
 TOTAL_SIZE = 12  # Set irregular sampling from 10 minutes to 120 minutes (12 * 10 minutes)
+MAX_DURATION = 48  # hours
+MAX_STEPS = (MAX_DURATION * 60) // SAMPLE_TIME
 
 INSULIN_ACTION_LOW = 0.0
 INSULIN_ACTION_HIGH = 0.5
@@ -84,7 +86,7 @@ class EpisodeRewardsOnly(RecordConstructorArgs, Wrapper):
 
 class T1DPatientEnv(Wrapper):
 
-    def __init__(self, patient_ids: Iterable[int] = range(1, 31), max_hours: int = 48, **kwargs):
+    def __init__(self, patient_ids: Iterable[int] = range(1, 31), max_hours: int = MAX_DURATION, **kwargs):
         self.kwargs = kwargs
         self.max_hours = max_hours
 
@@ -390,7 +392,7 @@ class EnforcePPOWrapper(Wrapper):
 
 def make_glucose_env(*, patient_ids: Iterable[int] = range(1, 31), no_interim_rewards: bool = False, gamma: float = 1.0,
                      forced_interval: int = 0, use_scaling: bool = False, enforce_ppo_wrapper: bool = False,
-                     n_envs: int = 1, max_hours: int = 48, **kwargs):
+                     n_envs: int = 1, max_hours: int = MAX_DURATION, **kwargs):
     env = T1DPatientEnv(patient_ids=patient_ids, max_hours=max_hours, **kwargs)
     # env = AddPatientState(env)
     env = SampleTimeWrapper(env)

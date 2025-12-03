@@ -127,6 +127,10 @@ if __name__ == "__main__":
         FQE_ARGS.update({'hidden_dim': 64,
                          'recurrent_hidden_size': 64,
                          'critic_lr': 5e-3})  # Higher LR for FQE training
+        # Update action space to include additional time_remaining feature
+        new_observation_shape = (dummy_env.observation_space.shape[0] + 1,)
+        FQE_ARGS.update({'observation_shape': new_observation_shape})
+
         # Load our dataset
         datasets = load_buffer_datasets()
 
@@ -177,7 +181,7 @@ if __name__ == "__main__":
                 early_stopping_key=early_stopping_key,
                 decoy_interval=DECOY_INTERVAL,
                 early_stopping_limit=10,
-                dataset_kwargs={},
+                dataset_kwargs={'include_time_remaining': True},
             )
 
             # Add to our list of run scores
@@ -249,7 +253,7 @@ if __name__ == "__main__":
             # Add a custom 4-hour-truncated evaluator (for comparison with FQE)
             evaluators_test[key + "_44_hrs"] = ParallelEnvironmentEvaluator(partial(make_glucose_env,
                                                                                     forced_interval=interval,
-                                                                                    max_hours=44),
+                                                                                    max_hours=MAX_DURATION - 4),
                                                                             n_eval_envs=24,
                                                                             n_eval_episodes_per_id=30,
                                                                             gamma=GAMMA,

@@ -25,6 +25,7 @@ class RecurrentReplayBufferEnv:
         self.dones = {i: deque(maxlen=buffer_size) for i in range(4)}
         self.sample_bool = {i: deque(maxlen=buffer_size) for i in range(4)}
         self.visible_states = {i: deque(maxlen=buffer_size) for i in range(4)}
+        self.time_remaining = {i: deque(maxlen=buffer_size) for i in range(4)}
 
         self.buffer_size = buffer_size
         self.env = env
@@ -34,6 +35,7 @@ class RecurrentReplayBufferEnv:
         self.decoy_interval = 0
         self.n_samples = 0
         self.segments = 0
+        self.include_time_remaining = False
         self.dataset_IQR_return = None
         self.dataset_IQR_std = None
         self.dataset_IQR_n_episodes = None
@@ -53,7 +55,8 @@ class RecurrentReplayBufferEnv:
         return self.segments
 
     def set_generate_params(self, device: str = 'cpu', batch_size: int = None, decoy_interval: int = None,
-                            max_sequence_length: int = None, burn_in_length: int = None, epoch_fraction: float = 1.0):
+                            max_sequence_length: int = None, burn_in_length: int = None, epoch_fraction: float = 1.0,
+                            include_time_remaining: bool = False):
         """
         Scans the buffer to identify all episodes and their lengths, preparing for sampling.
         """
@@ -61,6 +64,7 @@ class RecurrentReplayBufferEnv:
         self.decoy_interval = decoy_interval if decoy_interval is not None else self.decoy_interval
         self.max_sequence_length = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
         self.burn_in_length = burn_in_length if burn_in_length is not None else self.burn_in_length
+        self.include_time_remaining = include_time_remaining if include_time_remaining is not None else self.include_time_remaining
         # Record the device for later
         self._device = device
 
@@ -329,6 +333,14 @@ class RecurrentReplayBufferEnv:
             next_obs = _get_tensor(self.observations, flat_next_idxs)
             next_action = _get_tensor(self.actions, flat_next_idxs)
 
+            # (Optional) Include time remaining
+            if self.include_time_remaining:
+                time_remaining = _get_tensor(self.time_remaining, flat_buffer_idxs)
+                obs = torch.cat([obs, time_remaining], dim=-1)
+
+                next_time_remaining = _get_tensor(self.time_remaining, flat_next_idxs)
+                next_obs = torch.cat([next_obs, next_time_remaining], dim=-1)
+
             # Dones/Visible
             done = _get_tensor(self.dones, flat_buffer_idxs, cast_float=False).bool()
             visible = _get_tensor(self.visible_states, flat_buffer_idxs, cast_float=False).bool()
@@ -419,6 +431,21 @@ class RecurrentReplayBufferEnv:
         done = _gather_helper(self.dones)
         visible = _gather_helper(self.visible_states)
 
+        # (Optional) get time_remaining and concat to obs
+        if self.include_time_remaining:
+            time_remaining = self.time_remaining[decoy_interval][gather_indices]
+            if time_remaining.ndim == 2:
+                time_remaining = time_remaining.unsqueeze(-1)
+
+            obs = torch.cat([obs, time_remaining], dim=-1)
+
+            # Next Time Remaining
+            next_time_remaining = self.time_remaining[decoy_interval][next_gather_indices]
+            if next_time_remaining.ndim == 2:
+                next_time_remaining = next_time_remaining.unsqueeze(-1)
+
+            next_obs = torch.cat([next_obs, next_time_remaining], dim=-1)
+
         # Next Action
         next_action = self.actions[decoy_interval][next_gather_indices]
         if next_action.ndim == 2:
@@ -447,7 +474,8 @@ class RecurrentReplayBufferEnv:
             ('rewards', self.rewards),
             ('dones', self.dones),
             ('sample_bool', self.sample_bool),
-            ('visible_states', self.visible_states)
+            ('visible_states', self.visible_states),
+            ('time_remaining', self.time_remaining),
         ]:
             save_dict = {i: list(value[i]) for i in range(4)}
             np.savez(os.path.join(path, f'{key}.npz'),
@@ -471,7 +499,8 @@ class RecurrentReplayBufferEnv:
             ('rewards', self.rewards),
             ('dones', self.dones),
             ('sample_bool', self.sample_bool),
-            ('visible_states', self.visible_states)
+            ('visible_states', self.visible_states),
+            ('time_remaining', self.time_remaining),
         ]:
             loaded = np.load(os.path.join(path, f'{key}.npz'), allow_pickle=True)
             for k in loaded.files:
@@ -515,7 +544,8 @@ class RecurrentReplayBufferEnv:
             'all_term': [],
             'all_trunc': [],
             'all_done': [],
-            'visible_state': [True]
+            'visible_state': [True],
+            'steps_remaining': [1.0],
         }
 
     def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None, save_path: str = "./replay_buffer",
@@ -546,12 +576,14 @@ class RecurrentReplayBufferEnv:
             obs, info, ep_buffer = self.reset(seed=current_seed)
             total_rewards = []
             total_lengths = []
+            max_episode_steps = MAX_STEPS
 
             while frame_count < n_frames:
                 model.set_random_seed(current_seed)
                 done = False
                 lstm_states = model.ac_network.init_hidden_state(batch_size=1)
                 total_reward = 0
+                current_ep_steps = 0
 
                 while not done:
                     action, lstm_states = model.predict(np.expand_dims(obs, 0), hidden_state=lstm_states,
@@ -563,8 +595,10 @@ class RecurrentReplayBufferEnv:
 
                     done = term or trunc
                     total_reward += reward
+                    current_ep_steps += 1
+                    steps_remaining = (max_episode_steps - current_ep_steps) / max_episode_steps
 
-                    self.update_episode_buffer(obs, real_action, reward, term, trunc, info, ep_buffer)
+                    self.update_episode_buffer(obs, real_action, reward, term, trunc, info, ep_buffer, steps_remaining)
 
                     if done:
                         # Update our frame count seed
@@ -572,6 +606,7 @@ class RecurrentReplayBufferEnv:
                         # Reset our buffer and environment
                         ep_buffer['all_obs'] = ep_buffer['all_obs'][:-1]
                         obs, info = self.env.reset(seed=current_seed)
+                        current_ep_steps = 0
 
                     pbar.update(1)
 
@@ -637,14 +672,15 @@ class RecurrentReplayBufferEnv:
             'rewards': {i: [] for i in range(4)},
             'dones': {i: [] for i in range(4)},
             'sample_bool': {i: [] for i in range(4)},
-            'visible_states': {i: [] for i in range(4)}
+            'visible_states': {i: [] for i in range(4)},
+            'time_remaining': {i: [] for i in range(4)}
         }
 
     @staticmethod
     def _save_chunk(storage, temp_dir, chunk_idx):
         """Saves the current dictionary of lists to an NPZ file."""
         save_dict = {}
-        for key in ['observations', 'actions', 'rewards', 'dones', 'sample_bool', 'visible_states']:
+        for key in ['observations', 'actions', 'rewards', 'dones', 'sample_bool', 'visible_states', 'time_remaining']:
             for i in range(4):
                 # Convert list to array for saving
                 save_dict[f"{key}_{i}"] = np.array(storage[key][i])
@@ -730,6 +766,7 @@ class RecurrentReplayBufferEnv:
         self.rewards[i] = _set_device(self.rewards[i]).float()
         self.dones[i] = _set_device(self.dones[i]).bool()
         self.visible_states[i] = _set_device(self.visible_states[i]).bool()
+        self.time_remaining[i] = _set_device(self.time_remaining[i]).float()
         self.sequence_info[i] = _set_device(self.sequence_info[i]).long()
 
         self._tensors_set = True
@@ -737,7 +774,7 @@ class RecurrentReplayBufferEnv:
 
     @staticmethod
     def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, term: bool, trunc: bool, info: dict,
-                              ep_buffer: dict):
+                              ep_buffer: dict, steps_remaining: int):
         ep_buffer['all_obs'] += [obs]
         ep_buffer['all_action'] += [action]
         ep_buffer['all_reward'] += [reward]
@@ -745,6 +782,7 @@ class RecurrentReplayBufferEnv:
         ep_buffer['all_trunc'] += [trunc]
         ep_buffer['all_done'] += [term or trunc]
         ep_buffer['visible_state'] += [info['steps_until_action_available'] == 0]
+        ep_buffer['steps_remaining'] += [steps_remaining]
 
     @staticmethod
     def _get_aggregated_episode(ep_buffer, window_size):
@@ -794,6 +832,7 @@ class RecurrentReplayBufferEnv:
             target_don = self.dones
             target_smp = self.sample_bool
             target_vis = self.visible_states
+            target_time = self.time_remaining
         else:
             target_obs = storage['observations']
             target_act = storage['actions']
@@ -801,6 +840,7 @@ class RecurrentReplayBufferEnv:
             target_don = storage['dones']
             target_smp = storage['sample_bool']
             target_vis = storage['visible_states']
+            target_time = storage['time_remaining']
 
         visible_idxs = ep_buffer['visible_state']
         for i in range(2):
@@ -809,6 +849,7 @@ class RecurrentReplayBufferEnv:
             target_rew[i] += ep_buffer['all_reward']
             target_don[i] += ep_buffer['all_done']
             target_smp[i] += [True for _ in range(len(ep_buffer['all_done']))]
+            target_time[i] += ep_buffer['steps_remaining']
 
         # Update visible states
         target_vis[0] += visible_idxs
@@ -837,6 +878,19 @@ class RecurrentReplayBufferEnv:
                 target_don[idx] += dones
                 target_smp[idx] += [True for _ in range(len(dones))]
                 target_vis[idx] += [True for _ in range(len(dones))]
+
+                # For steps remaining, this should be based on the NEW max length of the aggregated episode
+                raw_max = MAX_STEPS
+                agg_max = int(raw_max / win_size)
+
+                agg_time_remaining = []
+                for t in range(len(dones)):
+                    val = max(0, agg_max - t) / agg_max
+                    agg_time_remaining.append(val)
+
+                target_time[idx] += agg_time_remaining
+
+                raise Exception("Check the above code works as intended")
 
 
 class ParallelEnvironmentEvaluator:
@@ -1123,12 +1177,15 @@ class FQEEvaluator:
         for batch in gen:
             (obs, acts, _, _, _, _, _, _, _, _, _) = batch
 
+            # Remove steps_remaining for target model
+            target_obs = obs[..., :-1]
+
             # Obs is shape [Batch, burn_in_steps, Dim]
 
             with torch.no_grad():
                 # Predict sequence of actions
                 # algo.target_model.predict returns actions for the whole sequence
-                acts_preds, _ = algo.target_model.predict(obs, deterministic=True, action_as_tensor=True)
+                acts_preds, _ = algo.target_model.predict(target_obs, deterministic=True, action_as_tensor=True)
 
                 if acts_preds is None:
                     acts_preds = acts

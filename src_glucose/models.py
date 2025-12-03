@@ -827,9 +827,15 @@ class _RecurrentBase(nn.Module):
 
     @staticmethod
     def add_noise(obs):
-        noise = torch.randn_like(obs) * obs.view(-1, 4).std(0)
+        batch_dims = obs.shape[:-1]
+        noise = torch.randn_like(obs) * obs.view(*batch_dims, -1).std(0)
         new_obs = obs.clone()  # necessary for cudagraphs
-        new_obs[..., :-1] = new_obs[..., :-1] + noise[..., :-1] * 0.01
+        if obs.shape[-1] == 4:
+            new_obs[..., :-1] = new_obs[..., :-1] + noise[..., :-1] * 0.01
+        elif obs.shape[-1] == 5:
+            new_obs[..., :-2] = new_obs[..., :-2] + noise[..., :-2] * 0.01
+        else:
+            raise ValueError("Observation last dimension must be 4 or 5 for noise addition.")
         return new_obs
 
     def generic_update(self, loss, optimizer, *nets):
@@ -1836,13 +1842,17 @@ class RecurrentFQE(_RecurrentBase):
         obs = self.add_noise(obs)
         next_obs = self.add_noise(next_obs)
 
+        # Remove steps_remaining for the target model
+        target_obs = obs[..., :-1]
+        target_next_obs = next_obs[..., :-1]
+
         with torch.autocast(device_type="cuda", enabled=self.scaler is not None, dtype=self._scaler_dtype):
             # Do LSTM inference outside of compiled loop
             lstm_out_q, _ = self.fqe_encoder(obs, train_mask=train_mask)
             with torch.no_grad():
                 # Get the next action from the target policy
-                lstm_out_pi, _ = self.target_model.actor_encoder(obs, train_mask=None)
-                next_lstm_out_pi, _ = self.target_model.actor_encoder(next_obs, train_mask=None)
+                lstm_out_pi, _ = self.target_model.actor_encoder(target_obs, train_mask=None)
+                next_lstm_out_pi, _ = self.target_model.actor_encoder(target_next_obs, train_mask=None)
                 next_lstm_out_tgt, _ = self.fqe_target_encoder(next_obs, train_mask=None)
 
             current_q, next_q, scaled_cql_loss = self._update_critic_compiled(
