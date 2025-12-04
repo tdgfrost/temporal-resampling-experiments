@@ -1837,7 +1837,6 @@ class RecurrentFQE(_RecurrentBase):
 
         # Calculate the logsumexp
         temperature = 1.0
-        cql_q_combined = cql_q_combined / temperature
         cql_q_logsumexp = torch.logsumexp(cql_q_combined / temperature, dim=0) * temperature
 
         # Log(N) normalization
