@@ -126,7 +126,7 @@ if __name__ == "__main__":
         # Update the hidden dims
         FQE_ARGS.update({'hidden_dim': 64,
                          'recurrent_hidden_size': 64,
-                         'critic_lr': 5e-3})  # Higher LR for FQE training
+                         'batch_size': 256})
         # Update action space to include additional time_remaining feature
         new_observation_shape = (dummy_env.observation_space.shape[0] + 1,)
         FQE_ARGS.update({'observation_shape': new_observation_shape})
@@ -137,10 +137,10 @@ if __name__ == "__main__":
         # Set up our FQE evaluator
         early_stopping_key = 'fqe_evaluation_negative_loss'
         val_evaluator = {'fqe_evaluation_negative_loss': FQEEvaluator(dataset=datasets['val'],
-                                                                      batch_size=1024,
+                                                                      batch_size=256,
                                                                       return_loss=True)}
         test_evaluator = {'fqe_evaluation': FQEEvaluator(dataset=datasets['test'],
-                                                         batch_size=1024)}
+                                                         batch_size=256)}
 
         # Get our list of trained models
         if is_ppo or is_random or is_dataset:
