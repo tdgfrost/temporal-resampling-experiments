@@ -1,4 +1,5 @@
 import glob
+from copy import deepcopy
 from functools import partial
 from typing import Union, Callable, Optional, Tuple, List
 import numpy as np
@@ -18,7 +19,8 @@ from gymnasium.vector import AsyncVectorEnv
 
 
 class RecurrentReplayBufferEnv:
-    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20):
+    def __init__(self, env, buffer_size: int = 100000, sequence_length: int = 64, burn_in_length: int = 20,
+                 reward_mean: Optional[dict] = None, reward_std: Optional[dict] = None):
         self.observations = {i: deque(maxlen=buffer_size) for i in range(4)}
         self.actions = {i: deque(maxlen=buffer_size) for i in range(4)}
         self.rewards = {i: deque(maxlen=buffer_size) for i in range(4)}
@@ -39,8 +41,8 @@ class RecurrentReplayBufferEnv:
         self.dataset_IQR_return = None
         self.dataset_IQR_std = None
         self.dataset_IQR_n_episodes = None
-        self.reward_mean = {i: None for i in range(4)}
-        self.reward_std = {i: None for i in range(4)}
+        self.reward_mean = {i: None for i in range(4)} if reward_mean is None else deepcopy(reward_mean)
+        self.reward_std = {i: None for i in range(4)} if reward_std is None else deepcopy(reward_std)
         self.max_sequence_length = sequence_length
         self.burn_in_length = burn_in_length
         self.sequence_info = {i: [] for i in range(4)}
@@ -725,7 +727,9 @@ class RecurrentReplayBufferEnv:
             if r_list:
                 full_rewards = np.concatenate(r_list, axis=0)
 
-                r_mean, r_std = full_rewards.mean(), full_rewards.std()
+                r_mean = self.reward_mean[i] or full_rewards.mean()
+                r_std = self.reward_std[i] or full_rewards.std()
+
                 norm_rewards = (full_rewards - r_mean) / (r_std + 1e-8)
 
                 self.rewards[i] = deque(norm_rewards, maxlen=self.buffer_size)
@@ -1258,27 +1262,33 @@ def load_buffer_datasets(fill_if_absent: bool = False, ppo_agent=None, dataset_s
     assert not fill_if_absent or ppo_agent is not None, \
         "PPO agent must be provided if not filling buffers."
 
-    def create_empty_dataset(patient_ids: List[int]):
+    def create_empty_dataset(patient_ids: List[int], *args, **kwargs):
         return RecurrentReplayBufferEnv(
             make_glucose_env(patient_ids=patient_ids),
-            buffer_size=dataset_size * 2
+            buffer_size=dataset_size * 2,
+            *args, **kwargs
         )
 
-    datasets = {'train': [create_empty_dataset(patient_ids=TRAIN_IDS), dataset_size],
-                # Val and test datasets have 1/3 of the patients, thus 1/3 size
-                'val': [create_empty_dataset(patient_ids=VAL_IDS), dataset_size // 3],
-                'test': [create_empty_dataset(patient_ids=TEST_IDS), dataset_size // 3]}
+    datasets = dict()
+    r_mean, r_std = None, None
+    for key, patient_ids, n_frames in [
+        ('train', TRAIN_IDS, dataset_size),
+        ('val', VAL_IDS, dataset_size // 3),
+        ('test', TEST_IDS, dataset_size // 3)
+    ]:
+        # Create empty dataset (+/- train dataset reward scaling)
+        dataset = create_empty_dataset(patient_ids=patient_ids, reward_mean=r_mean, reward_std=r_std)
 
-    for key, (dataset, n_frames) in datasets.items():
         if not os.path.exists(f'./replay_buffer_{key}/COMPLETE'):
             if fill_if_absent:
                 print(f"n=== Generating replay buffer for {key} dataset ===\n")
                 # Load PPO agent and fill buffer
-                dataset.fill_buffer(model=ppo_agent, n_frames=n_frames, save_path=f'./replay_buffer_{key}')
+                dataset.fill_buffer(model=ppo_agent, n_frames=dataset_size, save_path=f'./replay_buffer_{key}')
             else:
                 raise FileNotFoundError(f"Replay buffer for {key} dataset not found at "
                                         f"'./replay_buffer_{key}/COMPLETE'. "
                                         f"Please run offline training to generate the datasets.")
+
         else:
             if isinstance(reduce_fraction, dict):
                 current_reduce_fraction = reduce_fraction.get(key, None)
@@ -1286,5 +1296,8 @@ def load_buffer_datasets(fill_if_absent: bool = False, ppo_agent=None, dataset_s
                 current_reduce_fraction = reduce_fraction
             dataset.load(f'./replay_buffer_{key}', reduce_fraction=current_reduce_fraction)
 
+        if key == 'train':
+            r_mean, r_std = dataset.reward_mean, dataset.reward_std
         datasets[key] = dataset
+
     return datasets
