@@ -1689,7 +1689,7 @@ class RecurrentFQE(_RecurrentBase):
             self,
             target_model: Union[RecurrentIQL, RecurrentCQLSAC],
             tau_target: float = 0.005,
-            cql_alpha: float = 0.01,
+            cql_alpha: float = 1.0,
             *args,
             **kwargs
     ):
