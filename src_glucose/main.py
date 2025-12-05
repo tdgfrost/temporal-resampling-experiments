@@ -167,7 +167,8 @@ if __name__ == "__main__":
                 offline_agent.load_checkpoint(target_agent_path)
 
             # Create our FQE model
-            FQE_ARGS.update({'target_model': offline_agent})
+            FQE_ARGS.update({'target_model': offline_agent,
+                             'seed': seed})
             algo = RecurrentFQE(**FQE_ARGS)
 
             # Fit our FQE model
