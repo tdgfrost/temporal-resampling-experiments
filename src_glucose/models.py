@@ -1700,7 +1700,7 @@ class RecurrentFQE(_RecurrentBase):
         self._cql_alpha = torch.tensor(cql_alpha, device=self._device)
 
         # Define steps_per_epoch - should map based on decoy_interval
-        self.steps_per_epoch = {0: 3_000, 1: 3_000, 2: 3_000, 3: 3_000}
+        self.steps_per_epoch = {0: 3_000, 1: 3_000, 2: 2_000, 3: 2_000}
 
         # Set our update functions
         self.update_funcs.update({'critic_loss': self.update_critic})
@@ -1767,7 +1767,7 @@ class RecurrentFQE(_RecurrentBase):
 
     @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     def _update_critic_compiled(self, *args):
-        return self._update_critic_precompiled(*args, skip_cql=False)
+        return self._update_critic_precompiled(*args, skip_cql=True)
 
     @torch.compile  # Better to avoid CUDA graphs when no gradient required
     def _update_critic_compiled_no_grad(self, *args):

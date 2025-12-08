@@ -175,13 +175,13 @@ if __name__ == "__main__":
             log_dict = algo.fit(
                 dataset=datasets['train'],
                 accessory_datasets=[datasets[key] for key in ['val', 'test']],
-                n_epochs_train=50,
-                n_epochs_per_eval=1,
+                n_epochs_train=10,
+                n_epochs_per_eval=10,
                 evaluators_val=val_evaluator,
                 evaluators_test=test_evaluator,
                 early_stopping_key=early_stopping_key,
                 decoy_interval=DECOY_INTERVAL,
-                early_stopping_limit=10,
+                early_stopping_limit=None,
                 dataset_kwargs={'include_time_remaining': True},
             )
 
