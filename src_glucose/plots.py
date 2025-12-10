@@ -38,213 +38,242 @@ if __name__ == "__main__":
         replay_buffer_env = RecurrentReplayBufferEnv(make_glucose_env(), buffer_size=int(5e7))
         replay_buffer_env.load('./replay_buffer_train')
 
-        # Specific the type of plot we want
-        chosen_patient_number = 0  # Can remain fixed
-        for chosen_dataset_number in [0, 3]:
-            obs = np.array(replay_buffer_env.observations[chosen_dataset_number])
-            dones = np.array(replay_buffer_env.dones[chosen_dataset_number])
-            visibles = np.array(replay_buffer_env.visible_states[chosen_dataset_number])
 
-            blood_glucose = obs[:, 0] * 590 + 10  # Scale back to mg/dL
-            insulin_acts = obs[:, 1] * 1
+        # --- 0. Helper Functions (Assumes replay_buffer_env and bg_in_range_magni exist) ---
+
+        def get_patient_data(dataset_number, patient_idx_in_batch=0):
+            """Extracts and normalizes data for a specific dataset number."""
+            obs = np.array(replay_buffer_env.observations[dataset_number])
+            acts = np.array(replay_buffer_env.actions[dataset_number])
+            dones = np.array(replay_buffer_env.dones[dataset_number])
+
+            # De-normalize
+            blood_glucose = obs[:, 0] * 590 + 10
+            # insulin_acts = obs[:, 1] * 1
+            insulin_acts = acts * 1
             cho = obs[:, 2] * 300
             hour_float = obs[:, 3] * 48
-            current_patient_idx = np.where(dones)[0][chosen_patient_number] + 1
-            next_patient_idx = np.roll(np.where(dones)[0], -1)[chosen_patient_number]
+
+            # Slice specific patient episode
+            # Note: Using logic from your snippet
+            current_patient_idx = np.where(dones)[0][patient_idx_in_batch] + 1
+            next_patient_idx = np.roll(np.where(dones)[0], -1)[patient_idx_in_batch]
             if next_patient_idx < current_patient_idx:
                 next_patient_idx = -1
 
-            # --- 1. Create Mock Blood Glucose Data ---
-            pt_time = hour_float[current_patient_idx: next_patient_idx]
-            pt_blood_glucose = blood_glucose[current_patient_idx: next_patient_idx]
-            pt_insulin_acts = insulin_acts[current_patient_idx: next_patient_idx]
-            pt_insulin_acts_time = hour_float[current_patient_idx: next_patient_idx]  # shift in line with CHO
-            pt_cho = cho[current_patient_idx: next_patient_idx]
+            return {
+                'time': hour_float[current_patient_idx: next_patient_idx],
+                'bg': blood_glucose[current_patient_idx: next_patient_idx],
+                'insulin': insulin_acts[current_patient_idx: next_patient_idx],
+                'cho': cho[current_patient_idx: next_patient_idx],
+                'dataset_num': dataset_number
+            }
 
-            # --- 2. Define Reward Function Parameters ---
-            LOWER_TARGET = 70
-            HIGHER_TARGET = 180
-            PEAK_TARGET = minimize_scalar(
-                lambda x: -bg_in_range_magni([x]),
-                bounds=(70, 180),
-                method='bounded').x.item()  # Skewed peak
-            MAX_REWARD = 51.0  # The max positive reward at the peak
 
-            # --- 3. Set Up Plot Boundaries --- # Set Y-axis limits
-            # --- 3. Set Up Plot Boundaries --- # Set Y-axis limits
-            for y_max in [250, 700]:
-                fig, ax1 = plt.subplots(figsize=(14, 7))
+        def draw_panel(ax, data, y_max, show_legend=True, is_bottom_plot=True,
+                       explicit_xlim=None, explicit_xticks=None):
+            """
+            Draws a single plot panel with optional forced x-limits/ticks.
+            """
+            pt_time = data['time']
+            pt_bg = data['bg']
+            pt_cho = data['cho']
+            pt_insulin = data['insulin']
+
+            # Use explicit limits if provided, otherwise calculate from data
+            if explicit_xlim:
+                x_min, x_max = explicit_xlim
+            else:
                 x_min, x_max = pt_time.min(), pt_time.max()
-                y_min = 10
 
-                # --- 4. Create the Gradient Image ---
-                # Create an array of 500 y-values from the bottom to the top of the plot
-                # We will calculate the reward for each y-value
-                y_vals_for_gradient = np.linspace(y_min, y_max, 500)
+            y_min = 10
 
+            # --- A. Gradient Background (remains the same) ---
+            y_vals_for_gradient = np.linspace(y_min, y_max, 500)
 
-                # Vectorize the reward function so we can apply it to the whole array
-                def f(x): return bg_in_range_magni([x])
+            # ... [Insert gradient calculation logic from previous code here] ...
+            # (Re-using the logic for brevity, ensure you copy the gradient block here)
+            def f(x):
+                return bg_in_range_magni([x])
 
+            vectorized_reward_func = np.vectorize(f)
+            rewards = np.array(list(map(vectorized_reward_func, y_vals_for_gradient.tolist())))
+            v_min, v_max = rewards.min(), rewards.max()
+            cmap = plt.get_cmap('RdYlGn')
+            norm = mcolors.TwoSlopeNorm(vcenter=0, vmin=v_min, vmax=v_max)
+            colors_rgba = cmap(norm(rewards))
+            max_alpha = 0.5
+            alpha_vals = np.zeros_like(rewards)
+            pos_mask = rewards > 0
+            neg_mask = rewards < 0
+            alpha_vals[pos_mask] = np.exp(rewards[pos_mask] / v_max) ** 0.1 * max_alpha
+            alpha_vals[neg_mask] = np.exp(rewards[neg_mask] / v_min) ** 0.3 * max_alpha
+            colors_rgba[:, 3] = alpha_vals
+            gradient_image = colors_rgba.reshape(len(y_vals_for_gradient), 1, 4)
+            gradient_image = np.tile(gradient_image, (1, 10, 1))
 
-                vectorized_reward_func = np.vectorize(f)
-                rewards = np.array(list(map(vectorized_reward_func, y_vals_for_gradient.tolist())))
+            # Plot Image
+            ax.imshow(
+                gradient_image, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                aspect='auto', zorder=1
+            )
 
-                # Find the min (max penalty) and max (max reward) for normalization
-                v_min = rewards.min()
-                v_max = rewards.max()
+            # --- B. Plot Lines and Targets (remains the same) ---
+            LOWER_TARGET, HIGHER_TARGET = 70, 180
+            PEAK_TARGET = minimize_scalar(lambda x: -bg_in_range_magni([x]), bounds=(70, 180),
+                                          method='bounded').x.item()
 
-                # Create a diverging colormap centered at 0
-                # vcenter=0 ensures 0 is yellow, negatives are red, positives are green
-                cmap = plt.get_cmap('RdYlGn')
-                norm = mcolors.TwoSlopeNorm(vcenter=0, vmin=v_min, vmax=v_max)
+            ax.axhline(LOWER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5, label='Target range (70-180)')
+            ax.axhline(HIGHER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5)
+            ax.axhline(PEAK_TARGET, color='green', linestyle=':', linewidth=1, zorder=5, label='Peak reward')
 
-                # Get the (R, G, B, A) color for each reward value
-                # This is an array of shape (500, 4)
-                colors_rgba = cmap(norm(rewards))
+            if data['dataset_num'] == 3:
+                ax.step(pt_time, pt_bg, color='black', linewidth=1.5, zorder=10, label='Blood glucose', where='post')
+            else:
+                ax.plot(pt_time, pt_bg, color='black', linewidth=1.5, zorder=10, label='Blood glucose')
 
-                # --- 5. Create the Alpha (Transparency) Gradient ---
-                # We want alpha=0 at reward=0, and max_alpha at v_min and v_max
-                max_alpha = 0.5  # Set max opacity (e.g., 60%)
-                alpha_gamma = 0.5
-                alpha_vals = np.zeros_like(rewards)
-
-                # Get masks for positive and negative rewards
-                pos_mask = rewards > 0
-                neg_mask = rewards < 0
-
-                # Calculate alpha for positive rewards (scales from 0 to max_alpha)
-                alpha_vals[pos_mask] = np.exp(rewards[pos_mask] / v_max) ** 0.1 * max_alpha
-                # Calculate alpha for negative rewards (scales from 0 to max_alpha)
-                # (v_min is negative, so division results in a positive value)
-                alpha_vals[neg_mask] = np.exp(rewards[neg_mask] / v_min) ** 0.3 * max_alpha
-
-                # Apply this new alpha channel to our colors
-                colors_rgba[:, 3] = alpha_vals
-
-                # --- 6. Reshape Colors into a Plot-able Image ---
-                # Reshape (500, 4) -> (500, 1, 4)
-                # This is a 1-pixel-wide, 500-pixel-high image
-                gradient_image = colors_rgba.reshape(len(y_vals_for_gradient), 1, 4)
-                # Tile it horizontally to make a 10-pixel-wide image.
-                # This is more efficient for rendering than a full-width image.
-                gradient_image = np.tile(gradient_image, (1, 10, 1))
-
-                # --- 7. Plot the Gradient Image and Data ---
-                # Plot the gradient image on the background (zorder=1)
-                # `extent` maps the image pixels to the data coordinates [x_min, x_max, y_min, y_max]
-                # `origin='lower'` means the 0-index of the array is at the bottom (y_min)
-                # `aspect='auto'` stretches the image to fill the axes
-                ax1.imshow(
-                    gradient_image,
-                    origin='lower',
-                    extent=[x_min, x_max, y_min, y_max],
-                    aspect='auto',
-                    zorder=1
+            if y_max == 250:
+                cho_mask = pt_cho > 0
+                cho_vals = pt_cho[cho_mask]
+                if data['dataset_num'] == 3: cho_vals *= 12
+                markerline, stemlines, baseline = ax.stem(
+                    pt_time[cho_mask], cho_vals, linefmt='purple', markerfmt='D', basefmt=' ', label='Carbohydrates (g)'
                 )
+                plt.setp(markerline, markersize=5, color='purple', zorder=9)
+                plt.setp(stemlines, linewidth=1.5, color='purple', zorder=9)
 
-                # Plot the target lines
-                ax1.axhline(LOWER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5,
-                            label='Target Range (70-180)')
-                ax1.axhline(HIGHER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5)
-                ax1.axhline(PEAK_TARGET, color='green', linestyle=':', linewidth=1, zorder=5,
-                            label=f'Peak Reward ({int(PEAK_TARGET)})')
+            ax2 = None
+            if y_max == 250:
+                ax2 = ax.twinx()
+                ax2.step(pt_time, pt_insulin, color='blue', linestyle=':', linewidth=2, label='Insulin rate', zorder=8,
+                         where='post')
+                ax2.set_ylabel('Insulin (U/min)', color='blue', fontsize=10)
+                ax2.tick_params(axis='y', labelcolor='blue', labelsize=9)
+                ax2.set_ylim(0, 0.3)
+                ax2.grid(False)
 
-                # Plot CHO as a stem plot
-                if y_max == 250:
-                    cho_mask = pt_cho > 0
-                    cho_times = pt_time[cho_mask]
-                    cho_values = pt_cho[cho_mask]
-                    if chosen_dataset_number == 3:
-                        cho_values *= 12  # we want "total" CHO over 2 hours
-                    markerline, stemlines, baseline = ax1.stem(
-                        cho_times,
-                        cho_values,
-                        linefmt='purple',
-                        markerfmt='D',
-                        basefmt=' ',
-                        label='Carbohydrates (g)',
-                    )
-                    plt.setp(markerline, markersize=5, color='purple', zorder=9)
-                    plt.setp(stemlines, linewidth=1.5, color='purple', zorder=9)
+            # --- C. Formatting & TICKS ---
+            ax.set_ylim(y_min, y_max)
+            ax.set_xlim(x_min, x_max)
+            ax.grid(True, which='both', linestyle=':', alpha=0.3)
 
-                # Plot the actual blood glucose data on top (zorder=10)
-                if chosen_dataset_number == 3:
-                    ax1.step(pt_time, pt_blood_glucose, color='black', linewidth=1.5, zorder=10, label='Blood Glucose',
-                             where='post')
-                else:
-                    ax1.plot(pt_time, pt_blood_glucose, color='black', linewidth=1.5, zorder=10, label='Blood Glucose')
+            # Handle X-Ticks
+            def hour_formatter(x, pos):
+                return f'{int(x % 24)}'
 
-                # Create twin axis to plot insulin
-                if y_max == 250:
-                    ax2 = ax1.twinx()
-                    ax2.step(pt_insulin_acts_time, pt_insulin_acts, color='blue', linestyle=':',
-                             linewidth=2, label='Insulin Rate', zorder=8, where='post')
-                    ax2.set_ylabel('Insulin Rate (U/min)', color='blue', fontsize=12)
-                    ax2.tick_params(axis='y', labelcolor='blue')
-                    ax2.set_ylim(bottom=0)
-                    ax2.grid(True, which='both', linestyle=':', alpha=0.3)
-                    ax2.set_ylim(0., 0.3)
+            ax.xaxis.set_major_formatter(mticker.FuncFormatter(hour_formatter))
 
-                # --- 8. Add a Colorbar to Show Reward Mapping ---
-                # Create a new axes for the colorbar
-                # [left, bottom, width, height] in figure-relative coordinates
-                if y_max == 250:
-                    cax = fig.add_axes([0.88, 0.11, 0.02, 0.77])
-                else:
-                    cax = fig.add_axes([0.82, 0.11, 0.02, 0.77])
-                mappable = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+            if explicit_xticks is not None:
+                ax.set_xticks(explicit_xticks)
+            else:
+                ax.set_xticks(np.arange(np.ceil(x_min), x_max, 3))
 
-                neg_ticks = list(np.arange(np.floor(v_min / 20) * 20, 1, 20))
-                # final_ticks = sorted(list(set(neg_ticks + [1, 2, 3, 4, 5, 6, v_max])))
-                final_ticks = sorted(list(set(neg_ticks + list(np.arange(0, v_max, 10)))))
+            if is_bottom_plot:
+                ax.set_xlabel('Time (Hour of Day)', fontsize=12)
+            else:
+                # Hide x-labels for the top plot to clean up the look
+                ax.tick_params(labelbottom=False)
 
-                cbar = fig.colorbar(mappable, cax=cax, orientation='vertical', ticks=final_ticks)
-                cbar.set_ticklabels([f'{t:.1f}' for t in final_ticks])
-                cbar.set_label('Reward Value', fontsize=12)
-                # Note: The colorbar doesn't show the custom alpha, but it
-                # correctly shows the color-to-value mapping.
+            ax.set_ylabel('Glucose (mg/dL)', fontsize=12)
 
-                # --- 9. Final Plot Styling ---
-                ax1.set_xlim(x_min, x_max)
-                ax1.set_ylim(y_min, y_max)
-                if y_max == 250:
-                    ax1.set_title('Patient Simulator with Carbohydrates and Insulin', fontsize=16)
-                else:
-                    ax1.set_title('Patient Simulator (glucose only)', fontsize=16)
-                ax1.set_xlabel('Time (Hour of Day)', fontsize=12)
-                ax1.set_ylabel('Blood Glucose (mg/dL)', fontsize=12)
-                # Removed zorder=20 from the legend call to fix the TypeError
-                ax1.legend(loc='upper left')
-                ax1.grid(True, which='both', linestyle=':', alpha=0.3)
-
-                h1, l1 = ax1.get_legend_handles_labels()
-                if y_max == 250:
+            # Legend Logic
+            if show_legend:
+                h1, l1 = ax.get_legend_handles_labels()
+                if ax2:
                     h2, l2 = ax2.get_legend_handles_labels()
-                    ax1.legend(h1 + h2, l1 + l2, loc='upper left')
+                    ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, framealpha=0.9)
                 else:
-                    ax1.legend(h1, l1, loc='upper left')
+                    ax.legend(h1, l1, loc='upper left', fontsize=9)
+
+            return norm, cmap, v_min, v_max
 
 
-                # Adjust x-tick formatting
-                def hour_formatter(x, pos):
-                    """Formats a continuous hour (e.g., 25.5) as a 24-hour string (e.g., '1.5')"""
-                    hour = x % 24
-                    return f'{int(hour)}'
+        # ==============================================================================
+        # EXECUTION
+        # ==============================================================================
 
+        # 1. TASK ONE: Standalone Plot (Dataset 0, Y_MAX=700)
+        # ---------------------------------------------------
+        print("Generating Standalone Plot (Dataset 0, Y=700)...")
+        data_0 = get_patient_data(0)
 
-                ax1.xaxis.set_major_formatter(mticker.FuncFormatter(hour_formatter))
-                start_tick = np.ceil(x_min)
-                tick_locations = np.arange(start_tick, x_max, 3)
-                ax1.set_xticks(tick_locations)
+        fig1, ax1 = plt.subplots(figsize=(12, 6))
+        norm, cmap, vmin, vmax = draw_panel(ax1, data_0, y_max=700)
 
-                # Adjust main plot to make room for colorbar
-                fig.subplots_adjust(right=0.80)
-                if y_max == 250:
-                    plt.savefig(f'../logs_glucose/patient_simulator_example_dataset_{chosen_dataset_number}.png', dpi=1200)
-                else:
-                    plt.savefig(f'../logs_glucose/patient_simulator_example_glucose_only_{chosen_dataset_number}.png', dpi=1200)
-                plt.show()
+        ax1.set_title('Simulated Patient Trajectory (Glucose Only)', fontsize=16)
+
+        # Add Colorbar
+        neg_ticks = list(np.arange(np.floor(vmin / 20) * 20, 1, 20))
+        final_ticks = sorted(list(set(neg_ticks + list(np.arange(0, vmax, 10)))))
+
+        cax1 = fig1.add_axes([0.92, 0.15, 0.02, 0.7])
+        mappable1 = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        fig1.colorbar(mappable1, cax=cax1, orientation='vertical', ticks=final_ticks).set_label('Reward Value',
+                                                                                                fontsize=12)
+        fig1.subplots_adjust(right=0.90)
+
+        plt.savefig(f'../logs_glucose/patient_simulator_example_glucose_only.png', dpi=1200)
+        plt.show()
+
+        # 2. TASK TWO: Combined Vertical Plot (Dataset 0 & 3, Y_MAX=250)
+        # ---------------------------------------------------
+        print("Generating Combined Plot (Dataset 0 & 3, Y=250)...")
+        data_3 = get_patient_data(3)
+
+        # --- 1. Calculate Common Axes Limits ---
+        # We take the earliest start time and the latest end time across BOTH datasets
+        common_min = min(data_0['time'].min(), data_3['time'].min())
+        common_max = max(data_0['time'].max(), data_3['time'].max())
+
+        # --- 2. Create Common Ticks ---
+        # This ensures the grid lines line up perfectly vertically.
+        # We start at the ceiling of the min to ensure we hit an integer hour.
+        common_ticks = np.arange(np.ceil(common_min), common_max, 3)
+
+        # --- 3. Plotting ---
+        fig2, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+        # sharex=True is helpful, but since we are forcing ticks manually,
+        # passing explicit_xlim is the safest way to ensure the image background fills correctly.
+
+        # Plot Top (Dataset 0)
+        norm, cmap, vmin, vmax = draw_panel(
+            ax_top,
+            data_0,
+            y_max=250,
+            is_bottom_plot=False,
+            explicit_xlim=(common_min, common_max),
+            explicit_xticks=common_ticks
+        )
+        ax_top.set_title(f'Unprocessed Dataset', fontsize=14, loc='left')
+
+        # Plot Bottom (Dataset 3)
+        draw_panel(
+            ax_bot,
+            data_3,
+            y_max=250,
+            is_bottom_plot=True,
+            show_legend=False,
+            explicit_xlim=(common_min, common_max),
+            explicit_xticks=common_ticks
+        )
+        ax_bot.set_title(f'Binned (2hr) Dataset', fontsize=14, loc='left')
+
+        # --- 4. Shared Colorbar (Same as before) ---
+        fig2.subplots_adjust(right=0.83, hspace=0.1)  # Reduced hspace since x-axes match now
+        cax2 = fig2.add_axes([0.88, 0.15, 0.02, 0.7])
+
+        neg_ticks = list(np.arange(np.floor(vmin / 20) * 20, 1, 20))
+        final_ticks = sorted(list(set(neg_ticks + list(np.arange(0, vmax, 10)))))
+
+        mappable2 = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = fig2.colorbar(mappable2, cax=cax2, orientation='vertical', ticks=final_ticks)
+        cbar.set_ticklabels([f'{t:.0f}' for t in final_ticks])
+        cbar.set_label('Reward Value', fontsize=12)
+        plt.suptitle('Simulated Patient Trajectory', fontsize=20, y=0.93)
+
+        plt.savefig('../logs_glucose/patient_simulator_example'
+                    '.png', dpi=1200)
+        plt.show()
 
     if plot_padova_results:
         import matplotlib.pyplot as plt
