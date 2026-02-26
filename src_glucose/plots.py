@@ -22,8 +22,9 @@ class LegendTitleHandler(HandlerBase):
 
 
 if __name__ == "__main__":
-    plot_patient_example = False
+    plot_patient_example = True
     plot_padova_results = False
+    plot_fqe_results = False
 
     if plot_patient_example:
         import matplotlib.pyplot as plt
@@ -57,7 +58,8 @@ if __name__ == "__main__":
             # Slice specific patient episode
             # Note: Using logic from your snippet
             current_patient_idx = np.where(dones)[0][patient_idx_in_batch] + 1
-            next_patient_idx = np.roll(np.where(dones)[0], -1)[patient_idx_in_batch]
+            next_patient_idx = np.roll(np.where(dones)[0], -1)[patient_idx_in_batch] + 1
+
             if next_patient_idx < current_patient_idx:
                 next_patient_idx = -1
 
@@ -123,9 +125,9 @@ if __name__ == "__main__":
             PEAK_TARGET = minimize_scalar(lambda x: -bg_in_range_magni([x]), bounds=(70, 180),
                                           method='bounded').x.item()
 
-            ax.axhline(LOWER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5, label='Target range (70-180)')
+            ax.axhline(LOWER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5, label='Target glucose range')
             ax.axhline(HIGHER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5)
-            ax.axhline(PEAK_TARGET, color='green', linestyle=':', linewidth=1, zorder=5, label='Peak reward')
+            # ax.axhline(PEAK_TARGET, color='green', linestyle=':', linewidth=1, zorder=5, label='Peak reward')
 
             if data['dataset_num'] == 3:
                 ax.step(pt_time, pt_bg, color='black', linewidth=1.5, zorder=10, label='Blood glucose', where='post')
@@ -137,7 +139,7 @@ if __name__ == "__main__":
                 cho_vals = pt_cho[cho_mask]
                 if data['dataset_num'] == 3: cho_vals *= 12
                 markerline, stemlines, baseline = ax.stem(
-                    pt_time[cho_mask], cho_vals, linefmt='purple', markerfmt='D', basefmt=' ', label='Carbohydrates (g)'
+                    pt_time[cho_mask], cho_vals, linefmt='purple', markerfmt='D', basefmt=' ', label='Carbohydrates (grams, left)'
                 )
                 plt.setp(markerline, markersize=5, color='purple', zorder=9)
                 plt.setp(stemlines, linewidth=1.5, color='purple', zorder=9)
@@ -181,9 +183,9 @@ if __name__ == "__main__":
                 h1, l1 = ax.get_legend_handles_labels()
                 if ax2:
                     h2, l2 = ax2.get_legend_handles_labels()
-                    ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, framealpha=0.9)
+                    ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=9, framealpha=0.9)
                 else:
-                    ax.legend(h1, l1, loc='upper left', fontsize=9)
+                    ax.legend(h1, l1, loc='upper right', fontsize=9)
 
             return norm, cmap, v_min, v_max
 
@@ -206,11 +208,13 @@ if __name__ == "__main__":
         neg_ticks = list(np.arange(np.floor(vmin / 20) * 20, 1, 20))
         final_ticks = sorted(list(set(neg_ticks + list(np.arange(0, vmax, 10)))))
 
-        cax1 = fig1.add_axes([0.92, 0.15, 0.02, 0.7])
+        cax1 = fig1.add_axes([0.08, 0.15, 0.02, 0.7])
         mappable1 = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        fig1.colorbar(mappable1, cax=cax1, orientation='vertical', ticks=final_ticks).set_label('Reward Value',
-                                                                                                fontsize=12)
-        fig1.subplots_adjust(right=0.90)
+        cbar1 = fig1.colorbar(mappable1, cax=cax1, orientation='vertical', ticks=final_ticks)
+        cbar1.ax.yaxis.set_ticks_position('left')
+        cbar1.ax.yaxis.set_label_position('left')
+        cbar1.set_label('Glucose Reward Value', fontsize=12)
+        fig1.subplots_adjust(left=0.18)
 
         plt.savefig(f'../logs_glucose/patient_simulator_example_glucose_only.png', dpi=1200)
         plt.show()
@@ -259,17 +263,19 @@ if __name__ == "__main__":
         ax_bot.set_title(f'Binned (2hr) Dataset', fontsize=14, loc='left')
 
         # --- 4. Shared Colorbar (Same as before) ---
-        fig2.subplots_adjust(right=0.83, hspace=0.1)  # Reduced hspace since x-axes match now
-        cax2 = fig2.add_axes([0.88, 0.15, 0.02, 0.7])
+        fig2.subplots_adjust(left=0.18, hspace=0.2)  # Reduced hspace since x-axes match now
+        cax2 = fig2.add_axes([0.08, 0.15, 0.02, 0.7])
 
         neg_ticks = list(np.arange(np.floor(vmin / 20) * 20, 1, 20))
         final_ticks = sorted(list(set(neg_ticks + list(np.arange(0, vmax, 10)))))
 
         mappable2 = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
         cbar = fig2.colorbar(mappable2, cax=cax2, orientation='vertical', ticks=final_ticks)
+        cbar.ax.yaxis.set_ticks_position('left')
+        cbar.ax.yaxis.set_label_position('left')
         cbar.set_ticklabels([f'{t:.0f}' for t in final_ticks])
-        cbar.set_label('Reward Value', fontsize=12)
-        plt.suptitle('Simulated Patient Trajectory', fontsize=20, y=0.93)
+        cbar.set_label('Glucose Reward Value', fontsize=12)
+        plt.suptitle('Simulated Patient Trajectory', fontsize=20, y=0.93, x=0.55)
 
         plt.savefig('../logs_glucose/patient_simulator_example'
                     '.png', dpi=1200)
@@ -413,4 +419,165 @@ if __name__ == "__main__":
         )
 
         plt.savefig('../logs_glucose/iql_logs/final_plot.png', dpi=2000)
+        plt.show()
+
+    if plot_fqe_results:
+        import matplotlib.pyplot as plt
+        import polars as pl
+        import seaborn as sns
+        from matplotlib.lines import Line2D
+
+        # 1. Load Data
+        df = pl.read_csv('../logs_glucose/fqe_logs/fqe_results_normalised.csv')
+        df = df.with_columns(pl.col('algo').str.to_uppercase())
+
+        # Get error bars
+        df = df.with_columns([
+            (pl.col('ratio_iqm') - pl.col('ratio_2.5%')).alias('xerr_low'),
+            (pl.col('ratio_97.5%') - pl.col('ratio_iqm')).alias('xerr_high'),
+            (pl.col('true_ratio') - pl.col('true_ratio_2.5%')).alias('yerr_low'),
+            (pl.col('true_ratio_97.5%') - pl.col('true_ratio')).alias('yerr_high'),
+        ])
+
+        # Remove random and dataset
+        df = df.filter(~pl.col('algo').is_in(['RANDOM', 'DATASET']))
+
+        # Map dataset names
+        dataset_mapping = {
+            0: "Unprocessed",
+            1: "Interpolated",
+            2: "Binned (4hr)",
+            3: "Binned (2hr)"
+        }
+
+        df = df.with_columns(
+            pl.col('decoy_interval')
+            .cast(pl.Utf8)
+            .replace({'0': 'Unprocessed', '1': 'Interpolated', '2': 'Binned (4hr)', '3': 'Binned (2hr)'})
+            .alias('Training Dataset')
+        )
+
+        dataset_order = ['Unprocessed', 'Interpolated', 'Binned (2hr)', 'Binned (4hr)']
+        algos = ['BC', 'IQL', 'CQL']
+
+        # Get colour palette
+        dataset_colors = sns.color_palette("deep", len(dataset_order))
+
+        # Define Markers for Algorithms
+        algo_markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p']
+        if len(algos) > len(algo_markers):
+            algo_markers = algo_markers * (len(algos) // len(algo_markers) + 1)
+
+        # Start plotting
+        plt.figure(figsize=(10, 8))
+
+        for d_idx, dataset in enumerate(dataset_order):
+            for a_idx, algo in enumerate(algos):
+                sub_df = df.filter(pl.col('Training Dataset') == dataset).filter(pl.col('algo') == algo).to_pandas()
+
+                xerr = [sub_df['xerr_low'], sub_df['xerr_high']]
+                yerr = [sub_df['yerr_low'], sub_df['yerr_high']]
+
+                plt.errorbar(
+                    x=sub_df['ratio_iqm'],
+                    y=sub_df['true_ratio'],
+                    xerr=xerr,
+                    yerr=yerr,
+                    fmt='none',
+                    ecolor=dataset_colors[d_idx],
+                    alpha=0.5,
+                    capsize=3
+                )
+
+                plt.scatter(
+                    sub_df['ratio_iqm'],
+                    sub_df['true_ratio'],
+                    color=dataset_colors[d_idx],
+                    marker=algo_markers[a_idx],
+                    s=120,
+                    edgecolor='k',
+                    zorder=10
+                )
+
+        # Create custom legend
+        # Legend 1: Colors (Mapped Dataset Names with Custom Order)
+        color_legend_elements = []
+        for d_idx, dataset in enumerate(dataset_order):
+            color = dataset_colors[d_idx]
+            color_legend_elements.append(
+                Line2D([0], [0], marker='o', color='w', label=dataset,
+                       markerfacecolor=color, markersize=10, markeredgecolor='k')
+            )
+
+        # Legend 2: Markers (Algorithms)
+        marker_legend_elements = [
+            Line2D([0], [0], marker=marker, color='w', label=algo.upper(),
+                   markerfacecolor='gray', markersize=10, markeredgecolor='k')
+            for algo, marker in zip(algos, algo_markers[:len(algos)])
+        ]
+
+        # Add Identity Line
+        min_val = min(df.select('ratio_2.5%').min().item(), df.select('true_ratio_2.5%').min().item())
+        max_val = max(df.select('ratio_97.5%').max().item(), df.select('true_ratio_97.5%').max().item())
+        padding = (max_val - min_val) * 0.1
+        limit_min = min_val - padding
+        limit_max = max_val + padding
+
+        plt.plot([limit_min, limit_max], [limit_min, limit_max], 'k--', alpha=0.5, label='Perfect Calibration')
+
+        plt.xlabel('Predicted Performance Ratio (relative to dataset policy)', fontsize=14)
+        plt.ylabel('True Performance Ratio (relative to dataset policy)', fontsize=14)
+        plt.title('Retrospective Evaluation vs True Performance', fontsize=16)
+
+        # Add the text annotations
+        text_offset_ratio = 0.25
+        # Upper Left (Underestimated: y > x)
+        plt.text(
+            0.7,
+            2.0,
+            'Underestimated \n performance',
+            fontsize=14,
+            color='gray',
+            ha='center',
+            va='center',
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.5')
+        )
+
+        # Bottom Right (Overestimated: y < x)
+        plt.text(
+            3.3,
+            2.0,
+            'Overestimated \n performance',
+            fontsize=14,
+            color='gray',
+            ha='center',
+            va='center',
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.5')
+        )
+
+        # Add legends
+        legend1 = plt.legend(
+            handles=color_legend_elements,
+            title="Training Dataset",
+            loc='upper left',
+            frameon=True,
+            fontsize=12,
+            title_fontsize=14
+        )
+        plt.gca().add_artist(legend1)
+        plt.legend(
+            handles=marker_legend_elements,
+            title="Algorithm",
+            loc='lower right',
+            frameon=True,
+            fontsize=12,
+            title_fontsize=14
+        )
+
+        plt.grid(True, alpha=0.3)
+        plt.xlim(limit_min, limit_max)
+        plt.ylim(limit_min, limit_max)
+
+        plt.tight_layout()
+        plt.savefig('../logs_glucose/fqe_calibration_plot.png')
         plt.show()
