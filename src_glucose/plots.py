@@ -72,8 +72,8 @@ if __name__ == "__main__":
             }
 
 
-        def draw_panel(ax, data, y_max, show_legend=True, is_bottom_plot=True,
-                       explicit_xlim=None, explicit_xticks=None):
+        def draw_panel(ax, ax_ins, data, y_max, show_legend=True, is_bottom_plot=True,
+                       explicit_xlim=None, explicit_xticks=None, show_gradient=True, plot_type='insulin'):
             """
             Draws a single plot panel with optional forced x-limits/ticks.
             """
@@ -114,20 +114,22 @@ if __name__ == "__main__":
             gradient_image = colors_rgba.reshape(len(y_vals_for_gradient), 1, 4)
             gradient_image = np.tile(gradient_image, (1, 10, 1))
 
-            # Plot Image
-            ax.imshow(
-                gradient_image, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                aspect='auto', zorder=1
-            )
+            if show_gradient:
+                # Plot Image
+                ax.imshow(
+                    gradient_image, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                    aspect='auto', zorder=1
+                )
 
             # --- B. Plot Lines and Targets (remains the same) ---
             LOWER_TARGET, HIGHER_TARGET = 70, 180
             PEAK_TARGET = minimize_scalar(lambda x: -bg_in_range_magni([x]), bounds=(70, 180),
                                           method='bounded').x.item()
 
-            ax.axhline(LOWER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5, label='Target glucose range')
-            ax.axhline(HIGHER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5)
-            # ax.axhline(PEAK_TARGET, color='green', linestyle=':', linewidth=1, zorder=5, label='Peak reward')
+            if y_max == 700:
+                ax.axhline(LOWER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5, label='Target glucose range (70–180 mg/dL)')
+                ax.axhline(HIGHER_TARGET, color='gray', linestyle='--', linewidth=1, zorder=5)
+                ax.axhline(PEAK_TARGET, color='green', linestyle=':', linewidth=1, zorder=5, label='Peak reward')
 
             if data['dataset_num'] == 3:
                 ax.step(pt_time, pt_bg, color='black', linewidth=1.5, zorder=10, label='Blood glucose', where='post')
@@ -139,20 +141,28 @@ if __name__ == "__main__":
                 cho_vals = pt_cho[cho_mask]
                 if data['dataset_num'] == 3: cho_vals *= 12
                 markerline, stemlines, baseline = ax.stem(
-                    pt_time[cho_mask], cho_vals, linefmt='purple', markerfmt='D', basefmt=' ', label='Carbohydrates (grams, left)'
+                    pt_time[cho_mask], cho_vals, linefmt='purple', markerfmt='D', basefmt=' ', label='Carbohydrates (grams)'
                 )
                 plt.setp(markerline, markersize=5, color='purple', zorder=9)
                 plt.setp(stemlines, linewidth=1.5, color='purple', zorder=9)
 
-            ax2 = None
-            if y_max == 250:
-                ax2 = ax.twinx()
-                ax2.step(pt_time, pt_insulin, color='blue', linestyle=':', linewidth=2, label='Insulin rate', zorder=8,
-                         where='post')
-                ax2.set_ylabel('Insulin (U/min)', color='blue', fontsize=10)
-                ax2.tick_params(axis='y', labelcolor='blue', labelsize=9)
-                ax2.set_ylim(0, 0.3)
-                ax2.grid(False)
+            ax2 = ax_ins
+            if ax2 is not None:
+                if plot_type == 'insulin':
+                    ax2.step(pt_time, pt_insulin, color='blue', linestyle='-', linewidth=1.5, label='Insulin rate', zorder=8,
+                             where='post')
+                    ax2.set_ylabel('Insulin\n(U/min)', color='blue', fontsize=12)
+                    ax2.tick_params(axis='y', labelcolor='blue', labelsize=10)
+                    ins_max = pt_insulin.max() if len(pt_insulin) > 0 else 0.1
+                    ax2.set_ylim(0, max(0.1, ins_max * 1.2))
+                elif plot_type == 'reward':
+                    rewards_array = vectorized_reward_func(pt_bg)
+                    cum_rewards = np.cumsum(rewards_array)
+                    ax2.plot(pt_time, cum_rewards, color='black', linestyle='-', linewidth=1.5, label='Cumulative reward', zorder=8)
+                    ax2.set_ylabel('Cumulative\nreward', color='black', fontsize=12)
+                    ax2.tick_params(axis='y', labelcolor='black', labelsize=10)
+
+                ax2.grid(True, which='both', linestyle=':', alpha=0.3)
 
             # --- C. Formatting & TICKS ---
             ax.set_ylim(y_min, y_max)
@@ -161,7 +171,9 @@ if __name__ == "__main__":
 
             # Handle X-Ticks
             def hour_formatter(x, pos):
-                return f'{int(x % 24)}'
+                hour = int(x % 24)
+                day = int((x - x_min) // 24) + 1
+                return f'{hour:02d}:00\nDay {day}'
 
             ax.xaxis.set_major_formatter(mticker.FuncFormatter(hour_formatter))
 
@@ -170,22 +182,34 @@ if __name__ == "__main__":
             else:
                 ax.set_xticks(np.arange(np.ceil(x_min), x_max, 3))
 
-            if is_bottom_plot:
-                ax.set_xlabel('Time (Hour of Day)', fontsize=12)
-            else:
-                # Hide x-labels for the top plot to clean up the look
-                ax.tick_params(labelbottom=False)
+            if ax2 is not None:
+                ax2.xaxis.set_major_formatter(mticker.FuncFormatter(hour_formatter))
+                if explicit_xticks is not None:
+                    ax2.set_xticks(explicit_xticks)
+                else:
+                    ax2.set_xticks(np.arange(np.ceil(x_min), x_max, 3))
+                ax2.set_xlim(x_min, x_max)
 
-            ax.set_ylabel('Glucose (mg/dL)', fontsize=12)
+            ax.set_ylabel('Glucose\n(mg/dL)', fontsize=12)
+            ax.tick_params(labelbottom=False)
+
+            if ax2 is not None:
+                if is_bottom_plot:
+                    ax2.set_xlabel('Time', fontsize=12)
+                else:
+                    ax2.tick_params(labelbottom=False)
+            else:
+                if is_bottom_plot:
+                    ax.set_xlabel('Time', fontsize=12)
+                    ax.tick_params(labelbottom=True)
 
             # Legend Logic
             if show_legend:
                 h1, l1 = ax.get_legend_handles_labels()
-                if ax2:
+                ax.legend(h1, l1, loc='upper left', fontsize=9, framealpha=0.9)
+                if ax2 is not None:
                     h2, l2 = ax2.get_legend_handles_labels()
-                    ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=9, framealpha=0.9)
-                else:
-                    ax.legend(h1, l1, loc='upper right', fontsize=9)
+                    ax2.legend(h2, l2, loc='upper left', bbox_to_anchor=(0.0, 1.0), fontsize=9, framealpha=0.9)
 
             return norm, cmap, v_min, v_max
 
@@ -196,13 +220,17 @@ if __name__ == "__main__":
 
         # 1. TASK ONE: Standalone Plot (Dataset 0, Y_MAX=700)
         # ---------------------------------------------------
+        import matplotlib.gridspec as gridspec
         print("Generating Standalone Plot (Dataset 0, Y=700)...")
         data_0 = get_patient_data(0)
 
-        fig1, ax1 = plt.subplots(figsize=(12, 6))
-        norm, cmap, vmin, vmax = draw_panel(ax1, data_0, y_max=700)
+        fig1 = plt.figure(figsize=(12, 6))
+        gs1 = fig1.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.0)
+        ax1 = fig1.add_subplot(gs1[0])
+        ax1_ins = fig1.add_subplot(gs1[1], sharex=ax1)
+        norm, cmap, vmin, vmax = draw_panel(ax1, ax1_ins, data_0, y_max=700, plot_type='reward')
 
-        ax1.set_title('Simulated Patient Trajectory (Glucose Only)', fontsize=16)
+        ax1.set_title('Simulated Patient Trajectory (Glucose/Rewards Only)', fontsize=16)
 
         # Add Colorbar
         neg_ticks = list(np.arange(np.floor(vmin / 20) * 20, 1, 20))
@@ -235,47 +263,54 @@ if __name__ == "__main__":
         common_ticks = np.arange(np.ceil(common_min), common_max, 3)
 
         # --- 3. Plotting ---
-        fig2, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-        # sharex=True is helpful, but since we are forcing ticks manually,
-        # passing explicit_xlim is the safest way to ensure the image background fills correctly.
+        fig2 = plt.figure(figsize=(14, 10))
+        outer_gs = fig2.add_gridspec(2, 1, hspace=0.3)
+
+        top_gs = outer_gs[0].subgridspec(2, 1, height_ratios=[1, 1], hspace=0.0)
+        ax_top = fig2.add_subplot(top_gs[0])
+        ax_top_ins = fig2.add_subplot(top_gs[1], sharex=ax_top)
+
+        bot_gs = outer_gs[1].subgridspec(2, 1, height_ratios=[1, 1], hspace=0.0)
+        ax_bot = fig2.add_subplot(bot_gs[0], sharex=ax_top)
+        ax_bot_ins = fig2.add_subplot(bot_gs[1], sharex=ax_top)
 
         # Plot Top (Dataset 0)
         norm, cmap, vmin, vmax = draw_panel(
-            ax_top,
+            ax_top, ax_top_ins,
             data_0,
             y_max=250,
             is_bottom_plot=False,
             explicit_xlim=(common_min, common_max),
-            explicit_xticks=common_ticks
+            explicit_xticks=common_ticks,
+            show_gradient=False
         )
+
+        # Override Top Legends to Upper Right
+        ax_top.get_legend().remove()
+        ax_top_ins.get_legend().remove()
+        h1, l1 = ax_top.get_legend_handles_labels()
+        ax_top.legend(h1, l1, loc='upper right', fontsize=9, framealpha=0.9)
+        h2, l2 = ax_top_ins.get_legend_handles_labels()
+        ax_top_ins.legend(h2, l2, loc='upper right', bbox_to_anchor=(0.95, 1.0), fontsize=9, framealpha=0.9)
+
         ax_top.set_title(f'Unprocessed Dataset', fontsize=14, loc='left')
 
         # Plot Bottom (Dataset 3)
         draw_panel(
-            ax_bot,
+            ax_bot, ax_bot_ins,
             data_3,
             y_max=250,
             is_bottom_plot=True,
             show_legend=False,
             explicit_xlim=(common_min, common_max),
-            explicit_xticks=common_ticks
+            explicit_xticks=common_ticks,
+            show_gradient=False
         )
         ax_bot.set_title(f'Binned (2hr) Dataset', fontsize=14, loc='left')
+        ax_bot_ins.set_ylim(0, 0.12)
+        ax_top_ins.set_ylim(0, 0.12)
 
-        # --- 4. Shared Colorbar (Same as before) ---
-        fig2.subplots_adjust(left=0.18, hspace=0.2)  # Reduced hspace since x-axes match now
-        cax2 = fig2.add_axes([0.08, 0.15, 0.02, 0.7])
-
-        neg_ticks = list(np.arange(np.floor(vmin / 20) * 20, 1, 20))
-        final_ticks = sorted(list(set(neg_ticks + list(np.arange(0, vmax, 10)))))
-
-        mappable2 = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        cbar = fig2.colorbar(mappable2, cax=cax2, orientation='vertical', ticks=final_ticks)
-        cbar.ax.yaxis.set_ticks_position('left')
-        cbar.ax.yaxis.set_label_position('left')
-        cbar.set_ticklabels([f'{t:.0f}' for t in final_ticks])
-        cbar.set_label('Glucose Reward Value', fontsize=12)
-        plt.suptitle('Simulated Patient Trajectory', fontsize=20, y=0.93, x=0.55)
+        plt.suptitle('Simulated Patient Trajectory', fontsize=20, y=0.93)
 
         plt.savefig('../logs_glucose/patient_simulator_example'
                     '.png', dpi=1200)
